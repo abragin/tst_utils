@@ -1,0 +1,60 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Environment files
+.env
+.venv/
+env/
+venv/
+*.env
+
+# VSCode settings
+.vscode/
+
+# macOS metadata
+.DS_Store
+
+# Compiled files
+*.so
+*.out
+*.o
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.bak
+*.old
+*.orig
+
+# Test/coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+coverage.xml
+*.cover
+*.py,cover
+.cache
+pytest_cache/
+
+# Notebooks converted to HTML or LaTeX
+*.nbconvert.*
+
+# mypy / lint
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+
+# Jupyter runtime
+~/.local/share/jupyter/runtime/
+
+# Ignore WandB cache
+wandb/
+
