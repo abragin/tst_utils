@@ -26,7 +26,8 @@ class NewsDataset(torch.utils.data.IterableDataset):
         self.debug = debug
 
     def load_next_news_file(self, file):
-        news_df = pd.read_csv(file, compression='gzip')
+        compr = 'gzip' if file.endswith('.gz') else None
+        news_df = pd.read_csv(file, compression=compr)
         news_df['author'] = 'News'
         self.current_ds = BooksIterableDataset(
             news_df,
