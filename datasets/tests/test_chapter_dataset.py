@@ -1,5 +1,6 @@
 from tst_utils.datasets import ChapterDataset
 import pandas as pd
+import numpy as np
 from transformers import AutoTokenizer
 
 
@@ -176,3 +177,62 @@ def test_max_length():
     assert len(item['input_ids']) == 11, 'expected length of input_ids to be equal to 11'
     assert len(item['labels']) == 11, 'expected length of labels to be equal to 11'
     assert len(item['attention_mask']) == 11, 'expected length of attention_mask to be equal to 11'
+
+def test_t5_with_style_vector():
+    style_vector = np.random.rand(64).astype(np.float32)
+    dataset = ChapterDataset(
+        test_df,
+        tokenizer=tokenizer,
+        source_cols=['text_source_opt1'],
+        model_type='T5',
+        min_tok_len=min_tok_len,
+        avg_tok_len=avg_tok_len,
+        max_tok_len=max_tok_len,
+        max_length=max_length,
+        style_vector=style_vector
+    )
+    dataset.segment_ranges = [(0, 2)]
+    item = dataset[0]
+    assert 'style' in item, "Missing 'style' in T5 dataset item"
+    assert np.allclose(item['style'], style_vector), "Style vector mismatch in T5"
+    decoded_input = tokenizer.decode(item['input_ids'])
+    expected_source = f"{test_df.text_source_opt1[0]} {test_df.text_source_opt1[1]}</s>"
+    assert decoded_input.endswith("</s>"), "Missing separator token in T5 input"
+    assert (
+        decoded_input == expected_source
+    ), "Incorrect source input_ids values"
+    decoded_labels = tokenizer.decode(item['labels'])
+    expected_target = ' '.join(test_df.text_ru[0:2]) + "</s>"
+    assert decoded_labels.endswith("</s>"), "Missing separator token in T5 label"
+    assert (
+        decoded_labels == expected_target
+    ), "Incorrect target labels values"
+
+def test_gpt_with_style_vector():
+    style_vector = np.random.rand(64).astype(np.float32)
+    dataset = ChapterDataset(
+        test_df,
+        tokenizer=tokenizer_gpt,
+        source_cols=['text_source_opt2'],
+        model_type='GPT',
+        min_tok_len=min_tok_len,
+        avg_tok_len=avg_tok_len,
+        max_tok_len=max_tok_len,
+        max_length=max_length,
+        style_vector=style_vector
+    )
+    dataset.segment_ranges = [(0, 3)]
+    item = dataset[0]
+    assert 'style' in item, "Missing 'style' in GPT dataset item"
+    assert np.allclose(item['style'], style_vector), "Style vector mismatch in GPT"
+    decoded = tokenizer_gpt.decode(item['input_ids'])
+    expected_input = (
+        ' '.join(test_df.text_source_opt2[0:3])
+        + "</s>"
+        + ' '.join(test_df.text_ru[0:3])
+        + "</s>"
+    )
+    assert decoded.count("</s>") >= 1 or decoded.endswith("</s>"), "Expected separator token in GPT input"
+    assert (
+        decoded == expected_input
+    ), "Incorrect source input_ids values"
