@@ -1,21 +1,20 @@
 import numpy as np
 import torch
 from tst_utils.datasets.chapter_dataset import ChapterDataset
+from tqdm import tqdm
+
 
 class BooksDataset(torch.utils.data.Dataset):
     def __init__(
         self, books_df, tokenizer, source_cols,
         model_type, target_col = 'text_ru',
         min_tok_len=50, avg_tok_len=150, max_tok_len=500, max_length = 512,
+        style_dict = None,
+        disable_tqdm = True
     ):
-        chapters = books_df[['title','author', 'chapter_pos']].drop_duplicates()
+        grouped = books_df.groupby(['author', 'title', 'chapter_pos'])
         self.chapter_datasets = []
-        for _, chapter_row in chapters.iterrows():
-            chapter_df = books_df[(
-                (books_df.title == chapter_row.title) &
-                (books_df.chapter_pos == chapter_row.chapter_pos) &
-                (books_df.author == chapter_row.author)
-            )]
+        for _, chapter_df in tqdm(grouped, disable=disable_tqdm):
             self.chapter_datasets.append(ChapterDataset(
                 chapter_df,
                 tokenizer = tokenizer,
@@ -24,7 +23,8 @@ class BooksDataset(torch.utils.data.Dataset):
                 min_tok_len = min_tok_len,
                 avg_tok_len = avg_tok_len,
                 max_tok_len = max_tok_len,
-                max_length = max_length
+                max_length = max_length,
+                style_vector = style_dict[chapter_df.iloc[0].author] if style_dict else None
             ))
         self.total_length = sum(len(dataset) for dataset in self.chapter_datasets)
         self.positions = []
@@ -39,7 +39,6 @@ class BooksDataset(torch.utils.data.Dataset):
             cds.sample()
 
     def debug_info(self, ind):
-        # ind = self.index[self.cur % self.total_length]
         dataset_index, chapter_index = self.positions[ind]
         chapter_dataset = self.chapter_datasets[dataset_index]
         rng_start, rng_end = chapter_dataset.segment_ranges[chapter_index]
@@ -63,7 +62,8 @@ class BooksIterableDataset(torch.utils.data.IterableDataset):
         self, books_df, tokenizer, source_cols,
         model_type, target_col = 'text_ru',
         min_tok_len=50, avg_tok_len=150, max_tok_len=500, max_length = 512,
-        max_samples=None, debug=False
+        max_samples=None, debug=False,
+        style_dict = None
     ):
         self.books_dataset = BooksDataset(
             books_df,
@@ -75,6 +75,7 @@ class BooksIterableDataset(torch.utils.data.IterableDataset):
             avg_tok_len = avg_tok_len,
             max_tok_len=max_tok_len,
             max_length = max_length,
+            style_dict = style_dict
         )
         self.index = list(range(self.books_dataset.total_length))
         np.random.shuffle(self.index)
