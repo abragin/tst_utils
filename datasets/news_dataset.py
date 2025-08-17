@@ -23,12 +23,14 @@ class NewsDataset(torch.utils.data.IterableDataset):
         self.avg_tok_len = avg_tok_len
         self.max_tok_len = max_tok_len
         self.max_length = max_length
+        self.style_emb = style_emb
         self.debug = debug
 
     def load_next_news_file(self, file):
         compr = 'gzip' if file.endswith('.gz') else None
         news_df = pd.read_csv(file, compression=compr)
         news_df['author'] = 'News'
+        style_dict = {'News': self.style_emb} if self.style_emb is not None else None
         self.current_ds = BooksIterableDataset(
             news_df,
             tokenizer = self.tokenizer,
@@ -39,6 +41,7 @@ class NewsDataset(torch.utils.data.IterableDataset):
             avg_tok_len = self.avg_tok_len,
             max_tok_len = self.max_tok_len,
             max_length = self.max_length,
+            style_dict = style_dict,
             debug = self.debug
         )
         self.current_ds.max_samples = len(self.current_ds.books_dataset)
