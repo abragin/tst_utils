@@ -10,7 +10,9 @@ class NewsDataset(torch.utils.data.IterableDataset):
         self, news_files, tokenizer, model_type,
         source_cols=['text_ru_pph'],
         target_col = 'text_ru',
-        min_tok_len=50, avg_tok_len=150, max_tok_len=500, max_length = 512,
+        min_tok_len=50, avg_tok_len=150, max_length = 512,
+        max_tok_len=None,
+        style_emb = None,
         debug = False
     ):
         self.news_files = news_files

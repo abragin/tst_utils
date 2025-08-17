@@ -6,8 +6,11 @@ from tst_utils.datasets.utils import a2tag, produce_segments
 class ChapterDataset(torch.utils.data.Dataset):
     def __init__(
         self, chapter_df, tokenizer, source_cols,
-        min_tok_len, avg_tok_len, max_tok_len, max_length,
-        model_type, target_col = 'text_ru',
+        min_tok_len, avg_tok_len,
+        max_length, # max token length of source and target texts (separately)
+        model_type,
+        max_tok_len = None, # Disired max token length of source and target texts (not guaranteed)
+        target_col = 'text_ru',
         style_vector = None
     ):
         self.target_col = target_col
@@ -21,12 +24,14 @@ class ChapterDataset(torch.utils.data.Dataset):
         self.tokenizer = tokenizer
         self.min_tok_len = min_tok_len
         self.avg_tok_len = avg_tok_len
-        self.max_tok_len = max_tok_len
-        self.max_length = max_length
         if model_type in ['GPT', 'T5']:
             self.model_type = model_type
         else:
             raise Exception("Unsupported model type: ", model_type)
+
+        self.max_tok_len = max_tok_len if max_tok_len is not None else int(max_length*0.95 - 1)
+        self.max_length = max_length
+
         if model_type == 'T5': 
             ids_up_bound = -1
         else:
@@ -96,7 +101,7 @@ class ChapterDataset(torch.utils.data.Dataset):
             }
         elif self.model_type == 'GPT':
             if len(source_ids) > (self.max_length-2):
-                source_ids = source_ids[:self.max_length]
+                source_ids = source_ids[:self.max_length-1]
             if len(target_ids) > (self.max_length-2):
                 target_ids = target_ids[:self.max_length-1]
             sep_token_id = self.eos_token_id

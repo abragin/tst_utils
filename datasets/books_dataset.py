@@ -8,7 +8,8 @@ class BooksDataset(torch.utils.data.Dataset):
     def __init__(
         self, books_df, tokenizer, source_cols,
         model_type, target_col = 'text_ru',
-        min_tok_len=50, avg_tok_len=150, max_tok_len=500, max_length = 512,
+        min_tok_len=50, avg_tok_len=150, max_length = 512,
+        max_tok_len = None,
         style_dict = None,
         disable_tqdm = True
     ):
@@ -61,7 +62,8 @@ class BooksIterableDataset(torch.utils.data.IterableDataset):
     def __init__(
         self, books_df, tokenizer, source_cols,
         model_type, target_col = 'text_ru',
-        min_tok_len=50, avg_tok_len=150, max_tok_len=500, max_length = 512,
+        min_tok_len=50, avg_tok_len=150, max_length = 512,
+        max_tok_len = None,
         max_samples=None, debug=False,
         style_dict = None
     ):
