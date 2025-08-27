@@ -2,6 +2,48 @@ import numpy as np
 from itertools import accumulate
 
 
+def gpt_tokenize_function(batch, tokenizer, max_length=256):
+    # Build concatenated texts with EOS tokens
+    input_txts = [
+        src + tokenizer.eos_token + tgt + tokenizer.eos_token
+        for src, tgt in zip(batch["source"], batch["target"])
+    ]
+
+    # Tokenize the whole batch
+    model_inputs = tokenizer(
+        input_txts,
+        max_length=max_length,
+        padding=False,
+        truncation=True,
+    )
+
+    return model_inputs
+
+def t5_tokenize_function(example, tokenizer, max_length = 128):
+     return tokenizer(
+        example["source"],
+        text_target = example["target"],
+        max_length=max_length,
+        padding=False,
+        truncation=True
+    )
+
+def processing_fn(ds, tokenizer, max_length, model_type="T5"):
+    if model_type == "T5":
+        tok_fn = t5_tokenize_function
+    elif model_type == "GPT":
+        tok_fn = gpt_tokenize_function
+    else:
+        raise Exception("Unsupported model type: ", model_type)
+    return ds.select_columns(
+        ['source', 'target', 'target_style_emb']
+    ).rename_column(
+        "target_style_emb", "style"
+    ).map(
+        lambda batch: tok_fn(batch, tokenizer, max_length=max_length),
+        batched=True
+    ).remove_columns(['source', 'target'])
+
 def a2tag(author):
     return f"<{author.lower().replace(' ', '_')}>"
 
