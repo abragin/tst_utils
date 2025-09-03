@@ -3,9 +3,12 @@ import numpy as np
 import os
 
 
-def load_test_df():
+def load_test_df(short=False):
     """Load the main test dataset"""
-    file_path = os.path.join(os.path.dirname(__file__), "test_data.csv.gz")
+    if short:
+         file_path = os.path.join(os.path.dirname(__file__), "test_data_short.csv.gz")
+    else:
+        file_path = os.path.join(os.path.dirname(__file__), "test_data.csv.gz")
     return pd.read_csv(file_path, compression='gzip')
 
 def load_author_styles():
