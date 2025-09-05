@@ -1,6 +1,6 @@
 from tst_utils.eval.data.load import load_test_df, load_llm_data, load_author_styles
 from tst_utils.eval.tst_methods.baseline_translator import TstViaTranslate
-from tst_utils.eval.tst_methods.gpt_small_tst import tst_via_gptsmall
+from tst_utils.eval.tst_methods.gpt_small_tst import TstViaGPTSmall
 from tst_utils.eval.performance import TstPerformanceMetrics, TARGET_STYLES
 
 
@@ -25,7 +25,7 @@ def run_gpt_small_eval(test_chunks, author_styles):
     print("\n--- Running GPT-Small-based TST Evaluation ---")
     pm = TstPerformanceMetrics(
         test_df=test_chunks,
-        tst_func=tst_via_gptsmall,
+        tst_func=TstViaGPTSmall(),
         target_styles=TARGET_STYLES['BCDT'],
         tst_model='gpt_small',
         author_styles=author_styles,
