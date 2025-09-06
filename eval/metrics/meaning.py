@@ -46,17 +46,20 @@ def labse_embeddings(texts, labse_model, labse_tokenizer, batch_size=16):
             embeddings.extend(ems)
     return embeddings
 
-def labse_meaning_score(text, styled_text):
+def calc_labse_embeddings(texts):
     model = AutoModel.from_pretrained(LABSE_MODEL_NAME).cuda()
     tokenizer = AutoTokenizer.from_pretrained(LABSE_MODEL_NAME)
     model.eval()
-    embs_input = labse_embeddings(text, model, tokenizer)
-    embs_output = labse_embeddings(styled_text, model, tokenizer)
-    scores = np.array([
-        torch.dot(embs_input[i], embs_output[i]).cpu().numpy().item()
-        for i in range(len(embs_input))
+    return labse_embeddings(texts, model, tokenizer)
+
+def labse_scores_from_embs(text_labse_embs, style_text_labse_embs):
+    return np.array([
+        torch.dot(
+            torch.tensor(text_labse_embs[i]).cpu(),
+            torch.tensor(style_text_labse_embs[i]).cpu()
+        ).numpy().item()
+        for i in range(len(text_labse_embs))
     ])
-    return scores
 
 def b_score(text, styled_text):
     """Compute BERTScore F1 for given text pairs."""

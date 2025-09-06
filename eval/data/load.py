@@ -6,10 +6,10 @@ import os
 def load_test_df(short=False):
     """Load the main test dataset"""
     if short:
-         file_path = os.path.join(os.path.dirname(__file__), "test_data_short.csv.gz")
+        file_path = os.path.join(os.path.dirname(__file__), "test_data_short.parquet.gzip")
     else:
-        file_path = os.path.join(os.path.dirname(__file__), "test_data.csv.gz")
-    return pd.read_csv(file_path, compression='gzip')
+        file_path = os.path.join(os.path.dirname(__file__), "test_data.parquet.gzip")
+    return pd.read_parquet(file_path)
 
 def load_author_styles():
     """Load vector representations for main target styles"""

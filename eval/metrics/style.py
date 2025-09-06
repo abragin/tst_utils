@@ -32,8 +32,8 @@ def add_away_towards(df, author_styles):
     away_val = []
     towards_val = []
     for _, row in df.iterrows():
-        source = row.text_emb
-        current = row.styled_text_emb
+        source = row.text_style_emb
+        current = row.styled_text_style_emb
         target = author_styles[row.target_style]
         away_val.append(away(source, current, target))
         towards_val.append(towards(source, current, target))

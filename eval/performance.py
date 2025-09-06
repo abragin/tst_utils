@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from tst_utils.eval.metrics.naturality import calculate_perplexity, naturality_score
-from tst_utils.eval.metrics.meaning import meaning_score, b_score, labse_meaning_score
+from tst_utils.eval.metrics.meaning import meaning_score, b_score, labse_scores_from_embs, calc_labse_embeddings
 from tst_utils.eval.metrics.style import calc_style_embeddings, add_away_towards
 
 
@@ -52,8 +52,9 @@ class TstPerformanceMetrics:
             raise Exception("TST results are absent.")
         if self.verbose:
             print('Adding perplexity')
-        self.tst_results['source_perplexity'] = calculate_perplexity(self.tst_results.text)[0]
-        self.tst_results['target_perplexity'] = calculate_perplexity(self.tst_results.styled_text)[0]
+        if not ('text_perplexity' in self.tst_results):
+            self.tst_results['text_perplexity'] = calculate_perplexity(self.tst_results.text)[0]
+        self.tst_results['styled_text_perplexity'] = calculate_perplexity(self.tst_results.styled_text)[0]
         if self.verbose:
             print('Adding bert score')
         self.tst_results['bert_score'] = b_score(
@@ -61,13 +62,22 @@ class TstPerformanceMetrics:
         )
         if self.verbose:
             print('Adding labse score')
-        self.tst_results['labse_score'] = labse_meaning_score(self.tst_results.text, self.tst_results.styled_text)
+        if 'text_labse_emb' in self.tst_results:
+            text_labse_embs = self.tst_results.text_labse_emb
+        else:
+            text_labse_embs = calc_labse_embeddings(self.tst_results.text)
+        styled_text_labse_embs = calc_labse_embeddings(self.tst_results.styled_text)
+        self.tst_results['labse_score'] = labse_scores_from_embs(
+            text_labse_embs,
+            styled_text_labse_embs
+        )
         if self.verbose:
             print('Adding style embeddings')
-        self.tst_results['text_emb'] = calc_style_embeddings(
-            self.tst_results.text
-        )
-        self.tst_results['styled_text_emb'] = calc_style_embeddings(
+        if not ('text_style_emb' in self.tst_results):
+            self.tst_results['text_style_emb'] = calc_style_embeddings(
+                self.tst_results.text
+            )
+        self.tst_results['styled_text_style_emb'] = calc_style_embeddings(
             self.tst_results.styled_text
         )
         add_away_towards(self.tst_results, self.author_styles)
@@ -82,8 +92,8 @@ class TstPerformanceMetrics:
         )
 
         self.tst_results['naturality_score'] = naturality_score(
-            self.tst_results.source_perplexity,
-            self.tst_results.target_perplexity
+            self.tst_results.text_perplexity,
+            self.tst_results.styled_text_perplexity
         )
         self.tst_results['score'] = (
             self.tst_results['style_score'] *
