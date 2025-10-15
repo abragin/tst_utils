@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from tst_utils.eval.metrics.naturality import calculate_perplexity, naturality_score
-from tst_utils.eval.metrics.meaning import meaning_score, b_score, labse_scores_from_embs, calc_labse_embeddings
+from tst_utils.eval.metrics.meaning import meaning_score, b_score, labse_scores_from_embs, calc_labse_embeddings, length_penalty
 from tst_utils.eval.metrics.style import calc_style_embeddings, add_away_towards
 
 
@@ -86,9 +86,11 @@ class TstPerformanceMetrics:
         self.tst_results['style_score'] = np.sqrt(
             self.tst_results.away * self.tst_results.towards
         )
+        length_penalties = length_penalty(self.tst_results.text, self.tst_results.styled_text)
         self.tst_results['meaning_score'] = meaning_score(
             self.tst_results.bert_score,
-            self.tst_results.labse_score
+            self.tst_results.labse_score,
+            length_penalties
         )
 
         self.tst_results['naturality_score'] = naturality_score(

@@ -1,5 +1,6 @@
 from datasets import Dataset
 import numpy as np
+import pandas as pd
 import bert_score
 from tst_utils.eval.model_names import LABSE_MODEL_NAME
 import torch
@@ -61,15 +62,46 @@ def labse_scores_from_embs(text_labse_embs, style_text_labse_embs):
         for i in range(len(text_labse_embs))
     ])
 
-def b_score(text, styled_text):
+def length_ratio(texts, styled_texts):
+    """
+    Compute symmetric length ratio between pairs of texts:
+    ratio = min(len_in, len_out) / max(len_in, len_out)
+
+    Works with lists or pandas Series of strings.
+    Returns a numpy array of ratios in [0, 1].
+    """
+    # Convert to pandas Series for consistent vectorization
+    s1 = pd.Series(texts, dtype=str)
+    s2 = pd.Series(styled_texts, dtype=str)
+
+    len_in = s1.str.len()
+    len_out = s2.str.len()
+
+    # Avoid division by zero
+    ratio = np.where(
+        (len_in + len_out) == 0,
+        0.0,
+        np.minimum(len_in, len_out) / np.maximum(len_in, len_out)
+    )
+    return ratio
+
+def sin_penalty(x):
+    return 0.5 - 0.5 * np.cos(np.pi * x)
+
+def length_penalty(texts, styled_texts):
+    return sin_penalty(
+        length_ratio(texts, styled_texts)
+    )
+
+def b_score(texts, styled_texts):
     """Compute BERTScore F1 for given text pairs."""
-    P, R, F1 = bert_score.score(list(text), list(styled_text), lang='ru', verbose=False)
+    P, R, F1 = bert_score.score(list(texts), list(styled_texts), lang='ru', verbose=False)
     raw_score = F1.numpy()
     return raw_score
 
-def meaning_score(bs_raw: np.ndarray, ls_raw: np.ndarray) -> np.ndarray:
+def meaning_score(bs_raw: np.ndarray, ls_raw: np.ndarray, length_penalties: np.ndarray) -> np.ndarray:
     """Combine BERTScore and LaBSE score using min-max normalization & geometric mean."""
-    return np.sqrt(
+    return length_penalties * np.sqrt(
         min_max_bert_score(bs_raw) *
         min_max_labse(ls_raw)
     )
