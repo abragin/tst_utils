@@ -54,13 +54,23 @@ def calc_labse_embeddings(texts):
     return labse_embeddings(texts, model, tokenizer)
 
 def labse_scores_from_embs(text_labse_embs, style_text_labse_embs):
-    return np.array([
-        torch.dot(
-            torch.tensor(text_labse_embs[i]).cpu(),
-            torch.tensor(style_text_labse_embs[i]).cpu()
-        ).numpy().item()
-        for i in range(len(text_labse_embs))
-    ])
+    scores = []
+    for a, b in zip(text_labse_embs, style_text_labse_embs):
+        # Convert both inputs to CPU tensors safely
+        if not isinstance(a, torch.Tensor):
+            a = torch.as_tensor(a)
+        if not isinstance(b, torch.Tensor):
+            b = torch.as_tensor(b)
+
+        # Move to CPU
+        a = a.cpu()
+        b = b.cpu()
+
+        # Compute dot product
+        score = torch.dot(a, b).item()
+        scores.append(score)
+
+    return np.array(scores)
 
 def length_ratio(texts, styled_texts):
     """
