@@ -108,8 +108,7 @@ class TSTGenerator:
                     **self.generate_options,
                 )
                 decoded = self.tokenizer.batch_decode(output_sequences, skip_special_tokens=True)
-                results.extend(decoded)
-
+                grouped = [decoded[i:i + self.num_sequences] for i in range(0, len(decoded), self.num_sequences)]
             else:  # author tags path
                 style_token = self._get_style_representation(target_style, len(batch_texts))
 
@@ -133,12 +132,10 @@ class TSTGenerator:
                     num_return_sequences=self.num_sequences,
                     **self.generate_options,
                 )
-                decoded = self.tokenizer.batch_decode(output_ids, skip_special_tokens=False)
 
                 # For GPT with tags, strip everything before/including tag if needed
                 if self.model_type == "GPT":
                     decoded = self.tokenizer.batch_decode(output_ids, skip_special_tokens=False)
-
                     cleaned = []
                     for t in decoded:
                         if style_token in t:
@@ -148,7 +145,9 @@ class TSTGenerator:
                 else:
                     decoded = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
                     
+                grouped = [decoded[i:i + self.num_sequences] for i in range(0, len(decoded), self.num_sequences)]
 
-                results.extend(decoded)
+            results.extend(grouped)
+
 
         return results
