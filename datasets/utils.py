@@ -119,13 +119,8 @@ def get_chunk_ranges(best_indx):
     res_breakdown.reverse()
     return res_breakdown
 
-def produce_segments(chapter_token_cnts, n_chunks, min_tok_len, max_tok_len):
-    chapter_tok_cnt = sum(chapter_token_cnts)
-    mean_tok_len = chapter_tok_cnt / n_chunks
-    cl_distr = np.minimum(
-        max_tok_len,
-        min_tok_len + (mean_tok_len - min_tok_len) * np.random.gamma(shape = 1.5, scale=(1/1.5) , size = n_chunks)
-    )
+def produce_segments(chapter_token_cnts, n_chunks, length_sampler):
+    cl_distr = length_sampler.sample(n_chunks)
     cnk_pos = list(accumulate(cl_distr))
     chapter_tok_pos = list(accumulate(chapter_token_cnts))
     cnk_pos_norm = (cnk_pos / cnk_pos[-1])[:-1]

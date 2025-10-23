@@ -1,4 +1,4 @@
-from tst_utils.datasets import ChapterDataset
+from tst_utils.datasets import ChapterDataset, GammaLengthSampler
 import pandas as pd
 import numpy as np
 from transformers import AutoTokenizer
@@ -15,6 +15,11 @@ tokenizer.add_special_tokens({'additional_special_tokens': author_tags})
 model_name_gpt = "ai-forever/rugpt3small_based_on_gpt2"
 tokenizer_gpt =  AutoTokenizer.from_pretrained(model_name_gpt)
 tokenizer_gpt.add_special_tokens({'additional_special_tokens': author_tags})
+length_sampler = GammaLengthSampler(
+    mean_len = avg_tok_len,
+    min_len = min_tok_len,
+    max_len = max_tok_len
+)
 
 
 test_df = pd.DataFrame({
@@ -42,9 +47,7 @@ def test_with_1_source_col():
         tokenizer=tokenizer,
         source_cols = ['text_source_opt1'],
         model_type='T5',
-        min_tok_len=min_tok_len,
-        avg_tok_len=avg_tok_len,
-        max_tok_len=max_tok_len,
+        length_sampler=length_sampler,
         max_length=max_length
     )
     assert len(dataset) == 2, f"Expected dataset length 2, got {len(dataset)}"
@@ -65,9 +68,7 @@ def test_with_2_source_cols_but_1_empty():
         tokenizer=tokenizer,
         source_cols = ['text_source_opt1', 'text_source_opt2'],
         model_type='T5',
-        min_tok_len=min_tok_len,
-        avg_tok_len=avg_tok_len,
-        max_tok_len=max_tok_len,
+        length_sampler=length_sampler,
         max_length=max_length
     )
 
@@ -87,9 +88,7 @@ def test_with_2_source_cols():
         tokenizer=tokenizer,
         source_cols = ['text_source_opt1', 'text_source_opt2'],
         model_type='T5',
-        min_tok_len=min_tok_len,
-        avg_tok_len=avg_tok_len,
-        max_tok_len=max_tok_len,
+        length_sampler=length_sampler,
         max_length=max_length
     )
     assert len(dataset) == 2, f"Expected dataset length 2, got {len(dataset)}"
@@ -114,9 +113,7 @@ def test_with_2_source_cols_but_some_recs_are_empty():
         tokenizer=tokenizer,
         model_type='T5',
         source_cols = ['text_source_opt1', 'text_source_opt2'],
-        min_tok_len=min_tok_len,
-        avg_tok_len=avg_tok_len,
-        max_tok_len=max_tok_len,
+        length_sampler=length_sampler,
         max_length=max_length
     )
 
@@ -144,9 +141,7 @@ def test_with_2_source_cols_some_recs_are_empty_and_gpt_model_type():
         tokenizer=tokenizer_gpt,
         model_type='GPT',
         source_cols = ['text_source_opt1', 'text_source_opt2'],
-        min_tok_len=min_tok_len,
-        avg_tok_len=avg_tok_len,
-        max_tok_len=max_tok_len,
+        length_sampler=length_sampler,
         max_length=max_length
     )
 
@@ -167,9 +162,7 @@ def test_max_length():
         tokenizer=tokenizer,
         source_cols = ['text_source_opt1', 'text_source_opt2'],
         model_type = 'T5',
-        min_tok_len=min_tok_len,
-        avg_tok_len=avg_tok_len,
-        max_tok_len=max_tok_len,
+        length_sampler=length_sampler,
         max_length=11
     )
     dataset.segment_ranges = [(0, 2), (2, 3)]
@@ -185,9 +178,7 @@ def test_t5_with_style_vector():
         tokenizer=tokenizer,
         source_cols=['text_source_opt1'],
         model_type='T5',
-        min_tok_len=min_tok_len,
-        avg_tok_len=avg_tok_len,
-        max_tok_len=max_tok_len,
+        length_sampler=length_sampler,
         max_length=max_length,
         style_vector=style_vector
     )
@@ -215,9 +206,7 @@ def test_gpt_with_style_vector():
         tokenizer=tokenizer_gpt,
         source_cols=['text_source_opt2'],
         model_type='GPT',
-        min_tok_len=min_tok_len,
-        avg_tok_len=avg_tok_len,
-        max_tok_len=max_tok_len,
+        length_sampler=length_sampler,
         max_length=max_length,
         style_vector=style_vector
     )

@@ -6,7 +6,7 @@ from tst_utils.datasets.utils import a2tag, produce_segments
 class ChapterDataset(torch.utils.data.Dataset):
     def __init__(
         self, chapter_df, tokenizer, source_cols,
-        min_tok_len, avg_tok_len,
+        length_sampler,
         max_length, # max token length of source and target texts (separately)
         model_type,
         max_tok_len = None, # Disired max token length of source and target texts (not guaranteed)
@@ -22,14 +22,11 @@ class ChapterDataset(torch.utils.data.Dataset):
         }
         self.author_tag = a2tag(chapter_df.author.iloc[0]) if 'author' in chapter_df else None
         self.tokenizer = tokenizer
-        self.min_tok_len = min_tok_len
-        self.avg_tok_len = avg_tok_len
+        self.length_sampler = length_sampler
         if model_type in ['GPT', 'T5']:
             self.model_type = model_type
         else:
             raise Exception("Unsupported model type: ", model_type)
-
-        self.max_tok_len = max_tok_len if max_tok_len is not None else int(max_length*0.95 - 1)
         self.max_length = max_length
 
         if model_type == 'T5': 
@@ -73,7 +70,7 @@ class ChapterDataset(torch.utils.data.Dataset):
                 raise Exception("Neither style_vector nor author are provided")
         self.tot_tokens = sum(self.token_counts)
         self.n_chunks = min(
-            max(1,round(self.tot_tokens / avg_tok_len)),
+            max(1,round(self.tot_tokens / self.length_sampler.expected_mean())),
             chapter_df.shape[0]
         )
         self.sample()
@@ -139,7 +136,7 @@ class ChapterDataset(torch.utils.data.Dataset):
     def sample(self):
         self.segment_ranges = produce_segments(
             self.token_counts, self.n_chunks, 
-            self.min_tok_len, self.max_tok_len
+            self.length_sampler
         )
         if self.multiple_sources:
             self.selected_options = [

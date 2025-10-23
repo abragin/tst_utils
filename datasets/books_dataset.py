@@ -7,9 +7,9 @@ from tqdm import tqdm
 class BooksDataset(torch.utils.data.Dataset):
     def __init__(
         self, books_df, tokenizer, source_cols,
-        model_type, target_col = 'text_ru',
-        min_tok_len=50, avg_tok_len=150, max_length = 512,
-        max_tok_len = None,
+        model_type, length_sampler,
+        target_col = 'text_ru',
+        max_length = 512,
         style_dict = None,
         disable_tqdm = True
     ):
@@ -21,9 +21,7 @@ class BooksDataset(torch.utils.data.Dataset):
                 tokenizer = tokenizer,
                 source_cols = source_cols,
                 model_type = model_type,
-                min_tok_len = min_tok_len,
-                avg_tok_len = avg_tok_len,
-                max_tok_len = max_tok_len,
+                length_sampler = length_sampler,
                 max_length = max_length,
                 style_vector = style_dict[chapter_df.iloc[0].author] if style_dict else None
             ))
@@ -61,9 +59,10 @@ class BooksDataset(torch.utils.data.Dataset):
 class BooksIterableDataset(torch.utils.data.IterableDataset):
     def __init__(
         self, books_df, tokenizer, source_cols,
-        model_type, target_col = 'text_ru',
-        min_tok_len=50, avg_tok_len=150, max_length = 512,
-        max_tok_len = None,
+        model_type,
+        length_sampler,
+        target_col = 'text_ru',
+        max_length = 512,
         max_samples=None, debug=False,
         style_dict = None
     ):
@@ -73,9 +72,7 @@ class BooksIterableDataset(torch.utils.data.IterableDataset):
             source_cols = source_cols,
             model_type = model_type,
             target_col = target_col,
-            min_tok_len = min_tok_len,
-            avg_tok_len = avg_tok_len,
-            max_tok_len=max_tok_len,
+            length_sampler = length_sampler,
             max_length = max_length,
             style_dict = style_dict
         )
