@@ -62,11 +62,18 @@ class TSTGenerator:
                 raise ValueError(f"Unsupported style: {target_style}")
             return f"<{target_style.lower()}>"
 
-    def perform_tst(self, texts, target_style):
+    def perform_tst(self, texts, target_style=None, target_style_embeddings=None):
         """
         Perform text style transfer on a list of input texts.
+        Either `target_style` (str) or `target_style_embeddings` (list-like of embeddings) must be provided.
         Returns a list of generated strings.
         """
+        if (target_style is None) and (target_style_embeddings is None):
+            raise ValueError("Either target_style or target_style_embeddings must be provided.")
+
+        if (target_style is not None) and (target_style_embeddings is not None):
+            raise ValueError("Provide only one of target_style or target_style_embeddings, not both.")
+
         results = []
         total = len(texts)
 
@@ -74,10 +81,19 @@ class TSTGenerator:
             end = start + self.batch_size
             batch_texts = texts[start:end]
 
-            if self.style_emb_dict is not None:  # style embeddings path
+            # --- Determine style embeddings or tag ---
+            if target_style_embeddings is not None:
+                batch_embs = target_style_embeddings[start:end]
+                if len(batch_embs) != len(batch_texts):
+                    raise ValueError("Length mismatch between texts and target_style_embeddings.")
+                style_embs = torch.tensor(np.stack(batch_embs)).float().to(self.device)
+            elif self.style_emb_dict is not None:
                 style_embs = self._get_style_representation(target_style, len(batch_texts))
+            else:
+                style_embs = None # will use author tags path
 
-                # Tokenize
+            if style_embs is not None:
+                # embeddings path
                 if self.model_type == "GPT":
                     ipt = self.tokenizer(
                         [t + self.tokenizer.eos_token for t in batch_texts],
@@ -108,7 +124,7 @@ class TSTGenerator:
                     **self.generate_options,
                 )
                 decoded = self.tokenizer.batch_decode(output_sequences, skip_special_tokens=True)
-                grouped = [decoded[i:i + self.num_sequences] for i in range(0, len(decoded), self.num_sequences)]
+
             else:  # author tags path
                 style_token = self._get_style_representation(target_style, len(batch_texts))
 
@@ -144,10 +160,8 @@ class TSTGenerator:
                     decoded = cleaned
                 else:
                     decoded = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-                    
-                grouped = [decoded[i:i + self.num_sequences] for i in range(0, len(decoded), self.num_sequences)]
 
+            grouped = [decoded[i:i + self.num_sequences] for i in range(0, len(decoded), self.num_sequences)]
             results.extend(grouped)
-
 
         return results

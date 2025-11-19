@@ -28,13 +28,13 @@ def towards(source, current, target):
         sim_measure(current, target) - sim_measure(source, target), 0
     )/sim_c(target, source)
 
-def add_away_towards(df, author_styles):
+def add_away_towards(df, author_styles=None):
     away_val = []
     towards_val = []
     for _, row in df.iterrows():
         source = row.text_style_emb
         current = row.styled_text_style_emb
-        target = author_styles[row.target_style]
+        target = author_styles[row.target_style] if author_styles else row.target_style_emb
         away_val.append(away(source, current, target))
         towards_val.append(towards(source, current, target))
     df['away'] = away_val

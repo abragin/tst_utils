@@ -1,7 +1,10 @@
 import pandas as pd
 import numpy as np
 from tst_utils.eval.metrics.naturality import calculate_perplexity, naturality_score
-from tst_utils.eval.metrics.meaning import meaning_score, b_score, labse_scores_from_embs, calc_labse_embeddings, length_penalty
+from tst_utils.eval.metrics.meaning import (
+    meaning_score, b_score, labse_scores_from_embs,
+    calc_labse_embeddings, length_penalty
+)
 from tst_utils.eval.metrics.style import calc_style_embeddings, add_away_towards
 
 
@@ -16,12 +19,19 @@ class TstPerformanceMetrics:
     Class to evaluate TST models using style transfer, meaning, and naturality metrics.
     
     Parameters:
-    - test_df (pd.DataFrame): Dataset with 'text' and 'author'.
-    - tst_func (Callable[[List[str], str], List[str]]): Function that takes texts and target style.
-    - target_styles (List[str]): List of target styles for TST.
-    - tst_model (str): Name or ID of the model being evaluated.
-    - author_styles (Dict[str, np.ndarray]): Precomputed style embeddings.
-    - verbose (bool): Whether to print debug info.
+    - test_df (pd.DataFrame): Dataset containing source texts and related metadata.
+        Expected columns:
+          • For TST with string target styles: 'text' and 'author'.
+          • For TST with explicit target style embeddings:
+              'text', 'author', 'target_style_emb', and 'target_style_desc'.
+    - tst_func (Callable): Function performing text style transfer.
+        • For TST with string target styles: should have a signature like (texts: List[str], target_style: str) -> List[str].
+        • For TST with explicit target style embeddings: should have a signature like (texts: List[str], target_style_embeddings: List[np.ndarray]) -> List[str].
+    - target_styles (List[str] | None): List of target styles to evaluate.
+        Used only for text target style TST. If None, the class expects explicit target style embeddings in test_df.
+    - tst_model (str): Name or ID of the TST model being evaluated.
+    - author_styles (Dict[str, np.ndarray]): Precomputed style embeddings per author or domain. Used with target style TST only.
+    - verbose (bool): Whether to print debug information during processing.
     """
     def __init__(
         self, test_df, tst_func, target_styles, tst_model,
@@ -35,8 +45,14 @@ class TstPerformanceMetrics:
         self.author_styles = author_styles
         self.tst_results = None
 
-    def produce_tst_results(self) -> None:
+    def produce_tst_results_with_text_target_styles(self) -> None:
         res_dfs = []
+
+        precalculated_cols = ["text_perplexity", "text_style_emb", "text_labse_emb"]
+        cols_to_copy = (
+            ['example_number', 'text', 'author'] +
+            [c for c in precalculated_cols if c in self.test_df]
+        )
 
         for t_style in self.target_styles:
             if self.verbose:
@@ -65,15 +81,15 @@ class TstPerformanceMetrics:
                 flat_records = []
                 for ex_idx, versions in enumerate(tst_output):
                     for v_idx, text in enumerate(versions):
-                        flat_records.append({
-                            "example_number": df.loc[ex_idx, "example_number"],
-                            "text": df.loc[ex_idx, "text"],
-                            "author": df.loc[ex_idx, "author"],
-                            "target_style": t_style,
-                            "tst_model": self.tst_model,
-                            "styled_text": text,
-                            "version_number": v_idx,
-                        })
+                        flat_records.append(
+                            df.loc[ex_idx, cols_to_copy].to_dict()
+                            | {
+                                "target_style": t_style,
+                                "tst_model": self.tst_model,
+                                "styled_text": text,
+                                "version_number": v_idx,
+                            }
+                        )
                 df_expanded = pd.DataFrame(flat_records)
 
             else:  # 1D: [output_text_1, output_text_2, ...]
@@ -90,6 +106,90 @@ class TstPerformanceMetrics:
         # Combine all target styles
         self.tst_results = pd.concat(res_dfs, ignore_index=True)
 
+    def produce_tst_results_with_target_style_emb(self) -> None:
+        """
+        Perform TST using explicit style embeddings from test_df.
+        Expects `target_style_emb` and `target_style_desc` columns in test_df.
+        """
+        if "target_style_emb" not in self.test_df or "target_style_desc" not in self.test_df:
+            raise ValueError("test_df must contain 'target_style_emb' and 'target_style_desc' columns.")
+
+        df = self.test_df.reset_index(drop=False).rename(columns={"index": "example_number"})
+        df["tst_model"] = self.tst_model
+
+        precalculated_cols = ["text_perplexity", "text_style_emb", "text_labse_emb"]
+        cols_to_copy = (
+            ['example_number', 'text', 'author', 'target_style_emb', 'target_style_desc'] +
+            [c for c in precalculated_cols if c in self.test_df]
+        )
+
+        if self.verbose:
+            print("Performing TST with target_style_embeddings")
+
+        tst_output = self.tst_func(
+            texts=df.text.tolist(),
+            target_style_embeddings=df.target_style_emb.tolist()
+        )
+
+        if not tst_output:
+            raise ValueError("tst_func returned an empty result.")
+
+        if isinstance(tst_output[0], list):  # multiple generations per example
+            num_versions = len(tst_output[0])
+            if not all(len(x) == num_versions for x in tst_output):
+                raise ValueError("Inconsistent number of generated versions per example.")
+
+            flat_records = []
+            for ex_idx, versions in enumerate(tst_output):
+                for v_idx, text in enumerate(versions):
+                    flat_records.append(
+                        df.loc[ex_idx, cols_to_copy].to_dict()
+                        | {
+                            "tst_model": self.tst_model,
+                            "styled_text": text,
+                            "version_number": v_idx,
+                        }
+                    )
+            self.tst_results = pd.DataFrame(flat_records)
+
+        else:  # single output per example
+            if len(tst_output) != len(df):
+                raise ValueError(
+                    f"Length mismatch: tst_func returned {len(tst_output)} texts for {len(df)} examples."
+                )
+            df["styled_text"] = tst_output
+            df["version_number"] = 0
+            self.tst_results = df
+
+    def produce_tst_results(self) -> None:
+        """
+        Automatically select between:
+        - produce_tst_results_with_text_target_styles()
+        - produce_tst_results_with_target_style_emb()
+        depending on configuration.
+        """
+        if self.target_styles:
+            return self.produce_tst_results_with_text_target_styles()
+        elif {"target_style_emb", "target_style_desc"} <= set(self.test_df.columns):
+            return self.produce_tst_results_with_target_style_emb()
+        else:
+            raise ValueError(
+                "Cannot determine TST mode: either provide target_styles "
+                "or ensure test_df has both 'target_style_emb' and 'target_style_desc' columns."
+            )
+
+    def add_source_ppx_and_emb(self):
+        if not ('text_perplexity' in self.test_df):
+            self.test_df['text_perplexity'] = calculate_perplexity(self.test_df.text)[0]
+        if not ('text_style_emb' in self.test_df):
+            self.test_df['text_style_emb'] = calc_style_embeddings(
+                self.test_df.text
+            )
+        if not ('text_labse_emb' in self.test_df):
+            self.test_df['text_labse_emb'] = [
+                e.cpu().numpy()
+                for e in calc_labse_embeddings(self.test_df.text)
+            ]
 
     def compute_scores(self):
         if self.tst_results is None:
@@ -168,22 +268,31 @@ class TstPerformanceMetrics:
         if valid_df.empty:
             raise ValueError("No valid 'score' values found in tst_results.")
 
-        # Select row with the highest score for each (example_number, target_style)
-        idx = valid_df.groupby(["example_number", "target_style"])["score"].idxmax()
+        # Select row with the highest score for each (example_number and target_style (if present))
+        if "target_style" in valid_df:
+            idx = valid_df.groupby(["example_number", "target_style"])["score"].idxmax()
+        else:
+            idx = valid_df.groupby(["example_number"])["score"].idxmax()
         self.best_tst_results = valid_df.loc[idx].reset_index(drop=True)
 
     def final_performance(self):
-        res = {}
-        for fs_key in TARGET_STYLES:
-            f_styles = TARGET_STYLES[fs_key]
-            if set(f_styles) <= set(self.target_styles):
-                res[fs_key] = self.best_tst_results[
-                    self.best_tst_results.target_style.isin(f_styles)
-                ].score.mean()
-        return res
+        if self.target_styles:
+            res = {}
+            for fs_key in TARGET_STYLES:
+                f_styles = TARGET_STYLES[fs_key]
+                if set(f_styles) <= set(self.target_styles):
+                    res[fs_key] = self.best_tst_results[
+                        self.best_tst_results.target_style.isin(f_styles)
+                    ].score.mean()
+            return res
+        else:
+            return {
+                'DATA_MEAN': self.best_tst_results.score.mean()
+            }
 
     # Pefrorm TST, compute scores and select best version
     def execute(self) -> None:
+        self.add_source_ppx_and_emb()
         self.produce_tst_results()
         self.compute_scores()
         self.select_best_tst_version()
