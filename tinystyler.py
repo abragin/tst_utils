@@ -1,17 +1,29 @@
+from safetensors.torch import load_file
 import torch
 from transformers import T5ForConditionalGeneration, AutoModelForCausalLM
 
+
 class TinyStyler(torch.nn.Module):
-    def __init__(self, model_name, model_type='T5', use_style=False, ctrl_embed_dim=768):
+    def __init__(
+        self, model_name,
+        model_type='T5', use_style=False, ctrl_embed_dim=768,
+        checkpoint_path=None
+    ):
         super().__init__()
         if model_type in ['T5', 'GPT']:
             self.model_type = model_type
         else:
             raise Exception("Unsupported model type: ", model_type)
         if model_type == 'T5':  
-            self.model = T5ForConditionalGeneration.from_pretrained(model_name)
+            self.model = T5ForConditionalGeneration.from_pretrained(
+                model_name,
+                use_safetensors=True
+            )
         else:
-            self.model = AutoModelForCausalLM.from_pretrained(model_name)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                use_safetensors=True
+            )
         self.use_style = use_style
         if self.use_style:
             self.ctrl_embed_dim = ctrl_embed_dim
@@ -27,6 +39,10 @@ class TinyStyler(torch.nn.Module):
                 self.proj = torch.nn.Linear(
                     self.ctrl_embed_dim, self.model.config.hidden_size
                 )
+        if checkpoint_path is not None:
+            state_dict = load_file(checkpoint_path)
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            assert not unexpected, unexpected
 
     def forward(self, input_ids, attention_mask, labels=None, style=None):
         if self.use_style:

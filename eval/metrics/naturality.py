@@ -6,7 +6,10 @@ import torch
 
 def calculate_perplexity(model_output, aggregate=False, sep='\n'):
     """ Calculate average perplexity per token and number of tokens in each text."""
-    model = AutoModelForCausalLM.from_pretrained(PERPL_MODEL_NAME).cuda()
+    model = AutoModelForCausalLM.from_pretrained(
+        PERPL_MODEL_NAME,
+        use_safetensors=True
+    ).cuda()
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(PERPL_MODEL_NAME)
     lls = []

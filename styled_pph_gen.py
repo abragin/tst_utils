@@ -276,6 +276,9 @@ def save_tst_results(tst_df, results_path):
         next_result_num = max(nums) + 1
     else:
         next_result_num = 1
+    tst_df['styled_text_style_emb'] = tst_df['styled_text_style_emb'].map(
+        lambda se: se.astype(np.float16)
+    )
     next_result_str_num = str(next_result_num).zfill(5)
     new_result_path = results_path + f"part_{next_result_str_num}.parquet.gzip"
     tst_df[tst_res_cols].to_parquet(new_result_path, compression='gzip')
@@ -308,7 +311,7 @@ class PphGenerator:
         style_df_path,
         base_df_path,
         results_path,
-        trained_model_path,
+        checkpoint_path,
         long_texts=False,
         rows_at_once=30000,
         base_model_path = "ai-forever/rugpt3small_based_on_gpt2"
@@ -330,8 +333,10 @@ class PphGenerator:
         else:
             max_length = 256
             batch_size = 10
-        model = TinyStyler(model_name=base_model_path, model_type='GPT', use_style=True).cuda()
-        model.load_state_dict(torch.load(trained_model_path+'/pytorch_model.bin'))
+        model = TinyStyler(
+            model_name=base_model_path, model_type='GPT', use_style=True,
+            checkpoint_path = checkpoint_path
+        ).cuda()
         model.eval()        
         self.tst_generator = TSTGenerator(
             model,
