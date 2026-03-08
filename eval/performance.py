@@ -6,6 +6,7 @@ from tst_utils.eval.metrics.meaning import (
     calc_labse_embeddings, length_penalty
 )
 from tst_utils.eval.metrics.style import calc_style_embeddings, add_away_towards
+from tst_utils.eval.metrics.copying import compute_all_copying_metrics
 
 
 TARGET_STYLES = {
@@ -290,7 +291,26 @@ class TstPerformanceMetrics:
                 'DATA_MEAN': self.best_tst_results.score.mean()
             }
 
-    # Pefrorm TST, compute scores and select best version
+    def compute_copying_metrics(self, df=None):
+        """Compute copying diagnostics (chrF, BLEU, ROUGE-L, n-gram Jaccard).
+
+        Adds columns to the target DataFrame (default: self.best_tst_results).
+        Does NOT modify the composite score.
+        """
+        if df is None:
+            if not hasattr(self, "best_tst_results") or self.best_tst_results is None:
+                raise AttributeError(
+                    "best_tst_results is missing. Run execute() first, "
+                    "or pass a DataFrame explicitly."
+                )
+            df = self.best_tst_results
+
+        metrics = compute_all_copying_metrics(df.text, df.styled_text)
+        for name, values in metrics.items():
+            df[name] = values
+        return df
+
+    # Perform TST, compute scores and select best version
     def execute(self) -> None:
         self.add_source_ppx_and_emb()
         self.produce_tst_results()
