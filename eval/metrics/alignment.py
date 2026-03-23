@@ -113,6 +113,24 @@ class AlignmentScorer:
         return self._span_score(unaligned_indices, total)
 
     @staticmethod
+    def rolling_density_map(unaligned_indices: list, total: int, window: int = 9) -> np.ndarray:
+        """Per-word unalignment density array (uniform kernel, edge-normalised).
+
+        density[i] = fraction of words in the window centred on i that are unaligned,
+        normalised by actual in-bounds window size so edge positions are not penalised.
+        Returns an array of length `total` with values in [0, 1].
+        """
+        if total == 0:
+            return np.zeros(0)
+        unaligned = np.zeros(total)
+        for i in unaligned_indices:
+            if 0 <= i < total:
+                unaligned[i] = 1.0
+        k = np.ones(window) / window
+        norm = np.convolve(np.ones(total), k, mode="same")
+        return (np.convolve(unaligned, k, mode="same") / norm)[:total]
+
+    @staticmethod
     def _rolling_density_score(unaligned_indices: list, total: int, window: int = 9) -> float:
         """Peak local unalignment density (uniform kernel, edge-normalised).
 
@@ -122,13 +140,7 @@ class AlignmentScorer:
         """
         if total == 0 or not unaligned_indices:
             return 0.0
-        unaligned = np.zeros(total)
-        for i in unaligned_indices:
-            if 0 <= i < total:
-                unaligned[i] = 1.0
-        k = np.ones(window) / window
-        norm    = np.convolve(np.ones(total), k, mode="same")
-        density = np.convolve(unaligned, k, mode="same") / norm
+        density = AlignmentScorer.rolling_density_map(unaligned_indices, total, window)
         return float(np.max(density))
 
     def _span_score(self, unaligned_indices: list, total: int) -> float:
