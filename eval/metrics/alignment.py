@@ -105,6 +105,16 @@ class AlignmentScorer:
             matching_methods=self._method_char(method),
             device=device,
         )
+        # RoBERTa-family tokenizers require add_prefix_space=True for pretokenized
+        # inputs (simalign calls tokenizer with is_split_into_words=True).
+        # Patch after init — simalign doesn't set this when loading the tokenizer.
+        # Original workaround in notebook 04 used a PatchedLoader; this is simpler.
+        _tok = self._aligner.embed_loader.tokenizer
+        if getattr(_tok, "add_prefix_space", None) is False:
+            from transformers import AutoTokenizer
+            self._aligner.embed_loader.tokenizer = AutoTokenizer.from_pretrained(
+                model, add_prefix_space=True
+            )
 
     def _compute_score(self, unaligned_indices: list, total: int) -> float:
         """Dispatch to the configured scoring function."""
