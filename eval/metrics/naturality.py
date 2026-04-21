@@ -4,43 +4,59 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 
 
-def calculate_perplexity(model_output, aggregate=False, sep='\n'):
-    """ Calculate average perplexity per token and number of tokens in each text."""
+def calculate_perplexity(model_output, aggregate=False, sep='\n', batch_size=32):
+    """Compute average per-token CE loss for each text using rugpt3small.
+
+    Returns (likelihoods, weights) where likelihoods[i] is mean CE loss for text i
+    and weights[i] is the token count. If aggregate=True returns a single
+    weighted-average CE loss over the full list.
+    """
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = AutoModelForCausalLM.from_pretrained(
         PERPL_MODEL_NAME,
-        use_safetensors=True
-    ).cuda()
+        use_safetensors=True,
+    ).to(device)
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(PERPL_MODEL_NAME)
-    lls = []
-    weights = []
-    for text in model_output:
-        encodings = tokenizer(f'{sep}{text}{sep}', return_tensors='pt')
-        input_ids = encodings.input_ids.to(model.device)
-        target_ids = input_ids.clone()
 
-        w = max(0, len(input_ids[0]) - 1)
-        if w > 0:
-            with torch.no_grad():
-                outputs = model(input_ids, labels=target_ids)
-                log_likelihood = outputs.loss #outputs[0]
-                ll = log_likelihood.item()
-        else:
-            ll = 0
-        lls.append(ll)
-        weights.append(w)
-    likelihoods, weights = np.array(lls), np.array(weights)
+    texts = [f'{sep}{t}{sep}' for t in model_output]
+
+    lls = []
+    ws = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        enc = tokenizer(batch, return_tensors='pt', truncation=True,
+                        max_length=512, padding=True).to(model.device)
+        with torch.no_grad():
+            out = model(**enc, labels=enc['input_ids'])
+            shift_logits = out.logits[..., :-1, :].contiguous()
+            shift_labels = enc['input_ids'][..., 1:].contiguous()
+            loss_fn = torch.nn.CrossEntropyLoss(
+                reduction='none', ignore_index=tokenizer.pad_token_id
+            )
+            token_losses = loss_fn(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            ).view(shift_labels.size())
+            attn = enc['attention_mask'][..., 1:].float()
+            sample_loss = (token_losses * attn).sum(-1) / attn.sum(-1).clamp(min=1)
+            sample_w = attn.sum(-1).long()
+        lls.extend(sample_loss.cpu().numpy().tolist())
+        ws.extend(sample_w.cpu().numpy().tolist())
+
+    likelihoods, weights = np.array(lls), np.array(ws)
     if aggregate:
-        return sum(likelihoods * weights) / sum(weights)
+        return (likelihoods * weights).sum() / weights.sum()
     return likelihoods, weights
 
+
 def naturality_score(source_perplexity, target_perplexity):
-    perpl_scaled_abs = np.maximum(target_perplexity - 4,0)
+    perpl_scaled_abs = np.maximum(target_perplexity - 4, 0)
     perpl_scaled_rel = np.maximum(
-        target_perplexity - np.maximum(source_perplexity, 4),0
+        target_perplexity - np.maximum(source_perplexity, 4), 0
     )
-    perplexity_score_abs = 1/(8 * perpl_scaled_abs + 1)
-    perplexity_score_rel = 1/(20 * perpl_scaled_rel + 1)
-    return np.sqrt(
-        perplexity_score_abs * perplexity_score_rel
-    )
+    perplexity_score_abs = 1 / (8 * perpl_scaled_abs + 1)
+    perplexity_score_rel = 1 / (20 * perpl_scaled_rel + 1)
+    return np.sqrt(perplexity_score_abs * perplexity_score_rel)
+
+
