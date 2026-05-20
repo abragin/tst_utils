@@ -18,6 +18,9 @@ Model comparison (itermax, punctuation stripping):
     rubert-tiny2:       span4 F1=0.707, AUC=0.841, 6ms/pair   ← speed fallback
     ruBert-base:        span4 F1=0.669, AUC=0.822, 11ms/pair
     ruRoberta-large:    rolling_max F1=0.735, AUC=0.907, 23ms/pair ← best overall
+                        ⚠ Do NOT use on texts with gender morphology changes (написал/написала) —
+                          contextual embeddings flag inflected cognates as CL, giving 17/34 false
+                          CL positives on gender-switch validation data. Use bert-multilingual instead.
 
 Scoring functions:
     score_fn='rolling_max' (default):
