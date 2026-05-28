@@ -7,6 +7,11 @@ from tst_utils.eval.metrics.meaning import (
 )
 from tst_utils.eval.metrics.style import calc_style_embeddings, add_away_towards
 from tst_utils.eval.metrics.copying import compute_all_copying_metrics
+from tst_utils.eval.metrics.composite import base_score_v2, compute_nat_v2
+
+_SCORE_COLS   = ['style_score', 'bert_score', 'labse_score',
+                 'text_perplexity', 'styled_text_perplexity']
+_QUALITY_COLS = ['bi_cl', 'gender_score', 'entity_score']
 
 
 TARGET_STYLES = {
@@ -248,32 +253,35 @@ class TstPerformanceMetrics:
             self.tst_results['naturality_score']
         ) ** (1./3)
 
-    def select_best_tst_version(self) -> None:
-        """
-        For each (example_number, target_style) pair, select the row with the highest 'score'
-        from self.tst_results and store the resulting DataFrame in self.best_tst_results.
-        """
+    def select_best_tst_version(self, score_col: str = 'score') -> None:
+        """For each (example_number, target_style) pair, select the row with the
+        highest value of *score_col* and store the result in self.best_tst_results.
 
+        Parameters
+        ----------
+        score_col : str
+            Column to maximise. Use 'score' (default) for the v1 composite or
+            'score_v2' for the v2 composite (requires compute_composite_v2() first).
+        """
         if not hasattr(self, "tst_results") or self.tst_results is None:
-            raise AttributeError("self.tst_results is missing. Run produce_tst_results() first.")
+            raise AttributeError("tst_results is missing. Run produce_tst_results() first.")
 
-        if "score" not in self.tst_results.columns:
-            raise ValueError("Column 'score' not found in self.tst_results. Run compute_scores() first.")
+        if score_col not in self.tst_results.columns:
+            raise ValueError(
+                f"Column '{score_col}' not found in tst_results. "
+                f"Run {'compute_scores()' if score_col == 'score' else 'compute_composite_v2()'} first."
+            )
 
-        # Ensure numeric score (in case it's stored as string)
-        self.tst_results["score"] = pd.to_numeric(self.tst_results["score"], errors="coerce")
-
-        # Drop rows with NaN scores to avoid errors
-        valid_df = self.tst_results.dropna(subset=["score"])
+        self.tst_results[score_col] = pd.to_numeric(self.tst_results[score_col], errors="coerce")
+        valid_df = self.tst_results.dropna(subset=[score_col])
 
         if valid_df.empty:
-            raise ValueError("No valid 'score' values found in tst_results.")
+            raise ValueError(f"No valid '{score_col}' values found in tst_results.")
 
-        # Select row with the highest score for each (example_number and target_style (if present))
-        if "target_style" in valid_df:
-            idx = valid_df.groupby(["example_number", "target_style"])["score"].idxmax()
+        if "target_style" in valid_df.columns:
+            idx = valid_df.groupby(["example_number", "target_style"])[score_col].idxmax()
         else:
-            idx = valid_df.groupby(["example_number"])["score"].idxmax()
+            idx = valid_df.groupby(["example_number"])[score_col].idxmax()
         self.best_tst_results = valid_df.loc[idx].reset_index(drop=True)
 
     def final_performance(self):
@@ -290,6 +298,76 @@ class TstPerformanceMetrics:
             return {
                 'DATA_MEAN': self.best_tst_results.score.mean()
             }
+
+    def compute_quality_scores(self, alignment_scorer, gender_scorer, entity_scorer) -> None:
+        """Add bi_score, cl_score, bi_cl, gender_score, entity_score to self.tst_results.
+
+        Operates on all generated versions (tst_results) so that score_v2 can be
+        used with select_best_tst_version before any selection is applied.
+
+        Parameters
+        ----------
+        alignment_scorer : AlignmentScorer
+        gender_scorer    : GenderConsistencyScorer
+        entity_scorer    : EntityConsistencyScorer
+        """
+        if self.tst_results is None:
+            raise ValueError("tst_results is missing. Run produce_tst_results() first.")
+
+        df = self.tst_results
+        al = alignment_scorer.score_batch(df.text.tolist(), df.styled_text.tolist(),
+                                          return_masks=False)
+        df['bi_score']     = al['bi_score']
+        df['cl_score']     = al['cl_score']
+        df['bi_cl']        = 1.0 - np.clip(np.maximum(al['bi_score'], al['cl_score']), 0.0, 1.0)
+
+        gn = gender_scorer.score_batch(df.text.tolist(), df.styled_text.tolist())
+        df['gender_score'] = gn['gender_score']
+
+        en = entity_scorer.score_batch(df.text.tolist(), df.styled_text.tolist())
+        df['entity_score'] = en['entity_score']
+
+    def compute_composite_v2(self) -> None:
+        """Add meaning_nolen, nat_v2, score_v2 to self.tst_results.
+
+        Required call order:
+            metrics.compute_scores()             # style_score, bert/labse, perplexities
+            metrics.compute_quality_scores(...)  # bi_cl, gender_score, entity_score
+            metrics.compute_composite_v2()       # score_v2
+        """
+        if self.tst_results is None:
+            raise ValueError("tst_results is missing. Run produce_tst_results() first.")
+
+        df = self.tst_results
+        missing_score = [c for c in _SCORE_COLS if c not in df.columns]
+        if missing_score:
+            raise ValueError(
+                f"Missing columns {missing_score} — call compute_scores() first."
+            )
+        missing_quality = [c for c in _QUALITY_COLS if c not in df.columns]
+        if missing_quality:
+            raise ValueError(
+                f"Missing columns {missing_quality} — call compute_quality_scores() first."
+            )
+
+        df['meaning_nolen'] = meaning_score(
+            df['bert_score'], df['labse_score'], np.ones(len(df))
+        )
+
+        target_styles = (
+            df['target_style'] if 'target_style' in df.columns
+            else df.get('target_style_desc', pd.Series([''] * len(df), index=df.index))
+        )
+        df['nat_v2'] = compute_nat_v2(
+            df['styled_text_perplexity'], df['text_perplexity'], target_styles
+        )
+
+        df['score_v2'] = (
+            base_score_v2(
+                df['style_score'], df['meaning_nolen'], df['bi_cl'],
+                df['gender_score'], df['entity_score']
+            ) * df['nat_v2']
+        )
 
     def compute_copying_metrics(self, df=None):
         """Compute copying diagnostics (chrF, BLEU, ROUGE-L, n-gram Jaccard).
