@@ -74,6 +74,16 @@ class AlignmentScorer:
         1 = raw fraction. Recommended: 2 for metrics, 4 for data filtering.
     device : str
         "cuda" or "cpu".
+    fallback_model : str or None
+        Model to use when the primary model raises RuntimeError (typically because
+        the combined source+target token length exceeds its positional embedding
+        limit). Recommended: "cointegrated/rubert-tiny2" (max_position_embeddings=2048,
+        F1=0.707). bert-base-multilingual-cased has the same 512 limit as BERT-base
+        and is NOT a useful fallback.
+    max_words_per_side : int or None
+        If set, truncate source and target to this many words before alignment.
+        Applied BEFORE the primary model; use as a last resort when even the
+        fallback model cannot handle the text length.
     """
 
     DEFAULT_CL_THRESHOLD = 0.25
@@ -88,6 +98,8 @@ class AlignmentScorer:
         window: int = 9,
         min_span: int = 1,
         device: str = "cuda",
+        max_words_per_side: int = None,
+        fallback_model: str = None,
     ):
         try:
             from simalign import SentenceAligner
@@ -102,22 +114,27 @@ class AlignmentScorer:
         self.score_fn = score_fn
         self.window = window
         self.min_span = min_span
-        self._aligner = SentenceAligner(
-            model=model,
-            token_type="word",
-            matching_methods=self._method_char(method),
-            device=device,
-        )
-        # RoBERTa-family tokenizers require add_prefix_space=True for pretokenized
-        # inputs (simalign calls tokenizer with is_split_into_words=True).
-        # Patch after init — simalign doesn't set this when loading the tokenizer.
-        # Original workaround in notebook 04 used a PatchedLoader; this is simpler.
-        _tok = self._aligner.embed_loader.tokenizer
-        if getattr(_tok, "add_prefix_space", None) is False:
-            from transformers import AutoTokenizer
-            self._aligner.embed_loader.tokenizer = AutoTokenizer.from_pretrained(
-                model, add_prefix_space=True
+        self.max_words_per_side = max_words_per_side
+
+        def _make_aligner(model_id):
+            al = SentenceAligner(
+                model=model_id,
+                token_type="word",
+                matching_methods=self._method_char(method),
+                device=device,
             )
+            # RoBERTa-family tokenizers require add_prefix_space=True for pretokenized
+            # inputs (simalign calls tokenizer with is_split_into_words=True).
+            tok = al.embed_loader.tokenizer
+            if getattr(tok, "add_prefix_space", None) is False:
+                from transformers import AutoTokenizer
+                al.embed_loader.tokenizer = AutoTokenizer.from_pretrained(
+                    model_id, add_prefix_space=True
+                )
+            return al
+
+        self._aligner = _make_aligner(model)
+        self._fallback_aligner = _make_aligner(fallback_model) if fallback_model else None
 
     def _compute_score(self, unaligned_indices: list, total: int) -> float:
         """Dispatch to the configured scoring function."""
@@ -190,13 +207,21 @@ class AlignmentScorer:
         return cleaned if cleaned else w
 
     def _align_pair(self, src_words: List[str], tgt_words: List[str]):
-        """Return (aligned_src_indices, aligned_tgt_indices)."""
+        """Return (aligned_src_indices, aligned_tgt_indices).
+
+        Falls back to self._fallback_aligner on RuntimeError (e.g. sequence
+        length exceeds the primary model's positional embedding limit).
+        """
         if not src_words or not tgt_words:
             return set(), set()
-        alignments = self._aligner.get_word_aligns(
-            [self._clean_word(w) for w in src_words],
-            [self._clean_word(w) for w in tgt_words],
-        )
+        src_clean = [self._clean_word(w) for w in src_words]
+        tgt_clean = [self._clean_word(w) for w in tgt_words]
+        try:
+            alignments = self._aligner.get_word_aligns(src_clean, tgt_clean)
+        except RuntimeError:
+            if self._fallback_aligner is None:
+                return set(), set()
+            alignments = self._fallback_aligner.get_word_aligns(src_clean, tgt_clean)
         al = alignments[self.method]
         return {i for i, j in al}, {j for i, j in al}
 
@@ -216,6 +241,10 @@ class AlignmentScorer:
         """
         src_words = source.split()
         tgt_words = target.split()
+
+        if self.max_words_per_side is not None:
+            src_words = src_words[:self.max_words_per_side]
+            tgt_words = tgt_words[:self.max_words_per_side]
 
         if not src_words or not tgt_words:
             return dict(bi_score=0.0, cl_score=0.0, has_bi=False, has_cl=False,
