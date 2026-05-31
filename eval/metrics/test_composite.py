@@ -114,3 +114,19 @@ def test_compute_composite_v2_missing_quality_cols():
     })
     with pytest.raises(ValueError, match='compute_quality_scores'):
         _make_metrics_with_results(df).compute_composite_v2()
+
+
+def test_compute_composite_v2_happy_path():
+    # All inputs perfect, Tolstoy target: styled_CE=5.0, source_CE=5.0
+    # tgt_ce_ref = max(6.637, 5.0) = 6.637; style_gap = 5.0 - 6.637 < 0 → nat_v2=1.0
+    df = pd.DataFrame({
+        'style_score': [1.0], 'bert_score': [1.0], 'labse_score': [1.0],
+        'text_perplexity': [5.0], 'styled_text_perplexity': [5.0],
+        'bi_score': [0.0], 'cl_score': [0.0], 'bi_cl': [1.0],
+        'gender_score': [1.0], 'entity_score': [1.0],
+        'target_style': ['Tolstoy'],
+    })
+    _make_metrics_with_results(df).compute_composite_v2()
+    assert df['score_v2'].iloc[0] == pytest.approx(1.0)
+    assert df['meaning_nolen'].iloc[0] == pytest.approx(1.0)
+    assert df['nat_v2'].iloc[0] == pytest.approx(1.0)
