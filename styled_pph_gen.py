@@ -314,8 +314,13 @@ class PphGenerator:
         checkpoint_path,
         long_texts=False,
         rows_at_once=30000,
-        base_model_path = "ai-forever/rugpt3small_based_on_gpt2"
+        base_model_path = "ai-forever/rugpt3small_based_on_gpt2",
+        assert_norm=None,
     ):
+        # `assert_norm` is threaded through to the inner TinyStyler. Default
+        # None because PphGenerator is used with both folder-14 (unit-norm)
+        # and pre-folder-14 (~15 norm) checkpoints — the caller must pick the
+        # value that matches the checkpoint they pass in.
         tokenizer = AutoTokenizer.from_pretrained(base_model_path)
         self.base_df = pd.read_parquet(base_df_path)
         self.style_df = pd.read_parquet(style_df_path)
@@ -335,7 +340,8 @@ class PphGenerator:
             batch_size = 10
         model = TinyStyler(
             model_name=base_model_path, model_type='GPT', use_style=True,
-            checkpoint_path = checkpoint_path
+            checkpoint_path=checkpoint_path,
+            assert_norm=assert_norm,
         ).cuda()
         model.eval()        
         self.tst_generator = TSTGenerator(

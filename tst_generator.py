@@ -23,6 +23,18 @@ GEN_OPTS_V3 = {   # default TinyStyler sampling params
 }
 
 class TSTGenerator:
+    """Batched style-transfer inference wrapper.
+
+    Style-embedding scale: this wrapper passes ``style_emb_dict`` /
+    ``target_style_embeddings`` straight through to ``model.generate(style=...)``.
+    The caller is responsible for matching the scale to what ``model``
+    (typically a :class:`TinyStyler`) expects. Two ways to enforce the
+    scale check:
+
+    - construct the model with ``TinyStyler(assert_norm=...)``; or
+    - pass ``assert_norm=`` to this wrapper, which will set the same attribute
+      on the inner model (overrides whatever the model was constructed with).
+    """
     def __init__(
         self,
         model,
@@ -35,6 +47,7 @@ class TSTGenerator:
         generate_options=GEN_OPTS_V1,
         max_length=512,
         min_length=32,
+        assert_norm=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -46,6 +59,23 @@ class TSTGenerator:
         self.generate_options = generate_options
         self.max_length = max_length
         self.min_length = min_length
+
+        if assert_norm is not None:
+            # Late-override of TinyStyler's scale assertion. Validate here so a
+            # bad value fails at wrapper construction, not at first forward().
+            from tst_utils.tinystyler import _VALID_ASSERT_NORM
+            if assert_norm not in _VALID_ASSERT_NORM:
+                raise ValueError(
+                    f"assert_norm must be one of {_VALID_ASSERT_NORM}, "
+                    f"got {assert_norm!r}"
+                )
+            if not hasattr(model, 'assert_norm'):
+                raise TypeError(
+                    "TSTGenerator(assert_norm=...) requires a model that exposes "
+                    "an `assert_norm` attribute (e.g. TinyStyler). Got "
+                    f"{type(model).__name__}."
+                )
+            model.assert_norm = assert_norm
 
         self.device = next(model.parameters()).device
 

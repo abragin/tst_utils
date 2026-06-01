@@ -189,7 +189,7 @@ class TstPerformanceMetrics:
             self.test_df['text_perplexity'] = calculate_perplexity(self.test_df.text)[0]
         if not ('text_style_emb' in self.test_df):
             self.test_df['text_style_emb'] = calc_style_embeddings(
-                self.test_df.text
+                self.test_df.text, normalize=False
             )
         if not ('text_labse_emb' in self.test_df):
             self.test_df['text_labse_emb'] = [
@@ -225,10 +225,10 @@ class TstPerformanceMetrics:
             print('Adding style embeddings')
         if not ('text_style_emb' in self.tst_results):
             self.tst_results['text_style_emb'] = calc_style_embeddings(
-                self.tst_results.text
+                self.tst_results.text, normalize=False
             )
         self.tst_results['styled_text_style_emb'] = calc_style_embeddings(
-            self.tst_results.styled_text
+            self.tst_results.styled_text, normalize=False
         )
         add_away_towards(self.tst_results, self.author_styles)
         if self.verbose:

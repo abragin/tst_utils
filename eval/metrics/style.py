@@ -3,9 +3,36 @@ from tst_utils.eval.model_names import STYLE_MODEL
 import numpy as np
 
 
-def calc_style_embeddings(texts):
+def calc_style_embeddings(texts, *, normalize):
+    """Encode `texts` with the project style encoder.
+
+    Args:
+        texts: iterable of strings to encode.
+        normalize: REQUIRED keyword. If True, output vectors are L2-normalized
+            to unit norm (delegated to SentenceTransformer's
+            ``normalize_embeddings``). If False, raw encoder outputs are
+            returned (typically norm ~15 for ``abragin/ruBert-style-base``).
+
+    Returns:
+        list[np.ndarray]: one 1D embedding per input text. List-of-arrays is
+        preserved (rather than a 2D ndarray) so that the result can be assigned
+        directly to a pandas Series column.
+
+    Notes:
+        - Folder-14 TinyStyler expects unit-norm style inputs; pre-folder-14
+          checkpoints expect unnormalized (~15). Pick `normalize` accordingly.
+        - The eval-side similarity metrics (`sim_measure`, `away`, `towards`)
+          are scale-invariant (angular), so `normalize=False` is correct for
+          evaluation pipelines that consume `author_styles.npz` (unnormalized).
+    """
     model = SentenceTransformer(STYLE_MODEL)
-    return [e for e in model.encode(list(texts), show_progress_bar=True)]
+    return [
+        e for e in model.encode(
+            list(texts),
+            show_progress_bar=True,
+            normalize_embeddings=normalize,
+        )
+    ]
 
 def sim_measure(u,v):
     ac_inp = np.dot(u,v)/(np.linalg.norm(u) * np.linalg.norm(v))
