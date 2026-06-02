@@ -10,11 +10,24 @@ class NewsDataset(torch.utils.data.IterableDataset):
         self, news_files, tokenizer, model_type,
         source_cols=['text_ru_pph'],
         target_col = 'text_ru',
-        min_tok_len=50, avg_tok_len=150, max_length = 512,
+        min_tok_len=50, avg_tok_len=150,
         max_tok_len=None,
         style_emb = None,
-        debug = False
+        debug = False,
+        *,
+        max_side_length = None,  # per-side token limit (passed through to BooksIterableDataset)
+        max_length = None,  # renamed -> max_side_length; sentinel for the old name
     ):
+        if max_length is not None:
+            raise ValueError(
+                "NewsDataset: `max_length` was renamed to `max_side_length` "
+                "(per-side token limit). Pass max_side_length=... instead."
+            )
+        if max_side_length is None:
+            raise ValueError(
+                "NewsDataset: `max_side_length` is required "
+                "(per-side token limit)."
+            )
         self.news_files = news_files
         self.model_type = model_type
         self.tokenizer = tokenizer
@@ -24,7 +37,7 @@ class NewsDataset(torch.utils.data.IterableDataset):
         self.news_file_ind = 0
         self.avg_tok_len = avg_tok_len
         self.max_tok_len = max_tok_len
-        self.max_length = max_length
+        self.max_side_length = max_side_length
         self.style_emb = style_emb
         self.debug = debug
 
@@ -42,7 +55,7 @@ class NewsDataset(torch.utils.data.IterableDataset):
             min_tok_len = self.min_tok_len,
             avg_tok_len = self.avg_tok_len,
             max_tok_len = self.max_tok_len,
-            max_length = self.max_length,
+            max_side_length = self.max_side_length,
             style_dict = style_dict,
             debug = self.debug
         )

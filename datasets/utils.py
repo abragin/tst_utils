@@ -3,6 +3,19 @@ from itertools import accumulate
 
 
 def gpt_tokenize_function(batch, tokenizer, max_length=256):
+    """HF-``map`` tokenizer for GPT (decoder-only) source/target pairs.
+
+    NOTE: ``max_length`` here is the **total concatenated** length —
+    ``source + EOS + target + EOS`` is tokenized as a single sequence and
+    truncated to ``max_length``. This is deliberately *different* from the
+    dataset classes' ``max_side_length`` (a per-side limit), so the names are
+    intentionally not unified. See ``t5_tokenize_function`` for the per-side
+    counterpart.
+
+    This HF-``map`` path is used by the folder-09 training scripts and the
+    folder-11 long-text fine-tuning notebook; folder-14 (current best short
+    model) instead uses ``StyleTransferDataset``.
+    """
     # Build concatenated texts with EOS tokens
     input_txts = [
         src + tokenizer.eos_token + tgt + tokenizer.eos_token
@@ -20,6 +33,15 @@ def gpt_tokenize_function(batch, tokenizer, max_length=256):
     return model_inputs
 
 def t5_tokenize_function(example, tokenizer, max_length = 128):
+     """HF-``map`` tokenizer for T5 (encoder-decoder) source/target pairs.
+
+     Here ``max_length`` is **per-side**: source and target (``text_target``)
+     are each truncated to ``max_length`` independently — the same semantics
+     as the dataset classes' ``max_side_length``, but kept under the name
+     ``max_length`` for this HF-``map`` path (used by folder-09 / folder-11).
+     Contrast with ``gpt_tokenize_function``, where ``max_length`` is the
+     total concatenated length.
+     """
      return tokenizer(
         example["source"],
         text_target = example["target"],
@@ -29,6 +51,15 @@ def t5_tokenize_function(example, tokenizer, max_length = 128):
     )
 
 def processing_fn(ds, tokenizer, max_length, model_type="T5"):
+    """Apply the HF-``map`` tokenizer for ``model_type`` to a dataset.
+
+    NOTE: ``max_length`` is forwarded to the per-model helper, where its
+    meaning differs — **per-side** for T5 (``t5_tokenize_function``) and
+    **total concatenated** length for GPT (``gpt_tokenize_function``). This
+    dispatcher therefore carries the same model-dependent ambiguity; the value
+    is intentionally left under the name ``max_length`` for this older
+    HF-``map`` path (the dataset classes use ``max_side_length`` instead).
+    """
     if model_type == "T5":
         tok_fn = t5_tokenize_function
     elif model_type == "GPT":

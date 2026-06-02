@@ -353,9 +353,8 @@ class PphGenerator:
             batch_size=batch_size,
             num_sequences=1,
             generate_options=GEN_OPTS_V3,
-            # max_length=512,
-            max_length=max_length,
-            # min_length=32,
+            max_input_length=max_length,
+            max_output_length=max_length,
         )
 
     def execute(self):

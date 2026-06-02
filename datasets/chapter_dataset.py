@@ -7,12 +7,26 @@ class ChapterDataset(torch.utils.data.Dataset):
     def __init__(
         self, chapter_df, tokenizer, source_cols,
         length_sampler,
-        max_length, # max token length of source and target texts (separately)
         model_type,
         max_tok_len = None, # Disired max token length of source and target texts (not guaranteed)
         target_col = 'text_ru',
-        style_vector = None
+        style_vector = None,
+        *,
+        max_side_length = None, # per-side token limit (source and target each truncated to it; for GPT they are concatenated so the training sequence is ~2x this)
+        max_length = None, # renamed -> max_side_length; sentinel for the old name
     ):
+        if max_length is not None:
+            raise ValueError(
+                "ChapterDataset: `max_length` was renamed to `max_side_length` "
+                "(per-side token limit; for GPT, source and target are "
+                "concatenated so the training sequence is ~2x this). "
+                "Pass max_side_length=... instead."
+            )
+        if max_side_length is None:
+            raise ValueError(
+                "ChapterDataset: `max_side_length` is required "
+                "(per-side token limit)."
+            )
         self.target_col = target_col
         self.texts_target = chapter_df[self.target_col].tolist()
         present_source_cols = [c for c in source_cols if (chapter_df[c] != '').any()]
@@ -27,9 +41,9 @@ class ChapterDataset(torch.utils.data.Dataset):
             self.model_type = model_type
         else:
             raise Exception("Unsupported model type: ", model_type)
-        self.max_length = max_length
+        self.max_side_length = max_side_length
 
-        if model_type == 'T5': 
+        if model_type == 'T5':
             ids_up_bound = -1
         else:
             ids_up_bound  = None
@@ -37,14 +51,14 @@ class ChapterDataset(torch.utils.data.Dataset):
         self.target_input_ids = [
             iids[:ids_up_bound] # Skip EOS token in case of T5
             for iids in tokenizer(
-                self.texts_target, truncation=True, max_length=max_length
+                self.texts_target, truncation=True, max_length=max_side_length
             )['input_ids']
         ]
         self.source_input_ids = {
             c: [
                     iids[:ids_up_bound] # Skip EOS token in case of T5
                     for iids in tokenizer(
-                        self.texts_source[c], truncation=True, max_length=max_length
+                        self.texts_source[c], truncation=True, max_length=max_side_length
                     )['input_ids']
             ]
             for c in present_source_cols
@@ -80,10 +94,10 @@ class ChapterDataset(torch.utils.data.Dataset):
         if self.model_type == 'T5':
             if self.author_token_ids:
                 source_ids = self.author_token_ids + source_ids
-            if len(source_ids) > (self.max_length-1):
-                source_ids = source_ids[:self.max_length-1]
-            if len(target_ids) > (self.max_length-1):
-                target_ids = target_ids[:self.max_length-1]
+            if len(source_ids) > (self.max_side_length-1):
+                source_ids = source_ids[:self.max_side_length-1]
+            if len(target_ids) > (self.max_side_length-1):
+                target_ids = target_ids[:self.max_side_length-1]
 
             sep_token_id = self.eos_token_id
             source_ids.append(sep_token_id)
@@ -97,10 +111,10 @@ class ChapterDataset(torch.utils.data.Dataset):
                 'style': self.style_vector if self.style_vector is not None else None
             }
         elif self.model_type == 'GPT':
-            if len(source_ids) > (self.max_length-2):
-                source_ids = source_ids[:self.max_length-1]
-            if len(target_ids) > (self.max_length-2):
-                target_ids = target_ids[:self.max_length-1]
+            if len(source_ids) > (self.max_side_length-2):
+                source_ids = source_ids[:self.max_side_length-1]
+            if len(target_ids) > (self.max_side_length-2):
+                target_ids = target_ids[:self.max_side_length-1]
             sep_token_id = self.eos_token_id
             input_ids = (
                 source_ids

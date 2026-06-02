@@ -208,12 +208,14 @@ def test_tst_generator_overrides_assert_norm():
     gen = TSTGenerator(
         model=inner, tokenizer=MagicMock(), target_styles=None,
         model_type='GPT', assert_norm='unnormalized',
+        max_input_length=256, max_output_length=256,
     )
     assert inner.assert_norm == 'unnormalized'
     # Default (None) leaves model alone.
     inner2 = _make_stub(assert_norm='normalized')
     inner2.parameters = lambda: iter([torch.zeros(1)])
-    TSTGenerator(model=inner2, tokenizer=MagicMock(), target_styles=None)
+    TSTGenerator(model=inner2, tokenizer=MagicMock(), target_styles=None,
+                 max_input_length=256, max_output_length=256)
     assert inner2.assert_norm == 'normalized'
 
 
@@ -223,7 +225,8 @@ def test_tst_generator_rejects_invalid_assert_norm():
     inner.parameters = lambda: iter([torch.zeros(1)])
     with pytest.raises(ValueError, match='assert_norm'):
         TSTGenerator(model=inner, tokenizer=MagicMock(), target_styles=None,
-                     assert_norm='bogus')
+                     assert_norm='bogus',
+                     max_input_length=256, max_output_length=256)
 
 
 def test_tst_generator_rejects_model_without_assert_norm():
@@ -232,4 +235,5 @@ def test_tst_generator_rejects_model_without_assert_norm():
     fake.parameters = lambda: iter([torch.zeros(1)])
     with pytest.raises(TypeError, match='assert_norm'):
         TSTGenerator(model=fake, tokenizer=MagicMock(), target_styles=None,
-                     assert_norm='normalized')
+                     assert_norm='normalized',
+                     max_input_length=256, max_output_length=256)

@@ -22,7 +22,8 @@ class TstViaGPTSmall:
             model_type="GPT",
             batch_size=8,
             generate_options=GEN_OPTS_V1,
-            max_length=512,
+            max_input_length=512,
+            max_output_length=512,
         )
 
     def __call__(self, texts, target_style):

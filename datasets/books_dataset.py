@@ -9,10 +9,22 @@ class BooksDataset(torch.utils.data.Dataset):
         self, books_df, tokenizer, source_cols,
         model_type, length_sampler,
         target_col = 'text_ru',
-        max_length = 512,
         style_dict = None,
-        disable_tqdm = True
+        disable_tqdm = True,
+        *,
+        max_side_length = None,  # per-side token limit (passed through to ChapterDataset)
+        max_length = None,  # renamed -> max_side_length; sentinel for the old name
     ):
+        if max_length is not None:
+            raise ValueError(
+                "BooksDataset: `max_length` was renamed to `max_side_length` "
+                "(per-side token limit). Pass max_side_length=... instead."
+            )
+        if max_side_length is None:
+            raise ValueError(
+                "BooksDataset: `max_side_length` is required "
+                "(per-side token limit)."
+            )
         grouped = books_df.groupby(['author', 'title', 'chapter_pos'])
         self.chapter_datasets = []
         for _, chapter_df in tqdm(grouped, disable=disable_tqdm):
@@ -22,7 +34,7 @@ class BooksDataset(torch.utils.data.Dataset):
                 source_cols = source_cols,
                 model_type = model_type,
                 length_sampler = length_sampler,
-                max_length = max_length,
+                max_side_length = max_side_length,
                 style_vector = style_dict[chapter_df.iloc[0].author] if style_dict else None
             ))
         self.total_length = sum(len(dataset) for dataset in self.chapter_datasets)
@@ -62,10 +74,23 @@ class BooksIterableDataset(torch.utils.data.IterableDataset):
         model_type,
         length_sampler,
         target_col = 'text_ru',
-        max_length = 512,
         max_samples=None, debug=False,
-        style_dict = None
+        style_dict = None,
+        *,
+        max_side_length = None,  # per-side token limit (passed through to BooksDataset)
+        max_length = None,  # renamed -> max_side_length; sentinel for the old name
     ):
+        if max_length is not None:
+            raise ValueError(
+                "BooksIterableDataset: `max_length` was renamed to "
+                "`max_side_length` (per-side token limit). "
+                "Pass max_side_length=... instead."
+            )
+        if max_side_length is None:
+            raise ValueError(
+                "BooksIterableDataset: `max_side_length` is required "
+                "(per-side token limit)."
+            )
         self.books_dataset = BooksDataset(
             books_df,
             tokenizer = tokenizer,
@@ -73,7 +98,7 @@ class BooksIterableDataset(torch.utils.data.IterableDataset):
             model_type = model_type,
             target_col = target_col,
             length_sampler = length_sampler,
-            max_length = max_length,
+            max_side_length = max_side_length,
             style_dict = style_dict
         )
         self.index = list(range(self.books_dataset.total_length))

@@ -7,15 +7,28 @@ class StyleTransferDataset(Dataset):
         self,
         df,
         tokenizer,
-        max_length, # For source & target separately
         is_train: bool,
         model_type: str,  # "GPT" or "T5"
+        *,
+        max_side_length=None,  # per-side token limit (source & target each truncated to it)
+        max_length=None,  # renamed -> max_side_length; sentinel for the old name
     ):
         assert model_type in {"GPT", "T5"}
+        if max_length is not None:
+            raise ValueError(
+                "StyleTransferDataset: `max_length` was renamed to "
+                "`max_side_length` (per-side token limit). "
+                "Pass max_side_length=... instead."
+            )
+        if max_side_length is None:
+            raise ValueError(
+                "StyleTransferDataset: `max_side_length` is required "
+                "(per-side token limit)."
+            )
 
         self.df = df.reset_index(drop=True)
         self.tokenizer = tokenizer
-        self.max_length = max_length
+        self.max_side_length = max_side_length
         self.is_train = is_train
         self.model_type = model_type
 
@@ -34,13 +47,13 @@ class StyleTransferDataset(Dataset):
             src,
             add_special_tokens=False,
             truncation=True,
-            max_length=self.max_length,
+            max_length=self.max_side_length,
         )
         tgt_enc = self.tokenizer(
             tgt,
             add_special_tokens=False,
             truncation=True,
-            max_length=self.max_length,
+            max_length=self.max_side_length,
         )
 
         src_ids = src_enc["input_ids"]
@@ -100,7 +113,7 @@ class StyleTransferDataset(Dataset):
             src_text,
             text_target=tgt_text,
             truncation=True,
-            max_length=self.max_length,
+            max_length=self.max_side_length,
             padding=False,
             return_tensors="pt",
         )
