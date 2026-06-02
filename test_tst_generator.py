@@ -124,6 +124,46 @@ def test_t5_uses_decoder_max_length(t5_tokenizer):
     assert "max_new_tokens" not in call["kwargs"]
 
 
+@pytest.mark.parametrize("bad_opts", [
+    {"num_return_sequences": 3},   # collides with self.num_sequences
+    {"max_new_tokens": 99},        # collides with the active GPT length kwarg
+    {"style": object()},           # collides with the embeddings style kwarg
+    {"input_ids": None},           # collides with the tokenized inputs
+])
+def test_conflicting_generate_options_raises(gpt_tokenizer, bad_opts):
+    """generate_options must not override wrapper-controlled generate kwargs.
+
+    Pre-refactor these were passed explicitly before **generate_options, so a
+    duplicate raised. The merged-dict refactor must keep failing fast rather
+    than letting generate_options silently win.
+    """
+    model = FakeModel()
+    gen = TSTGenerator(
+        model, gpt_tokenizer, target_styles=None, model_type="GPT",
+        style_emb_dict={"News": np.ones(8, dtype=np.float32)},
+        batch_size=4, generate_options=bad_opts,
+        max_input_length=16, max_output_length=24, min_output_length=5,
+    )
+    with pytest.raises(ValueError, match="wrapper-controlled"):
+        gen.perform_tst(["слово"], target_style="News")
+
+
+def test_nonactive_length_key_does_not_clash(gpt_tokenizer):
+    """A GPT model reserves max_new_tokens, not max_length — so a stray
+    max_length in generate_options is NOT a wrapper collision (matches the
+    pre-refactor per-kwarg semantics) and is forwarded to generate as-is."""
+    model = FakeModel()
+    gen = TSTGenerator(
+        model, gpt_tokenizer, target_styles=None, model_type="GPT",
+        style_emb_dict={"News": np.ones(8, dtype=np.float32)},
+        batch_size=4, generate_options={"max_length": 50},
+        max_input_length=16, max_output_length=24, min_output_length=5,
+    )
+    gen.perform_tst(["слово"], target_style="News")  # must not raise
+    assert model.last_call["kwargs"]["max_length"] == 50
+    assert model.last_call["kwargs"]["max_new_tokens"] == 24
+
+
 def test_old_max_length_kwarg_raises(gpt_tokenizer):
     with pytest.raises(ValueError, match="max_input_length"):
         TSTGenerator(

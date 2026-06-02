@@ -139,6 +139,91 @@ class TSTGenerator:
                 raise ValueError(f"Unsupported style: {target_style}")
             return f"<{target_style.lower()}>"
 
+    def _gen_len_kwargs(self):
+        """Generated-length kwargs, keyed by model family.
+
+        GPT (decoder-only) counts *new* tokens; T5 (encoder-decoder) counts
+        decoder ``max_length`` / ``min_length``. See the class docstring.
+        """
+        if self.model_type == "GPT":
+            return {
+                "max_new_tokens": self.max_output_length,
+                "min_new_tokens": self.min_output_length,
+            }
+        return {
+            "max_length": self.max_output_length,
+            "min_length": self.min_output_length,
+        }
+
+    def _prepare_inputs(self, batch_texts, style_token=None):
+        """Tokenize a batch into model-ready, on-device generate inputs.
+
+        ``style_token=None`` -> embeddings path (style is supplied separately
+        via the ``style=`` generate kwarg). ``style_token`` set -> author-tag
+        path, where the tag is woven into the text itself.
+        """
+        if style_token is None:
+            # Embeddings path: GPT gets a trailing eos; T5 takes the raw text.
+            if self.model_type == "GPT":
+                ipt = self.tokenizer(
+                    [t + self.tokenizer.eos_token for t in batch_texts],
+                    return_tensors="pt", padding=True, truncation=True,
+                    max_length=self.max_input_length,
+                )
+            else:  # T5
+                ipt = self.tokenizer(
+                    list(batch_texts),
+                    return_tensors="pt", padding=True, truncation=True,
+                    max_length=self.max_input_length,
+                )
+            return {k: v.to(self.device) for k, v in ipt.items()}
+
+        # Author-tag path.
+        if self.model_type == "GPT":
+            # The tag goes at the END of GPT inputs and the post-generation
+            # cleanup splits on it. Truncate the text first and append the tag
+            # AFTER, so truncation can never clip the trailing tag.
+            tag_ids = self.tokenizer(
+                " " + style_token, add_special_tokens=False
+            )["input_ids"]
+            keep = max(1, self.max_input_length - len(tag_ids))
+            batch_input_ids = [
+                self.tokenizer(
+                    txt, add_special_tokens=False,
+                    truncation=True, max_length=keep,
+                )["input_ids"] + tag_ids
+                for txt in batch_texts
+            ]
+            ipt = self.tokenizer.pad(
+                {"input_ids": batch_input_ids}, padding=True, return_tensors="pt",
+            )
+        else:  # T5 — tag is at the front, simple truncation is safe
+            inputs = [style_token + " " + txt for txt in batch_texts]
+            ipt = self.tokenizer(
+                inputs, return_tensors="pt", padding=True, truncation=True,
+                max_length=self.max_input_length,
+            )
+        return ipt.to(self.device)
+
+    def _decode(self, output_ids, style_token=None):
+        """Decode generated ids to strings.
+
+        Only the tag+GPT path needs special handling: those outputs include the
+        prompt (generated from ``input_ids``), so we split on the trailing tag
+        and trim at the eos. Every other path — including embeddings+GPT, which
+        generates from ``inputs_embeds`` and therefore returns *only* new tokens
+        (no prompt echo) — decodes plainly with ``skip_special_tokens=True``.
+        """
+        if style_token is not None and self.model_type == "GPT":
+            decoded = self.tokenizer.batch_decode(output_ids, skip_special_tokens=False)
+            cleaned = []
+            for t in decoded:
+                if style_token in t:
+                    t = t.split(style_token, 1)[1].split(self.tokenizer.eos_token)[0]
+                cleaned.append(t.strip())
+            return cleaned
+        return self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+
     def perform_tst(self, texts, target_style=None, target_style_embeddings=None):
         """
         Perform text style transfer on a list of input texts.
@@ -158,7 +243,10 @@ class TSTGenerator:
             end = start + self.batch_size
             batch_texts = texts[start:end]
 
-            # --- Determine style embeddings or tag ---
+            # Resolve this batch's style representation: either an embeddings
+            # tensor (passed via the `style=` generate kwarg) or an author-tag
+            # string (woven into the input text by `_prepare_inputs`).
+            style_embs, style_token = None, None
             if target_style_embeddings is not None:
                 batch_embs = target_style_embeddings[start:end]
                 if len(batch_embs) != len(batch_texts):
@@ -167,108 +255,33 @@ class TSTGenerator:
             elif self.style_emb_dict is not None:
                 style_embs = self._get_style_representation(target_style, len(batch_texts))
             else:
-                style_embs = None # will use author tags path
-
-            if style_embs is not None:
-                # embeddings path
-                if self.model_type == "GPT":
-                    ipt = self.tokenizer(
-                        [t + self.tokenizer.eos_token for t in batch_texts],
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=self.max_input_length,
-                    )
-                    gen_len_kwargs = {
-                        "max_new_tokens": self.max_output_length,
-                        "min_new_tokens": self.min_output_length,
-                    }
-                else:  # T5
-                    ipt = self.tokenizer(
-                        list(batch_texts),
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=self.max_input_length,
-                    )
-                    gen_len_kwargs = {
-                        "max_length": self.max_output_length,
-                        "min_length": self.min_output_length,
-                    }
-
-                ipt = {k: v.to(self.device) for k, v in ipt.items()}
-
-                # Generate
-                output_sequences = self.model.generate(
-                    input_ids=ipt["input_ids"],
-                    attention_mask=ipt["attention_mask"],
-                    style=style_embs,
-                    num_return_sequences=self.num_sequences,
-                    **gen_len_kwargs,
-                    **self.generate_options,
-                )
-                decoded = self.tokenizer.batch_decode(output_sequences, skip_special_tokens=True)
-
-            else:  # author tags path
                 style_token = self._get_style_representation(target_style, len(batch_texts))
 
-                if self.model_type == "GPT":
-                    # The style tag goes at the END of GPT inputs and the
-                    # post-generation cleanup splits on it. Truncate the text
-                    # first and append the tag AFTER, so truncation can never
-                    # clip the trailing tag.
-                    tag_ids = self.tokenizer(
-                        " " + style_token, add_special_tokens=False
-                    )["input_ids"]
-                    keep = max(1, self.max_input_length - len(tag_ids))
-                    batch_input_ids = [
-                        self.tokenizer(
-                            txt, add_special_tokens=False,
-                            truncation=True, max_length=keep,
-                        )["input_ids"] + tag_ids
-                        for txt in batch_texts
-                    ]
-                    ipt = self.tokenizer.pad(
-                        {"input_ids": batch_input_ids},
-                        padding=True,
-                        return_tensors="pt",
-                    ).to(self.device)
-                    gen_len_kwargs = {
-                        "max_new_tokens": self.max_output_length,
-                        "min_new_tokens": self.min_output_length,
-                    }
-                else:  # T5 — tag is at the front, simple truncation is safe
-                    inputs = [style_token + " " + txt for txt in batch_texts]
-                    ipt = self.tokenizer(
-                        inputs,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=self.max_input_length,
-                    ).to(self.device)
-                    gen_len_kwargs = {
-                        "max_length": self.max_output_length,
-                        "min_length": self.min_output_length,
-                    }
+            ipt = self._prepare_inputs(batch_texts, style_token=style_token)
+            gen_kwargs = {
+                "num_return_sequences": self.num_sequences,
+                **self._gen_len_kwargs(),
+            }
+            if style_embs is not None:
+                gen_kwargs["style"] = style_embs
 
-                output_ids = self.model.generate(
-                    **ipt,
-                    num_return_sequences=self.num_sequences,
-                    **gen_len_kwargs,
-                    **self.generate_options,
+            # Fail fast if generate_options tries to set a wrapper-controlled
+            # kwarg. Pre-refactor these were passed explicitly before
+            # **self.generate_options, so a duplicate raised TypeError; merging
+            # into one dict would instead let generate_options silently win.
+            # Key on the *active* kwargs only (e.g. GPT reserves max_new_tokens,
+            # not max_length), matching the original collision semantics.
+            clash = (set(gen_kwargs) | set(ipt)) & set(self.generate_options)
+            if clash:
+                raise ValueError(
+                    f"generate_options may not set wrapper-controlled kwargs "
+                    f"{sorted(clash)} — these come from num_sequences / "
+                    f"max_output_length / min_output_length / style / the "
+                    f"tokenized inputs. Remove them from generate_options."
                 )
 
-                # For GPT with tags, strip everything before/including tag if needed
-                if self.model_type == "GPT":
-                    decoded = self.tokenizer.batch_decode(output_ids, skip_special_tokens=False)
-                    cleaned = []
-                    for t in decoded:
-                        if style_token in t:
-                            t = t.split(style_token, 1)[1].split(self.tokenizer.eos_token)[0]
-                        cleaned.append(t.strip())
-                    decoded = cleaned
-                else:
-                    decoded = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+            output_ids = self.model.generate(**ipt, **gen_kwargs, **self.generate_options)
+            decoded = self._decode(output_ids, style_token=style_token)
 
             grouped = [decoded[i:i + self.num_sequences] for i in range(0, len(decoded), self.num_sequences)]
             results.extend(grouped)
