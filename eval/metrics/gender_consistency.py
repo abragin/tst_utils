@@ -87,14 +87,12 @@ class GenderConsistencyScorer:
 
     @staticmethod
     def _load_aligner(device: str):
-        from tst_utils.eval.metrics.alignment import AlignmentScorer
-        return AlignmentScorer(
-            model="bert",
-            method="itermax",
-            score_fn="span",
-            min_span=1,
-            device=device,
-        )
+        # BatchedAligner (mBERT, SimAlign default layer 8) — gender uses only the raw
+        # alignment edges (not bi/cl scores), so score_fn/threshold are irrelevant.
+        # No fallback_model: overflow (>512 subwords) → empty edges → score_B=1.0,
+        # matching the previous IndexError guard. align_batch batches score_B.
+        from tst_utils.eval.metrics.alignment import BatchedAligner
+        return BatchedAligner(model="bert", layer=8, method="itermax", device=device)
 
     def _tag_text(self, text: str):
         """Return list of (word_str, tag_or_None) using razdel tokenisation."""
@@ -193,35 +191,13 @@ class GenderConsistencyScorer:
             return 1.0
         return self._distribution_score(src_tokens, tgt_tokens)
 
-    def _score_B(self, source: str, target: str) -> float:
-        """Approach B: hard alignment (SimAlign bert-multilingual, itermax)."""
-        src_words = source.split()
-        tgt_words = target.split()
-        if not src_words or not tgt_words:
-            return 1.0
-
-        src_gmap = self._build_gender_map(source)
-        tgt_gmap = self._build_gender_map(target)
+    @staticmethod
+    def _score_B_from_edges(edges, src_gmap: dict, tgt_gmap: dict) -> float:
+        """Gender-agreement over aligned word edges (i = src word, j = tgt word)."""
         if not src_gmap and not tgt_gmap:
             return 1.0
-
-        try:
-            al = self._aligner._aligner.get_word_aligns(
-                [self._aligner._clean_word(w) for w in src_words],
-                [self._aligner._clean_word(w) for w in tgt_words],
-            )[self._aligner.method]
-        except (IndexError, RuntimeError):
-            # Very long texts (>512 subword tokens) cause simalign IndexError.
-            # score_B falls back to 1.0 (no switch detected); only score_A contributes.
-            LOG.warning(
-                "score_B fallback: alignment failed for text of length %d/%d words "
-                "(likely >512 subword tokens). Returning score_B=1.0.",
-                len(src_words), len(tgt_words),
-            )
-            return 1.0
-
         n_gendered = n_agree = 0
-        for i, j in al:
+        for i, j in edges:
             sg = src_gmap.get(i)
             tg = tgt_gmap.get(j)
             if sg and tg:
@@ -229,6 +205,21 @@ class GenderConsistencyScorer:
                 if sg == tg:
                     n_agree += 1
         return 1.0 if n_gendered == 0 else n_agree / n_gendered
+
+    def _score_B(self, source: str, target: str) -> float:
+        """Approach B: hard alignment (SimAlign bert-multilingual, itermax).
+
+        Edges come from BatchedAligner.align_batch. Overflow (>512 subwords) with no
+        fallback configured yields empty edges → score_B=1.0 (previous behaviour).
+        """
+        if not source.split() or not target.split():
+            return 1.0
+        src_gmap = self._build_gender_map(source)
+        tgt_gmap = self._build_gender_map(target)
+        if not src_gmap and not tgt_gmap:
+            return 1.0
+        edges = self._aligner.align_batch([source], [target])[0]
+        return self._score_B_from_edges(edges, src_gmap, tgt_gmap)
 
     # ── public interface ──────────────────────────────────────────────────────
 
@@ -277,13 +268,48 @@ class GenderConsistencyScorer:
             activated    : np.ndarray[bool]
             has_switch   : np.ndarray[bool]
         """
-        # Serial loop — SimAlign does not support batch inference here.
-        # At ~27 pairs/s on GPU, expect ~60 min for 100k pairs.
-        results = [self.score_pair(s, t) for s, t in zip(sources, targets)]
+        # Batched. Two reuse wins over the per-pair loop, both keyed on the fact
+        # that each source repeats across its N targets (≈25× in eval):
+        #   - SimAlign alignment is GPU-batched + source-encoding-reused via
+        #     BatchedAligner.align_batch (the ~72%-of-cost component);
+        #   - source-side morphology (rupostagger: gender tokens + gender map) is
+        #     computed ONCE per unique source instead of per row.
+        # Produces output identical to the per-pair score_pair loop (rupostagger
+        # is deterministic; alignment edges are bit-exact vs per-pair).
+        n = len(sources)
+        score_a = np.ones(n)
+        activated = np.zeros(n, dtype=bool)
+        src_gmaps = [None] * n
+        tgt_gmaps = [None] * n
+        nonempty = [False] * n
+        src_cache = {}  # source string -> (pron_present, src_tokens, src_gmap)
+        for k, (s, t) in enumerate(zip(sources, targets)):
+            if not s.split() or not t.split():
+                continue
+            nonempty[k] = True
+            if s not in src_cache:
+                pron, s_tokens = self._extract_gender_tokens(s)
+                src_cache[s] = (pron, s_tokens, self._build_gender_map(s))
+            pron, s_tokens, s_gmap = src_cache[s]
+            activated[k] = pron
+            # score_A reconstructed from cached source tokens + per-row target tokens
+            _, t_tokens = self._extract_gender_tokens(t)
+            score_a[k] = 1.0 if not pron else self._distribution_score(s_tokens, t_tokens)
+            src_gmaps[k] = s_gmap
+            tgt_gmaps[k] = self._build_gender_map(t)
+
+        edges_list = self._aligner.align_batch(sources, targets)  # batched, source-reused
+
+        score_b = np.ones(n)
+        for k in range(n):
+            if nonempty[k]:
+                score_b[k] = self._score_B_from_edges(
+                    edges_list[k], src_gmaps[k] or {}, tgt_gmaps[k] or {})
+        combined = (score_a + score_b) / 2.0
         return dict(
-            gender_score=np.array([r["gender_score"] for r in results]),
-            score_A=np.array([r["score_A"] for r in results]),
-            score_B=np.array([r["score_B"] for r in results]),
-            activated=np.array([r["activated"] for r in results]),
-            has_switch=np.array([r["has_switch"] for r in results]),
+            gender_score=combined,
+            score_A=score_a,
+            score_B=score_b,
+            activated=activated,
+            has_switch=combined < self.SWITCH_THRESHOLD,
         )
