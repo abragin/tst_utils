@@ -83,12 +83,20 @@ class AlignmentScorer:
         1 = raw fraction. Recommended: 2 for metrics, 4 for data filtering.
     device : str
         "cuda" or "cpu".
+    fallback : AlignmentScorer or None
+        Preconfigured scorer used for pairs whose source or target exceeds the
+        primary model's positional-embedding budget. The fallback applies its OWN
+        model + score_fn/window/min_span/thresholds (e.g. rubert-tiny2 with its
+        validated span/min_span=4 regime), not the primary's. Mutually exclusive
+        with `fallback_model`. Overflow rows are detected proactively (subword
+        pre-count, no primary forward pass) so the over-budget sequence never
+        reaches the primary encoder.
     fallback_model : str or None
-        Model to use when the primary model raises RuntimeError (typically because
-        the combined source+target token length exceeds its positional embedding
-        limit). Recommended: "cointegrated/rubert-tiny2" (max_position_embeddings=2048,
-        F1=0.707). bert-base-multilingual-cased has the same 512 limit as BERT-base
-        and is NOT a useful fallback.
+        Back-compat shorthand: builds an internal fallback `AlignmentScorer` on this
+        model under the validated span/min_span=4 regime. Recommended:
+        "cointegrated/rubert-tiny2" (max_position_embeddings=2048, span4 F1=0.707).
+        bert-base-multilingual-cased has the same 512 limit and is NOT a useful
+        fallback. Mutually exclusive with `fallback`.
     max_words_per_side : int or None
         If set, truncate source and target to this many words before alignment.
         Applied BEFORE the primary model; use as a last resort when even the
@@ -109,11 +117,17 @@ class AlignmentScorer:
         device: str = "cuda",
         max_words_per_side: int = None,
         fallback_model: str = None,
+        fallback: "AlignmentScorer" = None,
     ):
         try:
             from simalign import SentenceAligner
         except ImportError:
             raise ImportError("simalign is required: pip install simalign")
+
+        if fallback is not None and fallback_model is not None:
+            raise ValueError(
+                "pass either `fallback` (a preconfigured AlignmentScorer) or "
+                "`fallback_model` (str), not both")
 
         self.method = method
         self.bi_threshold = bi_threshold if bi_threshold is not None else (
@@ -140,10 +154,44 @@ class AlignmentScorer:
                 al.embed_loader.tokenizer = AutoTokenizer.from_pretrained(
                     model_id, add_prefix_space=True
                 )
+            # Clamp the requested layer to the model depth: SimAlign defaults to
+            # layer 8, but small fallback models (e.g. rubert-tiny2, 3 hidden layers)
+            # have fewer — without this the fallback raised ValueError at encode time
+            # (the latent reason the tiny2 fallback never actually worked). No-op for
+            # deep models (ruRoberta 24, mBERT 12). tiny2 → layer 3 (validated).
+            n_hidden = al.embed_loader.emb_model.config.num_hidden_layers
+            if al.embed_loader.layer > n_hidden:
+                al.embed_loader.layer = n_hidden
             return al
 
         self._aligner = _make_aligner(model)
-        self._fallback_aligner = _make_aligner(fallback_model) if fallback_model else None
+        self._tok = self._aligner.embed_loader.tokenizer
+
+        # Proactive over-budget guard: a pair whose per-word subword sum exceeds this
+        # budget is routed to the fallback BEFORE the primary forward pass, so the
+        # over-budget sequence never trips the primary encoder's positional-index
+        # assert. The per-word `tokenize` sum is a verified true upper bound on the
+        # encoder's content-position count (task 2A.3.2 Step 0); the margin covers
+        # the 2 special tokens. RoBERTa-family reserve extra positions (padding_idx).
+        cfg = self._aligner.embed_loader.emb_model.config
+        mpe = getattr(cfg, "max_position_embeddings", 512)
+        mt = getattr(cfg, "model_type", "")
+        margin = 4 if "roberta" in str(mt).lower() else 2
+        self._max_subwords = mpe - margin
+
+        # Fallback as a preconfigured scorer that applies its OWN scoring regime.
+        if fallback is not None:
+            self._fallback = fallback
+        elif fallback_model is not None:
+            # Back-compat: build a span4 fallback under the fallback model's own
+            # validated regime (was: inherit the primary's score_fn/window — the bug).
+            self._fallback = AlignmentScorer(
+                model=fallback_model, method=method, score_fn="span", min_span=4,
+                cl_threshold=cl_threshold, device=device,
+                max_words_per_side=max_words_per_side,
+            )
+        else:
+            self._fallback = None
 
     def _compute_score(self, unaligned_indices: list, total: int) -> float:
         """Dispatch to the configured scoring function."""
@@ -215,23 +263,13 @@ class AlignmentScorer:
         cleaned = re.sub(r'^[^\w]+|[^\w]+$', '', w, flags=re.UNICODE)
         return cleaned if cleaned else w
 
-    def _align_pair(self, src_words: List[str], tgt_words: List[str]):
-        """Return (aligned_src_indices, aligned_tgt_indices).
+    def _n_subwords(self, clean_words: List[str]) -> int:
+        return sum(len(self._tok.tokenize(w)) for w in clean_words)
 
-        Falls back to self._fallback_aligner on RuntimeError (e.g. sequence
-        length exceeds the primary model's positional embedding limit).
-        """
-        if not src_words or not tgt_words:
-            return set(), set()
-        src_clean = [self._clean_word(w) for w in src_words]
-        tgt_clean = [self._clean_word(w) for w in tgt_words]
-        try:
-            alignments = self._aligner.get_word_aligns(src_clean, tgt_clean)
-        except RuntimeError:
-            if self._fallback_aligner is None:
-                return set(), set()
-            alignments = self._fallback_aligner.get_word_aligns(src_clean, tgt_clean)
-        al = alignments[self.method]
+    def _primary_edges(self, src_clean: List[str], tgt_clean: List[str]):
+        """Primary-model alignment only. May raise RuntimeError if the sequence
+        exceeds the encoder's positional budget (caught by the reactive guard)."""
+        al = self._aligner.get_word_aligns(src_clean, tgt_clean)[self.method]
         return {i for i, j in al}, {j for i, j in al}
 
     def score_pair(self, source: str, target: str) -> dict:
@@ -247,6 +285,13 @@ class AlignmentScorer:
             has_cl        : bool  — cl_score >= cl_threshold
             bi_word_mask  : list[tuple[int, str]] — (index, word) for unaligned target words
             cl_word_mask  : list[tuple[int, str]] — (index, word) for unaligned source words
+            from_fallback : bool  — True if this pair was scored by the fallback scorer
+                            (its own model + score regime), always present (False when
+                            no fallback configured or the pair fit the primary budget).
+            unhandled     : bool  — True if no aligner in the chain could score this
+                            pair (over budget with no fallback, or the primary failed
+                            unexpectedly with no fallback). Carries default-zero scores
+                            → optimistic bi_cl; downstream can flag/exclude. Always present.
         """
         src_words = source.split()
         tgt_words = target.split()
@@ -257,9 +302,37 @@ class AlignmentScorer:
 
         if not src_words or not tgt_words:
             return dict(bi_score=0.0, cl_score=0.0, has_bi=False, has_cl=False,
-                        bi_word_mask=[], cl_word_mask=[])
+                        bi_word_mask=[], cl_word_mask=[], from_fallback=False,
+                        unhandled=False)
 
-        aligned_src, aligned_tgt = self._align_pair(src_words, tgt_words)
+        src_clean = [self._clean_word(w) for w in src_words]
+        tgt_clean = [self._clean_word(w) for w in tgt_words]
+
+        # Proactive over-budget guard: route to the fallback BEFORE touching the
+        # primary encoder (the per-word subword sum is a verified upper bound on the
+        # encoder's position count — task 2A.3.2 Step 0), so an over-budget sequence
+        # never trips the primary's positional-index assert.
+        over_budget = (self._n_subwords(src_clean) > self._max_subwords
+                       or self._n_subwords(tgt_clean) > self._max_subwords)
+        if over_budget and self._fallback is not None:
+            r = self._fallback.score_pair(source, target)
+            r["from_fallback"] = True
+            return r
+
+        unhandled = False
+        try:
+            aligned_src, aligned_tgt = self._primary_edges(src_clean, tgt_clean)
+        except RuntimeError:
+            # Reactive last resort: the guard should have caught all length overflow,
+            # so this fires only on unexpected encoder failures. Delegate the whole
+            # pair to the fallback's own scoring regime when available.
+            if self._fallback is not None:
+                r = self._fallback.score_pair(source, target)
+                r["from_fallback"] = True
+                return r
+            # over budget (or other failure) with no fallback → unscored, default-zero
+            aligned_src, aligned_tgt = set(), set()
+            unhandled = True
 
         bi_mask = [(j, tgt_words[j]) for j in range(len(tgt_words)) if j not in aligned_tgt]
         cl_mask = [(i, src_words[i]) for i in range(len(src_words)) if i not in aligned_src]
@@ -274,6 +347,8 @@ class AlignmentScorer:
             has_cl=cl_score >= self.cl_threshold,
             bi_word_mask=bi_mask,
             cl_word_mask=cl_mask,
+            from_fallback=False,
+            unhandled=unhandled,
         )
 
     def score_batch(
@@ -298,16 +373,20 @@ class AlignmentScorer:
             cl_score      : np.ndarray[float]
             has_bi        : np.ndarray[bool]
             has_cl        : np.ndarray[bool]
+            from_fallback : np.ndarray[bool] — True for rows scored by the fallback
+            unhandled     : np.ndarray[bool] — True for rows no aligner could score
             bi_word_mask  : list[list[tuple]] — only if return_masks=True
             cl_word_mask  : list[list[tuple]] — only if return_masks=True
         """
-        bi_scores, cl_scores = [], []
+        bi_scores, cl_scores, from_fb, unhandled = [], [], [], []
         bi_masks, cl_masks = [], []
 
         for src, tgt in zip(sources, targets):
             r = self.score_pair(src, tgt)
             bi_scores.append(r["bi_score"])
             cl_scores.append(r["cl_score"])
+            from_fb.append(r["from_fallback"])
+            unhandled.append(r["unhandled"])
             if return_masks:
                 bi_masks.append(r["bi_word_mask"])
                 cl_masks.append(r["cl_word_mask"])
@@ -317,6 +396,8 @@ class AlignmentScorer:
             cl_score=np.array(cl_scores),
             has_bi=np.array(bi_scores) >= self.bi_threshold,
             has_cl=np.array(cl_scores) >= self.cl_threshold,
+            from_fallback=np.array(from_fb, dtype=bool),
+            unhandled=np.array(unhandled, dtype=bool),
         )
         if return_masks:
             out["bi_word_mask"] = bi_masks
@@ -376,6 +457,7 @@ class BatchedAligner:
         distortion: float = 0.0,
         fallback_model: str = None,
         fallback_layer: int = None,
+        fallback: "BatchedAligner" = None,
     ):
         try:
             from simalign import SentenceAligner
@@ -384,6 +466,11 @@ class BatchedAligner:
 
         if method != "itermax":
             raise NotImplementedError("BatchedAligner currently supports itermax only")
+
+        if fallback is not None and fallback_model is not None:
+            raise ValueError(
+                "pass either `fallback` (a preconfigured BatchedAligner) or "
+                "`fallback_model` (str), not both")
 
         self.method = method
         self.layer = layer
@@ -424,10 +511,18 @@ class BatchedAligner:
         margin = 4 if "roberta" in str(mt).lower() else 2
         self._max_subwords = mpe - margin
 
-        # Lazy per-pair fallback aligner (e.g. rubert-tiny2 for overflow long texts).
+        # Fallback as a preconfigured BatchedAligner that applies its OWN model +
+        # score regime (e.g. rubert-tiny2 span/min_span=4). Overflow rows are routed
+        # here proactively (subword pre-count), so the over-budget sequence never
+        # reaches the primary encoder. A `fallback=` instance is eager; `fallback_model=`
+        # is built lazily on first overflow (cold path — 0% of the short eval set).
+        self._fallback = fallback
         self._fallback_model = fallback_model
         self._fallback_layer = fallback_layer
-        self._fallback_sa = None
+        # Count of overflow rows this aligner could NOT route to a fallback (no
+        # fallback configured) — surfaces fallback-of-fallback failures instead of
+        # silently zeroing. Gender (no fallback) increments this by design.
+        self.n_overflow_unhandled = 0
 
     # ── scoring helpers (mirror AlignmentScorer) ───────────────────────────────
     @staticmethod
@@ -466,18 +561,23 @@ class BatchedAligner:
             cnt += n
         return np.asarray(out, dtype=np.float32)
 
-    def _encode(self, word_lists):
+    def _encode(self, word_lists, wts=None):
         """Batched encode of pretokenized texts → list of per-word vector arrays.
 
         Each text's vectors are independent of batch partners (masked attention),
         so this is safe to call per source-group. Assumes inputs have already
         passed the subword-budget check in `_edges_per_row` (overflow rows are
-        routed to `_fallback_edges` before reaching here); the `truncation=True`
+        routed to the fallback before reaching here); the `truncation=True`
         cap is only a defensive guard, not the long-text handling path.
+
+        `wts` (per-word subword-token lists) may be passed in to avoid re-tokenizing
+        words already tokenized for the budget check; when None it is computed here
+        (byte-identical — covered by a parity test).
         """
         import torch
         out = [None] * len(word_lists)
-        wts = [[self._tok.tokenize(w) for w in words] for words in word_lists]
+        if wts is None:
+            wts = [[self._tok.tokenize(w) for w in words] for words in word_lists]
         for s in range(0, len(word_lists), self.enc_batch_size):
             chunk = word_lists[s:s + self.enc_batch_size]
             with torch.no_grad():
@@ -515,54 +615,50 @@ class BatchedAligner:
             w = w[:self.max_words_per_side]
         return w
 
+    def _tokenize_words(self, clean_words):
+        """Per-word subword-token lists (computed once; reused for budget + encode)."""
+        return [self._tok.tokenize(w) for w in clean_words]
+
     def _n_subwords(self, clean_words):
-        return sum(len(self._tok.tokenize(w)) for w in clean_words)
+        return sum(len(t) for t in self._tokenize_words(clean_words))
 
     def _ensure_fallback(self):
-        if self._fallback_sa is not None or not self._fallback_model:
+        """Lazily build the back-compat `fallback_model` aligner under the validated
+        span/min_span=4 regime (was: inherit the primary's score_fn — the bug). A
+        `fallback=` instance is already built and skips this path."""
+        if self._fallback is not None or not self._fallback_model:
             return
-        from simalign import SentenceAligner
         req = self._fallback_layer if self._fallback_layer is not None else self.layer
-        sa = SentenceAligner(model=self._fallback_model, token_type="word",
-                             matching_methods="i", device=self._device_str, layer=req)
-        # clamp layer for small fallbacks (e.g. rubert-tiny2 has 3 layers)
-        n_hidden = sa.embed_loader.emb_model.config.num_hidden_layers
-        if req > n_hidden:
-            sa.embed_loader.layer = n_hidden
-        tok = sa.embed_loader.tokenizer
-        if getattr(tok, "add_prefix_space", None) is False:
-            from transformers import AutoTokenizer
-            sa.embed_loader.tokenizer = AutoTokenizer.from_pretrained(
-                self._fallback_model, add_prefix_space=True)
-        self._fallback_sa = sa
-
-    def _fallback_edges(self, src_words, tgt_words):
-        """Aligned edges via the fallback model (cold path for overflow texts).
-        Returns None when no fallback is configured or alignment fails (→ row left
-        at default-zero, matching the previous behaviour)."""
-        self._ensure_fallback()
-        if self._fallback_sa is None:
-            return None
-        sc = [self._clean_word(w) for w in src_words]
-        tc = [self._clean_word(w) for w in tgt_words]
-        try:
-            al = self._fallback_sa.get_word_aligns(sc, tc)["itermax"]
-        except Exception:
-            return None
-        return [(int(i), int(j)) for i, j in al]
+        fb = BatchedAligner(
+            model=self._fallback_model, layer=req, method="itermax",
+            score_fn="span", min_span=4, cl_threshold=self.cl_threshold,
+            device=self._device_str, enc_batch_size=self.enc_batch_size,
+            max_words_per_side=self.max_words_per_side, distortion=self.distortion,
+        )
+        # clamp layer for small fallbacks (e.g. rubert-tiny2 has 3 hidden layers)
+        n_hidden = fb._emb_model.config.num_hidden_layers
+        if fb.layer > n_hidden:
+            fb.layer = n_hidden
+        self._fallback = fb
 
     def _edges_per_row(self, sources, targets):
         """Order-preserving per-row alignment with source-group reuse.
 
-        Returns a list of (edges, src_words, tgt_words) per input row, where
-        `edges` is the list of aligned (i, j) word-index pairs, or **None** for
-        rows that must be left at default-zero (empty source/target, or a degenerate
-        empty encoding). `src_words`/`tgt_words` are the ORIGINAL (uncleaned) words.
-        Shared by `score_batch` (→ bi/cl) and `align_batch` (→ gender, etc.).
+        Returns ``(rows, overflow_idx)`` where:
+          - ``rows[i] = (edges, src_words, tgt_words)``; ``edges`` is the list of
+            aligned (i, j) word-index pairs for primary-scored rows, or **None** for
+            rows left at default-zero — *both* empty/degenerate rows AND overflow
+            rows (overflow is no longer scored under the primary's settings here).
+          - ``overflow_idx`` is the set of row indices that exceeded the primary's
+            subword budget (live rows only). Callers route these to the fallback,
+            which applies its OWN score regime. Overflow with no fallback stays
+            default-zero (preserves the gender `score_B=1.0` invariant).
+        `src_words`/`tgt_words` are the ORIGINAL (uncleaned) words.
         """
         from collections import defaultdict
         n = len(sources)
         out = [None] * n
+        overflow_idx = set()
         groups = defaultdict(list)
         for i, s in enumerate(sources):
             groups[s if isinstance(s, str) else ""].append(i)
@@ -576,16 +672,19 @@ class BatchedAligner:
             if not live:
                 continue
             src_clean = [self._clean_word(w) for w in src_words]
-            src_n = self._n_subwords(src_clean)
+            src_wts = self._tokenize_words(src_clean)          # compute once
+            src_n = sum(len(t) for t in src_wts)
             tgt_clean_per_row = {i: [self._clean_word(w) for w in tgt_words_per_row[i]]
                                  for i in live}
+            tgt_wts_per_row = {i: self._tokenize_words(tgt_clean_per_row[i]) for i in live}
             primary = [i for i in live if src_n <= self._max_subwords
-                       and self._n_subwords(tgt_clean_per_row[i]) <= self._max_subwords]
-            overflow_set = set(live) - set(primary)
+                       and sum(len(t) for t in tgt_wts_per_row[i]) <= self._max_subwords]
+            overflow_idx.update(set(live) - set(primary))
 
             if primary:
                 to_encode = [src_clean] + [tgt_clean_per_row[i] for i in primary]
-                vecs = self._encode(to_encode)
+                wts = [src_wts] + [tgt_wts_per_row[i] for i in primary]   # reuse tokens
+                vecs = self._encode(to_encode, wts=wts)
                 v_src = vecs[0]
                 for k, i in enumerate(primary):
                     v_tgt = vecs[1 + k]
@@ -594,11 +693,7 @@ class BatchedAligner:
                     out[i] = (self._edges_from_vecs(v_src, v_tgt),
                               src_words, tgt_words_per_row[i])
                 del vecs  # transient: free this group's token embeddings
-
-            for i in overflow_set:
-                edges = self._fallback_edges(src_words, tgt_words_per_row[i])
-                out[i] = (edges, src_words, tgt_words_per_row[i])
-        return out
+        return out, overflow_idx
 
     # ── public API (drop-in for AlignmentScorer) ───────────────────────────────
     def _empty_result(self, return_masks):
@@ -617,6 +712,8 @@ class BatchedAligner:
             "has_cl": bool(out["has_cl"][0]),
             "bi_word_mask": out["bi_word_mask"][0],
             "cl_word_mask": out["cl_word_mask"][0],
+            "from_fallback": bool(out["from_fallback"][0]),
+            "unhandled": bool(out["unhandled"][0]),
         }
 
     def align_batch(self, sources, targets):
@@ -627,25 +724,54 @@ class BatchedAligner:
         ORIGINAL word indexing (clean_word preserves word count). Rows with empty
         source/target (or a degenerate encoding) yield an empty edge list.
 
+        Overflow rows are delegated to the fallback aligner's `align_batch`; with no
+        fallback configured they yield an empty edge list (the gender path relies on
+        this → `score_B=1.0`), and `n_overflow_unhandled` is incremented.
+
         Consumers that need the raw alignment, not bi/cl scores — e.g.
         `GenderConsistencyScorer` (maps src-gender[i] → tgt-gender[j]).
         """
-        rows = self._edges_per_row(sources, targets)
-        return [(edges if edges is not None else []) for edges, _sw, _tw in rows]
+        rows, overflow_idx = self._edges_per_row(sources, targets)
+        result = [(edges if edges is not None else []) for edges, _sw, _tw in rows]
+        if overflow_idx:
+            self._ensure_fallback()
+            if self._fallback is not None:
+                oi = sorted(overflow_idx)
+                fb_edges = self._fallback.align_batch([sources[i] for i in oi],
+                                                      [targets[i] for i in oi])
+                for k, i in enumerate(oi):
+                    result[i] = fb_edges[k]
+            else:
+                self.n_overflow_unhandled += len(overflow_idx)
+        return result
 
     def score_batch(self, sources, targets, return_masks: bool = True) -> dict:
         """Order-preserving batched BI/CL scoring with per-source-group reuse.
 
-        Returns the same dict shape as `AlignmentScorer.score_batch`.
+        Returns the same dict shape as `AlignmentScorer.score_batch`, plus two
+        boolean arrays (always present):
+          - `from_fallback`: True for rows routed to the fallback (scored under its
+            own model + score regime).
+          - `unhandled`: True for overflow rows that NO aligner in the chain could
+            score (overflow with no fallback, or overflow exceeding even the
+            fallback's budget). These carry default-zero scores → optimistic
+            `bi_cl=1.0`, so downstream filters can exclude/flag them instead of
+            treating them as genuine low-copy rows. `n_overflow_unhandled` is the
+            running total of `unhandled` across calls.
+        Overflow rows are delegated to the fallback's `score_batch` and spliced back
+        by original index.
         """
         n = len(sources)
         bi = np.zeros(n)
         cl = np.zeros(n)
+        from_fallback = np.zeros(n, dtype=bool)
+        unhandled = np.zeros(n, dtype=bool)
         bi_masks = [[] for _ in range(n)]
         cl_masks = [[] for _ in range(n)]
 
-        for i, (edges, src_words, tgt_words) in enumerate(self._edges_per_row(sources, targets)):
-            # None ⇒ leave default-zero (empty source/target or degenerate encoding)
+        rows, overflow_idx = self._edges_per_row(sources, targets)
+        for i, (edges, src_words, tgt_words) in enumerate(rows):
+            # None ⇒ leave default-zero (empty/degenerate, or overflow handled below)
             if edges is None or not src_words or not tgt_words:
                 continue
             aligned_src = {a for a, _ in edges}
@@ -658,11 +784,44 @@ class BatchedAligner:
                 bi_masks[i] = [(j, tgt_words[j]) for j in bi_un]
                 cl_masks[i] = [(j, src_words[j]) for j in cl_un]
 
+        has_bi = bi >= self.bi_threshold
+        has_cl = cl >= self.cl_threshold
+
+        # Overflow rows: score under the fallback's OWN model + regime + thresholds.
+        if overflow_idx:
+            self._ensure_fallback()
+            if self._fallback is not None:
+                oi = sorted(overflow_idx)
+                fb = self._fallback.score_batch([sources[i] for i in oi],
+                                                [targets[i] for i in oi],
+                                                return_masks=return_masks)
+                fb_unhandled = fb.get("unhandled")
+                for k, i in enumerate(oi):
+                    bi[i] = fb["bi_score"][k]
+                    cl[i] = fb["cl_score"][k]
+                    has_bi[i] = fb["has_bi"][k]   # fallback's own threshold
+                    has_cl[i] = fb["has_cl"][k]
+                    from_fallback[i] = True
+                    # propagate the fallback's give-ups (it overflowed too)
+                    if fb_unhandled is not None and fb_unhandled[k]:
+                        unhandled[i] = True
+                    if return_masks:
+                        bi_masks[i] = fb["bi_word_mask"][k]
+                        cl_masks[i] = fb["cl_word_mask"][k]
+            else:
+                # no fallback configured → these overflow rows are unscored
+                for i in overflow_idx:
+                    unhandled[i] = True
+
+        self.n_overflow_unhandled += int(unhandled.sum())
+
         out = dict(
             bi_score=bi,
             cl_score=cl,
-            has_bi=bi >= self.bi_threshold,
-            has_cl=cl >= self.cl_threshold,
+            has_bi=has_bi,
+            has_cl=has_cl,
+            from_fallback=from_fallback,
+            unhandled=unhandled,
         )
         if return_masks:
             out["bi_word_mask"] = bi_masks
