@@ -11,11 +11,11 @@ import warnings
 import pandas as pd
 import numpy as np
 from tst_utils.eval.metrics.meaning import meaning_score
-from tst_utils.eval.metrics.copying import chrf_scores
 from tst_utils.eval.metrics.composite import base_score_v2, compute_nat_v2
 from tst_utils.eval.performance.constants import TARGET_STYLES, _SCORE_COLS, _QUALITY_COLS
 from tst_utils.eval.performance.reshape import expand_tst_output
 from tst_utils.eval.performance.source_cache import ensure_source_caches
+from tst_utils.eval.performance.copying import add_chrf
 from tst_utils.eval.performance import scoring
 
 logger = logging.getLogger(__name__)
@@ -291,11 +291,9 @@ class TstPerformanceMetrics:
         )
 
     def compute_copying_metrics(self, df=None):
-        """Compute the chrF copying diagnostic.
-
-        Adds a `chrf` column to the target DataFrame (default: self.best_tst_results).
-        Does NOT modify the composite score. chrF is the only retained copying
-        metric (task 1.3: BLEU/ROUGE-L/n-gram Jaccard were redundant or broken).
+        """Compute the chrF copying diagnostic on the target DataFrame
+        (default: self.best_tst_results). Delegates to ``copying.add_chrf``;
+        does NOT modify the composite score.
         """
         if df is None:
             if not hasattr(self, "best_tst_results") or self.best_tst_results is None:
@@ -305,8 +303,7 @@ class TstPerformanceMetrics:
                 )
             df = self.best_tst_results
 
-        df["chrf"] = chrf_scores(df.text, df.styled_text)
-        return df
+        return add_chrf(df)
 
     def execute(self) -> None:
         """Run the score_v1 pipeline, in order:
