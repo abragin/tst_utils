@@ -6,7 +6,7 @@ from tst_utils.eval.metrics.meaning import (
     calc_labse_embeddings, length_penalty
 )
 from tst_utils.eval.metrics.style import calc_style_embeddings, add_away_towards
-from tst_utils.eval.metrics.copying import compute_all_copying_metrics
+from tst_utils.eval.metrics.copying import chrf_scores
 from tst_utils.eval.metrics.composite import base_score_v2, compute_nat_v2
 
 _SCORE_COLS   = ['style_score', 'bert_score', 'labse_score',
@@ -385,10 +385,11 @@ class TstPerformanceMetrics:
         )
 
     def compute_copying_metrics(self, df=None):
-        """Compute copying diagnostics (chrF, BLEU, ROUGE-L, n-gram Jaccard).
+        """Compute the chrF copying diagnostic.
 
-        Adds columns to the target DataFrame (default: self.best_tst_results).
-        Does NOT modify the composite score.
+        Adds a `chrf` column to the target DataFrame (default: self.best_tst_results).
+        Does NOT modify the composite score. chrF is the only retained copying
+        metric (task 1.3: BLEU/ROUGE-L/n-gram Jaccard were redundant or broken).
         """
         if df is None:
             if not hasattr(self, "best_tst_results") or self.best_tst_results is None:
@@ -398,9 +399,7 @@ class TstPerformanceMetrics:
                 )
             df = self.best_tst_results
 
-        metrics = compute_all_copying_metrics(df.text, df.styled_text)
-        for name, values in metrics.items():
-            df[name] = values
+        df["chrf"] = chrf_scores(df.text, df.styled_text)
         return df
 
     def execute(self) -> None:
