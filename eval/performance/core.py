@@ -1,29 +1,30 @@
+"""``TstPerformanceMetrics`` — orchestrator for the three-pillar TST evaluation.
+
+Thin orchestrator: reshaping (``reshape``), source caching (``source_cache``),
+and the per-metric base scores (``scoring``) live in sibling submodules; this
+module sequences them and adds the composite/quality/selection logic.
+"""
+
+import logging
+import warnings
+
 import pandas as pd
 import numpy as np
-from tst_utils.eval.metrics.naturality import calculate_perplexity, naturality_score
-from tst_utils.eval.metrics.meaning import (
-    meaning_score, b_score, labse_scores_from_embs,
-    calc_labse_embeddings, length_penalty
-)
-from tst_utils.eval.metrics.style import calc_style_embeddings, add_away_towards
+from tst_utils.eval.metrics.meaning import meaning_score
 from tst_utils.eval.metrics.copying import chrf_scores
 from tst_utils.eval.metrics.composite import base_score_v2, compute_nat_v2
+from tst_utils.eval.performance.constants import TARGET_STYLES, _SCORE_COLS, _QUALITY_COLS
+from tst_utils.eval.performance.reshape import expand_tst_output
+from tst_utils.eval.performance.source_cache import ensure_source_caches
+from tst_utils.eval.performance import scoring
 
-_SCORE_COLS   = ['style_score', 'bert_score', 'labse_score',
-                 'text_perplexity', 'styled_text_perplexity']
-_QUALITY_COLS = ['bi_cl', 'gender_score', 'entity_score']
+logger = logging.getLogger(__name__)
 
-
-TARGET_STYLES = {
-    'DT': ['Dostoevsky', 'Tolstoy'],
-    'BCDT': ['Bible', 'Chekhov', 'Dostoevsky', 'Tolstoy'],
-    'COMPLETE': ['Bible', 'Chekhov', 'Dostoevsky', 'Tolstoy', 'News']
-}
 
 class TstPerformanceMetrics:
     """
     Class to evaluate TST models using style transfer, meaning, and naturality metrics.
-    
+
     Parameters:
     - test_df (pd.DataFrame): Dataset containing source texts and related metadata.
         Expected columns:
@@ -37,7 +38,7 @@ class TstPerformanceMetrics:
         Used only for text target style TST. If None, the class expects explicit target style embeddings in test_df.
     - tst_model (str): Name or ID of the TST model being evaluated.
     - author_styles (Dict[str, np.ndarray]): Precomputed style embeddings per author or domain. Used with target style TST only.
-    - verbose (bool): Whether to print debug information during processing.
+    - verbose (bool): Whether to log debug/progress information during processing.
     """
     def __init__(
         self, test_df, tst_func, target_styles, tst_model,
@@ -50,6 +51,20 @@ class TstPerformanceMetrics:
         self.verbose = verbose
         self.author_styles = author_styles
         self.tst_results = None
+        if verbose and not logger.handlers:
+            # Verbose progress used to go to stdout via print(); preserve that it
+            # is actually visible even when the host app hasn't configured logging
+            # (a bare logger.info would be dropped by the WARNING last-resort handler).
+            _handler = logging.StreamHandler()
+            _handler.setFormatter(
+                logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+            logger.addHandler(_handler)
+            logger.setLevel(logging.INFO)
+
+    def _log(self, msg, *args) -> None:
+        """Verbose-gated progress logging (replaces the old `if self.verbose: print`)."""
+        if self.verbose:
+            logger.info(msg, *args)
 
     def produce_tst_results_with_text_target_styles(self) -> None:
         res_dfs = []
@@ -61,8 +76,7 @@ class TstPerformanceMetrics:
         )
 
         for t_style in self.target_styles:
-            if self.verbose:
-                print("Performing TST for style:", t_style)
+            self._log("Performing TST for style: %s", t_style)
 
             df = self.test_df[self.test_df.author != t_style].copy()
             df = df.reset_index(drop=False).rename(columns={"index": "example_number"})
@@ -72,41 +86,10 @@ class TstPerformanceMetrics:
             # Run TST
             tst_output = self.tst_func(df.text.tolist(), t_style)
 
-            # --- Handle both 1D and 2D outputs ---
-            if not tst_output:
-                raise ValueError("tst_func returned an empty result.")
-
-            # Detect output shape
-            if isinstance(tst_output[0], list):  # 2D: [[ver1, ver2, ...], ...]
-                num_versions = len(tst_output[0])
-
-                # Sanity check: all have same length
-                if not all(len(x) == num_versions for x in tst_output):
-                    raise ValueError("Inconsistent number of generated versions per example.")
-
-                flat_records = []
-                for ex_idx, versions in enumerate(tst_output):
-                    for v_idx, text in enumerate(versions):
-                        flat_records.append(
-                            df.loc[ex_idx, cols_to_copy].to_dict()
-                            | {
-                                "target_style": t_style,
-                                "tst_model": self.tst_model,
-                                "styled_text": text,
-                                "version_number": v_idx,
-                            }
-                        )
-                df_expanded = pd.DataFrame(flat_records)
-
-            else:  # 1D: [output_text_1, output_text_2, ...]
-                if len(tst_output) != len(df):
-                    raise ValueError(
-                        f"Length mismatch: tst_func returned {len(tst_output)} texts for {len(df)} examples."
-                    )
-                df["styled_text"] = tst_output
-                df["version_number"] = 0
-                df_expanded = df
-
+            df_expanded = expand_tst_output(
+                tst_output, df, cols_to_copy,
+                extra_fields={"target_style": t_style, "tst_model": self.tst_model},
+            )
             res_dfs.append(df_expanded)
 
         # Combine all target styles
@@ -129,43 +112,17 @@ class TstPerformanceMetrics:
             [c for c in precalculated_cols if c in self.test_df]
         )
 
-        if self.verbose:
-            print("Performing TST with target_style_embeddings")
+        self._log("Performing TST with target_style_embeddings")
 
         tst_output = self.tst_func(
             texts=df.text.tolist(),
             target_style_embeddings=df.target_style_emb.tolist()
         )
 
-        if not tst_output:
-            raise ValueError("tst_func returned an empty result.")
-
-        if isinstance(tst_output[0], list):  # multiple generations per example
-            num_versions = len(tst_output[0])
-            if not all(len(x) == num_versions for x in tst_output):
-                raise ValueError("Inconsistent number of generated versions per example.")
-
-            flat_records = []
-            for ex_idx, versions in enumerate(tst_output):
-                for v_idx, text in enumerate(versions):
-                    flat_records.append(
-                        df.loc[ex_idx, cols_to_copy].to_dict()
-                        | {
-                            "tst_model": self.tst_model,
-                            "styled_text": text,
-                            "version_number": v_idx,
-                        }
-                    )
-            self.tst_results = pd.DataFrame(flat_records)
-
-        else:  # single output per example
-            if len(tst_output) != len(df):
-                raise ValueError(
-                    f"Length mismatch: tst_func returned {len(tst_output)} texts for {len(df)} examples."
-                )
-            df["styled_text"] = tst_output
-            df["version_number"] = 0
-            self.tst_results = df
+        self.tst_results = expand_tst_output(
+            tst_output, df, cols_to_copy,
+            extra_fields={"tst_model": self.tst_model},
+        )
 
     def produce_tst_results(self) -> None:
         """
@@ -185,73 +142,23 @@ class TstPerformanceMetrics:
             )
 
     def add_source_ppx_and_emb(self):
-        if not ('text_perplexity' in self.test_df):
-            self.test_df['text_perplexity'] = calculate_perplexity(self.test_df.text)[0]
-        if not ('text_style_emb' in self.test_df):
-            self.test_df['text_style_emb'] = calc_style_embeddings(
-                self.test_df.text, normalize=False
-            )
-        if not ('text_labse_emb' in self.test_df):
-            self.test_df['text_labse_emb'] = [
-                e.cpu().numpy()
-                for e in calc_labse_embeddings(self.test_df.text)
-            ]
+        ensure_source_caches(
+            self.test_df, perplexity=True, style_emb=True, labse_emb=True
+        )
 
     def compute_scores(self):
+        """Add base v1 scores to self.tst_results (style/meaning/naturality + score).
+
+        Pipeline (each step caches/derives in place on self.tst_results):
+            perplexity → bert → labse → style embeddings/away-towards → combine.
+        """
         if self.tst_results is None:
             raise Exception("TST results are absent.")
-        if self.verbose:
-            print('Adding perplexity')
-        if not ('text_perplexity' in self.tst_results):
-            self.tst_results['text_perplexity'] = calculate_perplexity(self.tst_results.text)[0]
-        self.tst_results['styled_text_perplexity'] = calculate_perplexity(self.tst_results.styled_text)[0]
-        if self.verbose:
-            print('Adding bert score')
-        self.tst_results['bert_score'] = b_score(
-            self.tst_results.text, self.tst_results.styled_text
-        )
-        if self.verbose:
-            print('Adding labse score')
-        if 'text_labse_emb' in self.tst_results:
-            text_labse_embs = self.tst_results.text_labse_emb
-        else:
-            text_labse_embs = calc_labse_embeddings(self.tst_results.text)
-        styled_text_labse_embs = calc_labse_embeddings(self.tst_results.styled_text)
-        self.tst_results['labse_score'] = labse_scores_from_embs(
-            text_labse_embs,
-            styled_text_labse_embs
-        )
-        if self.verbose:
-            print('Adding style embeddings')
-        if not ('text_style_emb' in self.tst_results):
-            self.tst_results['text_style_emb'] = calc_style_embeddings(
-                self.tst_results.text, normalize=False
-            )
-        self.tst_results['styled_text_style_emb'] = calc_style_embeddings(
-            self.tst_results.styled_text, normalize=False
-        )
-        add_away_towards(self.tst_results, self.author_styles)
-        if self.verbose:
-            print('Adding scores')
-        self.tst_results['style_score'] = np.sqrt(
-            self.tst_results.away * self.tst_results.towards
-        )
-        length_penalties = length_penalty(self.tst_results.text, self.tst_results.styled_text)
-        self.tst_results['meaning_score'] = meaning_score(
-            self.tst_results.bert_score,
-            self.tst_results.labse_score,
-            length_penalties
-        )
-
-        self.tst_results['naturality_score'] = naturality_score(
-            self.tst_results.text_perplexity,
-            self.tst_results.styled_text_perplexity
-        )
-        self.tst_results['score'] = (
-            self.tst_results['style_score'] *
-            self.tst_results['meaning_score'] *
-            self.tst_results['naturality_score']
-        ) ** (1./3)
+        scoring.add_perplexity_scores(self.tst_results, self._log)
+        scoring.add_bert_score(self.tst_results, self._log)
+        scoring.add_labse_score(self.tst_results, self._log)
+        scoring.add_style_scores(self.tst_results, self.author_styles, self._log)
+        scoring.combine_scores(self.tst_results, self._log)
 
     def select_best_tst_version(self, score_col: str = 'score') -> None:
         """For each (example_number, target_style) pair, select the row with the
@@ -366,7 +273,6 @@ class TstPerformanceMetrics:
         elif 'target_style_desc' in df.columns:
             target_styles = df['target_style_desc']
         else:
-            import warnings
             warnings.warn(
                 "Neither 'target_style' nor 'target_style_desc' found in tst_results — "
                 "nat_v2 will use source_CE as reference for all rows (no author-CE lookup).",
@@ -403,9 +309,23 @@ class TstPerformanceMetrics:
         return df
 
     def execute(self) -> None:
-        """score_v1 pipeline only. For score_v2 call compute_quality_scores() +
-        compute_composite_v2() + select_best_tst_version(score_col='score_v2')
-        after execute() (requires external scorers)."""
+        """Run the score_v1 pipeline, in order:
+
+            add_source_ppx_and_emb()   # cache source perplexity/style/labse on test_df
+            produce_tst_results()      # dispatch text-target-style vs target-style-emb
+            compute_scores()           # style/meaning/naturality + score
+            select_best_tst_version()  # best row per (example, target_style) by 'score'
+
+        score_v2 extends this *after* execute() (it needs external scorers, so it
+        is not part of execute):
+
+            compute_quality_scores(alignment, gender, entity)  # bi_cl/gender/entity
+            compute_composite_v2()                             # meaning_nolen/nat_v2/score_v2
+            select_best_tst_version(score_col='score_v2')
+
+        The downstream methods guard this order explicitly (raising if a required
+        column is absent).
+        """
         self.add_source_ppx_and_emb()
         self.produce_tst_results()
         self.compute_scores()
