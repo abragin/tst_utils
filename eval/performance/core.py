@@ -42,7 +42,7 @@ class TstPerformanceMetrics:
     """
     def __init__(
         self, test_df, tst_func, target_styles, tst_model,
-        author_styles, verbose = False
+        author_styles, verbose = False, perplexity_batch_size = 32
     ):
         self.test_df = test_df
         self.tst_func = tst_func
@@ -50,6 +50,9 @@ class TstPerformanceMetrics:
         self.tst_model = tst_model
         self.verbose = verbose
         self.author_styles = author_styles
+        # rugpt3 perplexity batch size; lower to fit a small GPU (the per-batch
+        # logits tensor is the VRAM bottleneck — see styled_pph_gen's 8 GB path).
+        self.perplexity_batch_size = perplexity_batch_size
         self.tst_results = None
         if verbose and not logger.handlers:
             # Verbose progress used to go to stdout via print(); preserve that it
@@ -143,7 +146,8 @@ class TstPerformanceMetrics:
 
     def add_source_ppx_and_emb(self):
         ensure_source_caches(
-            self.test_df, perplexity=True, style_emb=True, labse_emb=True
+            self.test_df, perplexity=True, style_emb=True, labse_emb=True,
+            perplexity_batch_size=self.perplexity_batch_size,
         )
 
     def compute_scores(self):
@@ -154,7 +158,8 @@ class TstPerformanceMetrics:
         """
         if self.tst_results is None:
             raise Exception("TST results are absent.")
-        scoring.add_perplexity_scores(self.tst_results, self._log)
+        scoring.add_perplexity_scores(
+            self.tst_results, self._log, batch_size=self.perplexity_batch_size)
         scoring.add_bert_score(self.tst_results, self._log)
         scoring.add_labse_score(self.tst_results, self._log)
         scoring.add_style_scores(self.tst_results, self.author_styles, self._log)
@@ -237,9 +242,17 @@ class TstPerformanceMetrics:
 
         gn = gender_scorer.score_batch(df.text.tolist(), df.styled_text.tolist())
         df['gender_score'] = gn['gender_score']
+        # Keep the activation flag: gender filtering applies only to pairs where
+        # the source has a gendered pronoun (activated=True). score_v2 ignores it,
+        # but the short-text gen pipeline filters activated-only (task 1.6).
+        df['gender_activated'] = gn['activated']
 
         en = entity_scorer.score_batch(df.text.tolist(), df.styled_text.tolist())
         df['entity_score'] = en['entity_score']
+
+        # Defragment the activations the (resident) scorers just produced, so a
+        # long streaming run on a small GPU doesn't accumulate cache fragmentation.
+        scoring._free_gpu()
 
     def compute_composite_v2(self) -> None:
         """Add meaning_nolen, nat_v2, score_v2 to self.tst_results.

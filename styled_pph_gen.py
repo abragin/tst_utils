@@ -1,3 +1,4 @@
+import gc
 import numpy as np
 from numpy.random import default_rng
 import pandas as pd
@@ -8,14 +9,38 @@ from datetime import datetime
 from typing import Optional, List
 
 from tst_utils.eval.performance import TstPerformanceMetrics
+from tst_utils.eval.performance.source_cache import ensure_source_caches
 from tst_utils.eval.metrics.style import sim_measure
+from tst_utils.eval.metrics.composite import compute_nat_v2
+from tst_utils.eval.metrics.alignment import BatchedAligner
+from tst_utils.eval.metrics.gender_consistency import GenderConsistencyScorer
+from tst_utils.eval.metrics.entity_consistency import EntityConsistencyScorer
 from tst_utils.tinystyler import TinyStyler
 from tst_utils.tst_generator import TSTGenerator, GEN_OPTS_V3
+from tst_utils.utils import set_global_seed
 
+# Legacy v1 filters (retained).
 SIM_MEASURE_UB = 0.92
 SIM_MEASURE_TARGET_STYLE_UB = 0.9
-NATURALITY_SCORE_LB = 0.8
 MEANING_SCORE_LB = 0.75
+
+# Phase-1 quality filters wired in 2A.4 (thresholds calibrated in task 1.10 on
+# the mBERT-span4 regime; all are REJECTION conditions, so the keep-mask negates
+# them). The absolute naturality_score gate is dropped — it is mis-calibrated for
+# folder-14 (rejects 88.5% of fluent literary transfers); nat_v2 replaces it.
+CHRF_UB = 0.75          # keep chrf < 0.75 (copying diagnostic)
+BI_SCORE_UB = 0.12      # keep bi_score < 0.12 (span4 boilerplate insertion)
+CL_SCORE_UB = 0.10      # keep cl_score < 0.10 (span4 content loss)
+GENDER_SCORE_LB = 0.70  # keep gender_score >= 0.70, activated pairs only
+ENTITY_SCORE_LB = 0.70  # keep entity_score >= 0.70
+NAT_V2_LB = 0.5         # keep nat_v2 >= 0.5 (target/source-referenced CE gap)
+
+# rugpt3 perplexity batch size for scoring. The per-batch logits tensor is the
+# only thing that overflows tallin's ~8 GB GPU with the generator resident;
+# 8 (peak ~1.6 GB) fits, 32 (peak ~6.6 GB) does not (decision 13).
+PERPLEXITY_BATCH_SIZE = 8
+
+DEFAULT_SEED = 1991
 
 # ---------------- Helper functions ----------------
 
@@ -33,12 +58,22 @@ def _col_to_array_list(series: pd.Series) -> List[np.ndarray]:
     """Convert column with embeddings (lists/arrays) to list of numpy arrays."""
     return [_as_array(x) for x in series.to_list()]
 
-def _rescale_targets_to_source_norms(source_embs, target_embs):
-    """Rescale each target embedding to have same norm as corresponding source embedding."""
-    src_norms = np.array([np.linalg.norm(s) or 1.0 for s in source_embs])
+def _rescale_targets_to_source_norms(source_embs, target_embs, target_norm=None):
+    """Rescale each target embedding's norm.
+
+    By default (``target_norm=None``) each target is scaled to the norm of its
+    corresponding source embedding — the legacy behaviour for pre-folder-14
+    checkpoints, whose style inputs sit at ~15 norm. Pass ``target_norm=1.0``
+    for folder-14, which expects **unit-norm** style inputs (norm-fix Option 1,
+    validated in task 2A.4 Phase A).
+    """
+    if target_norm is None:
+        dst_norms = np.array([np.linalg.norm(s) or 1.0 for s in source_embs])
+    else:
+        dst_norms = np.full(len(source_embs), float(target_norm))
     tgt_norms = np.linalg.norm(target_embs, axis=1)
     tgt_norms_safe = np.where(tgt_norms == 0, 1.0, tgt_norms)
-    scaled = target_embs * (src_norms / tgt_norms_safe)[:, None]
+    scaled = target_embs * (dst_norms / tgt_norms_safe)[:, None]
     return [scaled[i] for i in range(scaled.shape[0])]
 
 # ---------------- Main generic function ----------------
@@ -50,14 +85,19 @@ def produce_target_style(
     n_picks: int = 1,
     source_emb_col: str = "text_style_emb",
     rng: Optional[np.random.Generator] = None,
+    target_norm: Optional[float] = None,
 ) -> List[np.ndarray]:
     """
     For each row in short_df:
       - choose n_picks random *different* values of key_col from complete_df, excluding the row's own value
       - sample one embedding per chosen group
       - mix them using random weights (if n_picks > 1)
-      - rescale to norm of source embedding
-    Returns: list of numpy arrays
+      - rescale to ``target_norm`` if given, else to the source embedding's norm
+
+    The ``n_picks=2`` mix keeps the raw weighted sum (no per-pick unit
+    normalization) — a deliberate choice preserved from the original mixing
+    behaviour (task 2A.4 decision 3); the final ``_rescale_targets_to_source_norms``
+    sets the norm.
     """
     if rng is None:
         rng = default_rng()
@@ -98,40 +138,44 @@ def produce_target_style(
         target_embs.append(combined)
 
     target_embs = np.stack(target_embs)
-    return _rescale_targets_to_source_norms(src_embs, target_embs)
+    return _rescale_targets_to_source_norms(src_embs, target_embs, target_norm=target_norm)
 
 # ---------------- Thin wrappers ----------------
 
 def produce_target_style_random_writer(
-    short_df, writers_df, author_col="author", source_emb_col="text_style_emb", rng=None
+    short_df, writers_df, author_col="author", source_emb_col="text_style_emb",
+    rng=None, target_norm=None
 ):
     return produce_target_style(
         short_df, writers_df, key_col=author_col, n_picks=1,
-        source_emb_col=source_emb_col, rng=rng
+        source_emb_col=source_emb_col, rng=rng, target_norm=target_norm
     )
 
 def produce_target_style_2_random_writers(
-    short_df, writers_df, author_col="author", source_emb_col="text_style_emb", rng=None
+    short_df, writers_df, author_col="author", source_emb_col="text_style_emb",
+    rng=None, target_norm=None
 ):
     return produce_target_style(
         short_df, writers_df, key_col=author_col, n_picks=2,
-        source_emb_col=source_emb_col, rng=rng
+        source_emb_col=source_emb_col, rng=rng, target_norm=target_norm
     )
 
 def produce_target_style_other_domain(
-    short_df, complete_df, domain_col="domain", source_emb_col="text_style_emb", rng=None
+    short_df, complete_df, domain_col="domain", source_emb_col="text_style_emb",
+    rng=None, target_norm=None
 ):
     return produce_target_style(
         short_df, complete_df, key_col=domain_col, n_picks=1,
-        source_emb_col=source_emb_col, rng=rng
+        source_emb_col=source_emb_col, rng=rng, target_norm=target_norm
     )
 
 def produce_target_style_2_other_domains(
-    short_df, complete_df, domain_col="domain", source_emb_col="text_style_emb", rng=None
+    short_df, complete_df, domain_col="domain", source_emb_col="text_style_emb",
+    rng=None, target_norm=None
 ):
     return produce_target_style(
         short_df, complete_df, key_col=domain_col, n_picks=2,
-        source_emb_col=source_emb_col, rng=rng
+        source_emb_col=source_emb_col, rng=rng, target_norm=target_norm
     )
 
 # ---------- Perturbation-based style sampling ----------
@@ -186,43 +230,93 @@ def get_target_styles(current_domain):
     ]
     return target_styles
 
-def add_target_style_emb(df, style_df, in_domain_style_df=None):
+def add_target_style_emb(df, style_df, in_domain_style_df=None, target_norm=None, rng=None):
     for target_style_desc in df.target_style_desc.unique():
         df_target_style = df[df.target_style_desc == target_style_desc]
         if not df_target_style.empty:
             if 'other_author' in target_style_desc:
                 target_style_embs = produce_target_style_random_writer(
-                    df_target_style, in_domain_style_df
+                    df_target_style, in_domain_style_df, rng=rng, target_norm=target_norm
                 )
             elif '2_authors_weighted_avg' in target_style_desc:
                 target_style_embs = produce_target_style_2_random_writers(
-                    df_target_style, in_domain_style_df
+                    df_target_style, in_domain_style_df, rng=rng, target_norm=target_norm
                 )
             elif 'other_domain' in target_style_desc:
                 target_style_embs = produce_target_style_other_domain(
-                    df_target_style, style_df
+                    df_target_style, style_df, rng=rng, target_norm=target_norm
                 )
             elif '2_domains_weighted_avg' in target_style_desc:
                 target_style_embs = produce_target_style_2_other_domains(
-                    df_target_style, style_df
+                    df_target_style, style_df, rng=rng, target_norm=target_norm
                 )
             else:
                 raise Exception('Unsupported target style type: ' + target_style_desc)
+            # noise/negation are norm-preserving, so they do not disturb target_norm
             if '_with_noise' in target_style_desc:
-                target_style_embs = add_noise_to_embs(target_style_embs, scale=0.01)
+                target_style_embs = add_noise_to_embs(target_style_embs, scale=0.01, rng=rng)
             elif '_with_negations' in target_style_desc:
                 qt = 0.02 if 'author' in target_style_desc else 0.01
-                target_style_embs = negate_some_vals(target_style_embs, quantile=qt)
+                target_style_embs = negate_some_vals(target_style_embs, quantile=qt, rng=rng)
             df.loc[df_target_style.index, 'target_style_emb'] = pd.Series(
                 target_style_embs, index=df_target_style.index, dtype=object
             )
 
-def gen_paraphrases(current_df, tst_generator, style_df, in_domain_style_df, target_styles):
+# Columns the keep-mask reads; perplexity/nat_v2 etc. must already be populated.
+PHASE1_FILTER_COLS = [
+    'chrf', 'bi_score', 'cl_score', 'gender_score', 'gender_activated',
+    'entity_score', 'meaning_score', 'tst_result_style_sim', 'nat_v2',
+]
+
+def phase1_keep_mask(tst_res):
+    """Boolean keep-mask for the A3-confirmed Phase-1 filter set (task 2A.4).
+
+    Every threshold below is a REJECTION condition; the rows to KEEP are the
+    negation. The gender gate fires only on activated pairs. ``tst_res`` must
+    already carry every column in ``PHASE1_FILTER_COLS``.
+
+    Factored out of ``gen_paraphrases`` so the threshold logic is unit-testable
+    without a GPU. NaN in a filter column would silently drop the row, so this
+    fails loud instead — a scorer regression (e.g. empty ``styled_text``)
+    should surface as an error, not a quietly lower pass rate.
+    """
+    missing = [c for c in PHASE1_FILTER_COLS if c not in tst_res.columns]
+    if missing:
+        raise KeyError(f"phase1_keep_mask: missing filter columns: {missing}")
+    # gender_score may legitimately be NaN on non-activated rows (it is masked
+    # out there); only flag NaN among the rows the gender gate actually reads.
+    plain = [c for c in PHASE1_FILTER_COLS
+             if c not in ('gender_score', 'gender_activated')]
+    nan_cols = [c for c in plain if tst_res[c].isna().any()]
+    if (tst_res.gender_activated.astype(bool) & tst_res.gender_score.isna()).any():
+        nan_cols.append('gender_score(activated)')
+    if nan_cols:
+        raise ValueError(f"phase1_keep_mask: NaN in filter columns: {nan_cols}")
+    return (
+        (tst_res.chrf < CHRF_UB) &
+        (tst_res.bi_score < BI_SCORE_UB) &
+        (tst_res.cl_score < CL_SCORE_UB) &
+        ~(tst_res.gender_activated.astype(bool) & (tst_res.gender_score < GENDER_SCORE_LB)) &
+        (tst_res.entity_score >= ENTITY_SCORE_LB) &
+        (tst_res.meaning_score > MEANING_SCORE_LB) &
+        (tst_res.tst_result_style_sim < SIM_MEASURE_UB) &
+        (tst_res.nat_v2 >= NAT_V2_LB)
+    )
+
+def gen_paraphrases(
+    current_df, tst_generator, style_df, in_domain_style_df, target_styles,
+    alignment_scorer, gender_scorer, entity_scorer,
+    target_norm=None, perplexity_batch_size=PERPLEXITY_BATCH_SIZE, rng=None,
+):
     current_df = current_df.copy()
-    current_df['target_style_desc'] = np.random.choice(
+    if rng is None:
+        rng = np.random.default_rng()
+    current_df['target_style_desc'] = rng.choice(
         target_styles, size=current_df.shape[0]
     )
-    add_target_style_emb(current_df, style_df, in_domain_style_df)
+    add_target_style_emb(
+        current_df, style_df, in_domain_style_df, target_norm=target_norm, rng=rng
+    )
     current_df['target_style_sim_measure'] = sim_measure_series(
         current_df, 'target_style_emb'
     )
@@ -235,9 +329,19 @@ def gen_paraphrases(current_df, tst_generator, style_df, in_domain_style_df, tar
         target_styles=None, #TARGET_STYLES['COMPLETE'],
         tst_model='pph_gen_with_random_target_style',
         author_styles=None, #author_styles,
-        verbose=True
+        verbose=True,
+        perplexity_batch_size=perplexity_batch_size,
     )
-    pm.execute()
+    # Canonical scoring order (mirrors the eval framework, minus score_v2):
+    #   compute_scores -> compute_quality_scores -> select_best -> copying metrics.
+    # quality scores run on *all* versions (before selection) so they survive into
+    # best_tst_results; perplexity uses the reduced batch size to fit 8 GB.
+    pm.add_source_ppx_and_emb()
+    pm.produce_tst_results()
+    pm.compute_scores()
+    pm.compute_quality_scores(alignment_scorer, gender_scorer, entity_scorer)
+    pm.select_best_tst_version()
+    pm.compute_copying_metrics()  # chrf on best_tst_results
     tst_res = pm.best_tst_results.set_index(
         pm.best_tst_results.example_number
     )
@@ -250,19 +354,36 @@ def gen_paraphrases(current_df, tst_generator, style_df, in_domain_style_df, tar
     tst_res['tst_result_style_sim'] = sim_measure_series(
         tst_res, 'styled_text_style_emb'
     )
-    tst_res = tst_res[
-        (tst_res.meaning_score > MEANING_SCORE_LB) &
-        (tst_res.naturality_score > NATURALITY_SCORE_LB) &
-        (tst_res.tst_result_style_sim < SIM_MEASURE_UB)
-    ]
-    return tst_res
+    tst_res['nat_v2'] = compute_nat_v2(
+        tst_res.styled_text_perplexity, tst_res.text_perplexity, tst_res.target_style_desc
+    )
+    return tst_res[phase1_keep_mask(tst_res)]
+
+# Columns that must reach disk for a survivor to be auditable downstream; if any
+# is absent from the results frame, the scoring order upstream is broken — fail
+# loud rather than silently dropping it via the whitelist intersection.
+REQUIRED_PERSIST_COLS = [
+    'styled_text', 'styled_text_style_emb', 'meaning_score',
+    'tst_result_style_sim', 'bi_score', 'cl_score', 'gender_score',
+    'entity_score', 'chrf', 'nat_v2',
+]
 
 def save_tst_results(tst_df, results_path):
     tst_res_cols = [
-        'target_style_desc','styled_text',
+        'text', 'target_style_desc', 'target_style_sim_measure', 'styled_text',
         'styled_text_style_emb', 'meaning_score',
-        'tst_result_style_sim'
+        'tst_result_style_sim',
+        # Phase-1 quality signals persisted for downstream auditing (2A.4):
+        'bi_score', 'cl_score', 'gender_score', 'gender_activated',
+        'entity_score', 'chrf', 'nat_v2',
+        # naturality_score is LEGACY — kept for reference only; it is NOT a gate
+        # in the 2A.4 pipeline (mis-calibrated for folder-14, replaced by nat_v2).
+        'naturality_score', 'style_score', 'score',
     ]
+    missing = [c for c in REQUIRED_PERSIST_COLS if c not in tst_df.columns]
+    if missing:
+        raise KeyError(f"save_tst_results: required columns missing: {missing}")
+    tst_res_cols = [c for c in tst_res_cols if c in tst_df.columns]
     results_files = [
         fn
         for fn in os.listdir(results_path)
@@ -316,11 +437,20 @@ class PphGenerator:
         rows_at_once=30000,
         base_model_path = "ai-forever/rugpt3small_based_on_gpt2",
         assert_norm=None,
+        seed=DEFAULT_SEED,
+        perplexity_batch_size=PERPLEXITY_BATCH_SIZE,
     ):
         # `assert_norm` is threaded through to the inner TinyStyler. Default
         # None because PphGenerator is used with both folder-14 (unit-norm)
         # and pre-folder-14 (~15 norm) checkpoints — the caller must pick the
         # value that matches the checkpoint they pass in.
+        set_global_seed(seed)
+        self.rng = np.random.default_rng(seed)
+        self.perplexity_batch_size = perplexity_batch_size
+        # Norm-fix Option 1: folder-14 (`assert_norm='normalized'`) expects
+        # unit-norm target style embeddings; older checkpoints keep the
+        # source-norm rescale (target_norm=None).
+        self.target_norm = 1.0 if assert_norm == 'normalized' else None
         tokenizer = AutoTokenizer.from_pretrained(base_model_path)
         self.base_df = pd.read_parquet(base_df_path)
         self.style_df = pd.read_parquet(style_df_path)
@@ -356,13 +486,48 @@ class PphGenerator:
             max_input_length=max_length,
             max_output_length=max_length,
         )
+        # Phase-1 filter scorers, constructed once and kept warm across chunks
+        # (reloading mBERT/NER per chunk would dominate runtime). VRAM: these sit
+        # resident alongside the generator (~3 GB total); the only transient peak
+        # is batch-8 perplexity (~1.6 GB) — comfortably under tallin's ~8 GB.
+        # mBERT span4 (task 2A.3.1); gender uses mBERT internally (task 1.6);
+        # entity is NER-only (no LaBSE/BiCl/pre_clean — defaults).
+        self.alignment_scorer = BatchedAligner(
+            model='bert', score_fn='span', min_span=4, device='cuda'
+        )
+        self.gender_scorer = GenderConsistencyScorer(device='cuda')
+        self.entity_scorer = EntityConsistencyScorer(device='cuda')
 
-    def execute(self):
+    def execute(self, max_attempts=3, prefetch=True):
+        """Stream the base pool through generation+filtering.
+
+        The queue is shuffled once; failures go to the back (FIFO) and are
+        retried with a freshly sampled target style (a row that fails one target
+        often passes another). ``max_attempts`` caps retries so the hard tail is
+        abandoned rather than recirculated forever — source is abundant, compute
+        is the bottleneck (task 2A.4 A4 / B5 finding). ``prefetch`` caches the
+        source-side features (perplexity/style/LaBSE) on the base pool **once**
+        so requeued rows don't recompute them every attempt (B4; the per-attempt
+        source recompute was ~55 ms/row × the retry redundancy).
+        """
+        if prefetch:
+            # Idempotent: text_style_emb already lives on the pools, so only
+            # perplexity + LaBSE are computed here, once for the whole pool.
+            ensure_source_caches(
+                self.base_df, perplexity=True, style_emb=True, labse_emb=True,
+                perplexity_batch_size=self.perplexity_batch_size,
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
         generated_df = join_generated_files(self.results_path)
         processed_ids = generated_df.index if (generated_df is not None) else []
         unprocessed_queue = list(set(self.base_df.index) - set(processed_ids))
-        np.random.shuffle(unprocessed_queue)
-        while len(unprocessed_queue) > 99:
+        # Shuffle via the instance rng (seeded in __init__) so the run is
+        # reproducible from `seed` alone, not the global numpy state.
+        unprocessed_queue = list(self.rng.permutation(unprocessed_queue))
+        attempts = {i: 0 for i in unprocessed_queue}
+        n_abandoned = 0
+        while unprocessed_queue:
             time_start = datetime.now()
             processing_ids = unprocessed_queue[:self.rows_at_once]
             unprocessed_queue = unprocessed_queue[self.rows_at_once:]
@@ -370,25 +535,42 @@ class PphGenerator:
             tst_df = gen_paraphrases(
                 current_df, self.tst_generator,
                 self.style_df, self.in_domain_style_df,
-                self.target_styles
+                self.target_styles,
+                self.alignment_scorer, self.gender_scorer, self.entity_scorer,
+                target_norm=self.target_norm,
+                perplexity_batch_size=self.perplexity_batch_size,
+                rng=self.rng,
             )
             save_tst_results(tst_df, self.results_path)
             completed_ids = set(tst_df.index)
-            failed_ids = [
-                i for i in processing_ids
-                if i not in completed_ids
-            ]
-            unprocessed_queue += failed_ids
+            requeued_ids = []
+            for i in processing_ids:
+                if i in completed_ids:
+                    continue
+                attempts[i] += 1
+                if attempts[i] < max_attempts:
+                    requeued_ids.append(i)   # rejects go to the back of the queue
+                else:
+                    n_abandoned += 1          # capped out — abandon (source is abundant)
+            unprocessed_queue += requeued_ids
+            # Release this chunk's cached GPU blocks before the next one — the
+            # transient scoring models otherwise fragment the small (~8 GB) GPU
+            # across the streaming requeue loop and OOM after a few chunks.
+            del tst_df, current_df
+            gc.collect()
+            torch.cuda.empty_cache()
             time_end = datetime.now()
             time_str = time_end.strftime('%Y-%m-%d %H:%M:%S')
             n_tried = len(processing_ids)
             n_succeeded = len(completed_ids)
             n_unprocessed = len(unprocessed_queue)
             n_total = self.base_df.shape[0]
-            n_processed = n_total - n_unprocessed
-            success_p = f"{n_succeeded/n_tried:.1%}"
+            success_p = f"{n_succeeded/n_tried:.1%}" if n_tried else "n/a"
             print(
                 f"{n_succeeded} from {n_tried} ({success_p}) generated paraphrases passed during last step."
             )
             print(f"Step time: {str(time_end-time_start)}")
-            print(f"Totally: {time_str} processed {n_processed} from {n_total}")
+            print(
+                f"Totally: {time_str} | queue {n_unprocessed} | abandoned {n_abandoned} "
+                f"(cap {max_attempts}) | pool {n_total}"
+            )

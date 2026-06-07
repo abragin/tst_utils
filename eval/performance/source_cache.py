@@ -10,12 +10,16 @@ from tst_utils.eval.metrics.meaning import calc_labse_embeddings
 from tst_utils.eval.metrics.style import calc_style_embeddings
 
 
-def ensure_source_caches(df, *, perplexity=False, style_emb=False, labse_emb=False) -> None:
+def ensure_source_caches(df, *, perplexity=False, style_emb=False, labse_emb=False,
+                         perplexity_batch_size=32) -> None:
     """Idempotently populate the requested source-side caches on ``df`` (computed
     from ``df.text``). Only the caches whose flag is set are touched, and only
-    when the corresponding column is absent."""
+    when the corresponding column is absent. ``perplexity_batch_size`` controls
+    the rugpt3 perplexity batch size (lower it to fit a small GPU — its per-batch
+    logits tensor dominates VRAM; see styled_pph_gen's 8 GB path)."""
     if perplexity and 'text_perplexity' not in df:
-        df['text_perplexity'] = calculate_perplexity(df.text)[0]
+        df['text_perplexity'] = calculate_perplexity(
+            df.text, batch_size=perplexity_batch_size)[0]
     if style_emb and 'text_style_emb' not in df:
         df['text_style_emb'] = calc_style_embeddings(df.text, normalize=False)
     if labse_emb and 'text_labse_emb' not in df:
