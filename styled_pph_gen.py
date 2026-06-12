@@ -214,10 +214,20 @@ def sim_measure_series(df, target_emb_col, source_emb_col="text_style_emb"):
         for se,te in zip(df[source_emb_col], df[target_emb_col])
     ]
     
-def get_target_styles(current_domain):
+def get_target_styles(current_domain, has_author_targets=None):
+    """Target-style-type list for a source domain.
+
+    ``has_author_targets=None`` keeps the legacy rule (news = domain targets
+    only, everything else also gets author targets). Label-less content
+    domains (2A.7 pools: wikipedia/pikabu/taiga_* — no per-author styles in
+    the style pool) must pass ``has_author_targets=False`` to get news-like
+    domain-only targets; PphGenerator derives this from the style pool.
+    """
     base_domain_target_style_types = ['other_domain', '2_domains_weighted_avg']
     base_author_target_style_types = ['other_author', '2_authors_weighted_avg']
-    if current_domain == 'news':
+    if has_author_targets is None:
+        has_author_targets = current_domain != 'news'
+    if not has_author_targets:
         base_target_styles = base_domain_target_style_types
     else:
         base_target_styles = (
@@ -457,11 +467,13 @@ class PphGenerator:
         self.results_path = results_path
         self.rows_at_once = rows_at_once
         current_domain = self.base_df.iloc[0].domain
-        self.target_styles = get_target_styles(current_domain)
-        if current_domain == 'news':
-            self.in_domain_style_df = None
-        else:
-            self.in_domain_style_df = self.style_df[self.style_df.domain == current_domain]
+        in_domain = self.style_df[self.style_df.domain == current_domain]
+        # news and label-less domains (no rows in the style pool, e.g. the 2A.7
+        # wikipedia/pikabu/taiga_* pools) get domain-only target styles.
+        has_author_targets = (current_domain != 'news') and not in_domain.empty
+        self.target_styles = get_target_styles(
+            current_domain, has_author_targets=has_author_targets)
+        self.in_domain_style_df = in_domain if has_author_targets else None
         if long_texts:
             max_length = 1024
             batch_size = 6
