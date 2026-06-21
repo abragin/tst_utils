@@ -18,6 +18,14 @@ def calculate_perplexity(model_output, aggregate=False, sep='\n', batch_size=32)
     ).to(device)
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(PERPL_MODEL_NAME)
+    # rugpt3small's tokenizer defaults to padding_side='left'. With left padding and
+    # no position_ids, GPT2 assigns real tokens position ids that include the per-batch
+    # pad offset, shifting their positional embeddings -> per-text CE becomes
+    # batch-composition dependent (up to ~7.6 CE units; see
+    # docs/issues/resolved/calculate-perplexity-left-pad-batch-dependence.md). Right padding
+    # keeps real tokens at positions 0..n-1 and out of causal attention's view of the
+    # pads, making CE batch-invariant (verified: max |bs1-bs8| = 2e-6).
+    tokenizer.padding_side = 'right'
 
     texts = [f'{sep}{t}{sep}' for t in model_output]
 

@@ -16,43 +16,67 @@ nat_v2     = 1 / (max(0, style_gap − 2.0) + 1)
 
 score_v2   = base_score × nat_v2
 
-Author CE baselines are medians of CE(literary original text) from styled_pph,
-computed on 25 samples per author using rugpt3small. Domain medians are used for
-ficbook/news/writers when the target_style is not in AUTHOR_CE.
+Author/domain CE baselines are medians of CE(literary original text) from
+rugpt3small, computed by 16 phase 2A infrastructure/recompute_ce.py
+(N=500 samples/key, seed 1991, batch-invariant right-padded calculate_perplexity).
+AUTHOR_CE basis: data/styled_pph/train_short.parquet.gzip `text`; DOMAIN_CE basis:
+data/sources_v2/final/<domain>_train_v2.parquet `text` (9-domain pool_v2 taxonomy).
+Domain medians are the fallback when target_style is not in AUTHOR_CE.
+
+NOTE (2026-06-21): the previous values were corrupted by a left-padding bug in
+calculate_perplexity that made CE batch-composition dependent (see
+docs/issues/resolved/calculate-perplexity-left-pad-batch-dependence.md). These corrected
+values are ~2 CE units lower and on a compressed scale (span ~0.9). The nat_v2
+`margin` (2.0) was tuned on the old inflated scale and now leaves nat_v2 ~ 1.0 for
+almost all inputs; it should be recalibrated on this scale to regain discrimination.
 """
 
 import numpy as np
 import pandas as pd
 
 AUTHOR_CE = {
-    'Chekhov':        4.965303,
-    'Zoschenko':      5.025889,
-    'News':           5.109265,
-    'Dovlatov':       5.258266,
-    'Putin':          5.313718,
-    'Ilf and Petrov': 5.407140,
-    'Medvedev':       5.416350,
-    'Pushkin':        5.535736,
-    'Lermontov':      5.541788,
-    'Zhvaneckiy':     5.572086,
-    'Bulgakov':       5.757597,
-    'Dostoevsky':     5.850113,
-    'Bryusov':        5.891932,
-    'Yerofeyev':      5.897355,
-    'Gorky':          5.959240,
-    'Turgenev':       5.991673,
-    'Blok':           6.050667,
-    'Bible':          6.123743,
-    'Tolstoy':        6.637148,
-    'Gogol':          6.842763,
-    'Herzen':         6.905677,
-    'Nabokov':        8.702062,
+    'Chekhov':        3.641447,
+    'Zoschenko':      3.813564,
+    'News':           3.147179,
+    'Dovlatov':       3.758374,
+    'Putin':          3.414283,
+    'Ilf and Petrov': 3.715437,
+    'Medvedev':       3.643130,
+    'Pushkin':        3.867682,
+    'Lermontov':      3.768750,
+    'Zhvaneckiy':     3.911052,
+    'Bulgakov':       3.771773,
+    'Dostoevsky':     3.835618,
+    'Bryusov':        3.702599,
+    'Yerofeyev':      3.755454,
+    'Gorky':          3.853821,
+    'Turgenev':       3.777817,
+    'Blok':           3.897557,
+    'Bible':          3.666696,
+    'Tolstoy':        3.743540,
+    'Gogol':          3.965799,
+    'Herzen':         4.047286,
+    'Nabokov':        3.930439,
 }
 
+# 9-domain pool_v2 taxonomy (2A.8.1b). Fallback when target_style not in AUTHOR_CE.
+# NOTE: AUTHOR_CE and DOMAIN_CE sit on *different* text bases (AUTHOR_CE: train_short
+# literary originals; DOMAIN_CE: data/sources_v2/final pools), so a key present in both
+# ('Bible') has two slightly different values (author 3.667 vs domain 3.857) and the
+# author entry wins via _lookup_target_ce. Also note this table is only consulted on the
+# *eval* path (target_style); styled_pph generation passes target_style_desc (synthetic
+# recipe strings, e.g. 'other_author'), which never match a key, so generation-time nat_v2
+# is always source-referenced. See docs/issues/resolved/calculate-perplexity-left-pad-batch-dependence.md.
 DOMAIN_CE = {
-    'ficbook': 5.573,
-    'news':    5.109265,
-    'writers': 5.725,
+    'news':            3.151731,
+    'wikipedia':       3.421043,
+    'ficbook':         3.807949,
+    'pikabu':          4.046271,
+    'taiga_proza':     3.876610,
+    'taiga_magazines': 3.876763,
+    'writers':         3.962501,
+    'Bible':           3.857263,
+    'political':       3.649666,
 }
 
 

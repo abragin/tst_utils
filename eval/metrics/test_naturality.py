@@ -56,6 +56,28 @@ class TestCalculatePerplexity:
         agg = float((lls * ws).sum() / ws.sum())
         assert lls.min() <= agg <= lls.max()
 
+    def test_batch_size_invariance(self):
+        """Per-text CE must not depend on batch composition.
+
+        Regression test for the left-padding bug: rugpt3small's tokenizer pads on
+        the left, and without position_ids GPT2 shifts real tokens' positional
+        embeddings by the per-batch pad count, making CE depend on batch_size
+        (observed up to ~7.6 CE units). Texts of very different lengths force
+        substantial padding when batched together. bs=1 has no padding and is the
+        correct reference; right-padding makes all batch sizes agree.
+        See docs/issues/resolved/calculate-perplexity-left-pad-batch-dependence.md.
+        """
+        from tst_utils.eval.metrics.naturality import calculate_perplexity
+        texts = [
+            'Он шёл.',
+            'Я люблю читать книги каждый день, особенно по вечерам, когда за окном идёт дождь.',
+            'Привет.',
+            'Москва — столица России, и в ней живёт очень много самых разных людей со всего света.',
+        ]
+        ref, _ = calculate_perplexity(texts, batch_size=1)      # no padding → correct
+        batched, _ = calculate_perplexity(texts, batch_size=4)  # forces left/right padding
+        assert np.abs(np.asarray(ref) - np.asarray(batched)).max() < 1e-3
+
 
 # ---------------------------------------------------------------------------
 # naturality_score

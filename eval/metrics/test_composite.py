@@ -44,12 +44,15 @@ def test_nat_v2_known_author_no_penalty():
 
 
 def test_nat_v2_known_author_with_penalty():
-    # Tolstoy CE = 6.637; styled=11.0, source=5.0
-    # tgt_ce_ref = max(6.637, 5.0) = 6.637
-    # style_gap = 11.0 - 6.637 = 4.363; excess = 4.363 - 2.0 = 2.363
-    # nat_v2 = 1 / (2.363 + 1) = 0.2975
-    result = nat_v2_score(11.0, 5.0, 'Tolstoy')
-    assert result == pytest.approx(1.0 / (2.363 + 1), abs=1e-3)
+    # Expected derived from the imported AUTHOR_CE (robust to CE recalibration).
+    # source below the author CE so tgt_ce_ref = author CE; styled well above it.
+    ce = AUTHOR_CE['Tolstoy']
+    styled, source = ce + 5.0, ce - 0.5
+    ref = max(ce, source)  # = ce
+    expected = 1.0 / ((styled - ref - 2.0) + 1)  # excess = 3.0 → 0.25
+    result = nat_v2_score(styled, source, 'Tolstoy')
+    assert result == pytest.approx(expected, abs=1e-3)
+    assert result < 1.0  # a penalty actually fired
 
 
 def test_nat_v2_source_ce_floor():
@@ -67,22 +70,30 @@ def test_nat_v2_unknown_author_falls_back_to_source_ce():
 
 
 def test_nat_v2_domain_fallback():
-    # 'writers' is in DOMAIN_CE (5.725); styled=9.0, source=5.0
-    # tgt_ce_ref = max(5.725, 5.0) = 5.725
-    # style_gap = 9.0 - 5.725 = 3.275; excess = 1.275
-    # nat_v2 = 1 / (1.275 + 1)
-    result = nat_v2_score(9.0, 5.0, 'writers')
-    assert result == pytest.approx(1.0 / (1.275 + 1), abs=1e-3)
+    # 'writers' is only in DOMAIN_CE (not AUTHOR_CE) → exercises the domain fallback.
+    # Expected derived from the imported DOMAIN_CE (robust to CE recalibration).
+    ce = DOMAIN_CE['writers']
+    styled, source = ce + 4.0, ce - 0.5
+    ref = max(ce, source)  # = ce
+    expected = 1.0 / ((styled - ref - 2.0) + 1)  # excess = 2.0 → 1/3
+    result = nat_v2_score(styled, source, 'writers')
+    assert result == pytest.approx(expected, abs=1e-3)
+    assert result < 1.0  # a penalty actually fired via the domain reference
 
 
 def test_compute_nat_v2_vectorised():
-    sty = [6.0, 11.0, 8.0]
-    src = [5.0, 5.0, 10.0]
+    # Inputs framed relative to the imported AUTHOR_CE (robust to CE recalibration):
+    #   row0: styled just above ref, gap < margin → no penalty
+    #   row1: styled well above ref → penalty
+    #   row2: source above ref → source floor → no penalty
+    ce = AUTHOR_CE['Tolstoy']
+    sty = [ce + 1.0, ce + 5.0, ce + 1.0]
+    src = [ce - 1.0, ce - 1.0, ce + 3.0]
     styles = ['Tolstoy', 'Tolstoy', 'Tolstoy']
     results = compute_nat_v2(sty, src, styles)
-    assert results[0] == pytest.approx(1.0)           # no penalty
-    assert results[1] == pytest.approx(1.0 / (2.363 + 1), abs=1e-3)  # penalty
-    assert results[2] == pytest.approx(1.0)           # source floor
+    assert results[0] == pytest.approx(1.0)                           # no penalty
+    assert results[1] == pytest.approx(1.0 / ((5.0 - 2.0) + 1), abs=1e-3)  # penalty, excess=3
+    assert results[2] == pytest.approx(1.0)                           # source floor
 
 
 # ---------------------------------------------------------------------------
