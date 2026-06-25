@@ -21,9 +21,67 @@ from tst_utils.styled_pph_gen import (
     _rescale_targets_to_source_norms,
     produce_target_style,
     save_tst_results,
+    get_target_styles,
+    DOMAIN_ONLY,
     CHRF_UB, BI_SCORE_UB, CL_SCORE_UB, GENDER_SCORE_LB,
     ENTITY_SCORE_LB, MEANING_SCORE_LB, SIM_MEASURE_UB, NAT_V2_LB,
 )
+from tst_utils.eval.metrics.composite import (
+    AUTHOR_CE, DOMAIN_CE, _lookup_target_ce,
+)
+
+
+# ---------------- 2A.8.1b: domain -> target-style routing ----------------
+
+# The 9-domain pool_v2 taxonomy. Real-author domains carry per-author style
+# targets; domain-only domains do not (news pattern). 'political' carries author
+# names but is domain-targets-only.
+REAL_AUTHOR_DOMAINS = ['writers', 'ficbook', 'taiga_proza', 'pikabu']
+DOMAIN_ONLY_DOMAINS = ['news', 'wikipedia', 'taiga_magazines', 'Bible', 'political']
+
+
+def test_domain_only_set_matches_taxonomy():
+    assert DOMAIN_ONLY == set(DOMAIN_ONLY_DOMAINS)
+    # the two groups partition the 9 domains, no overlap
+    assert set(REAL_AUTHOR_DOMAINS) & DOMAIN_ONLY == set()
+    assert len(REAL_AUTHOR_DOMAINS) + len(DOMAIN_ONLY_DOMAINS) == 9
+
+
+@pytest.mark.parametrize('domain', REAL_AUTHOR_DOMAINS)
+def test_real_author_domains_get_author_and_domain_targets(domain):
+    # explicit-flag path (what PphGenerator passes) and the None default path
+    # must agree, and must include both author and domain target styles.
+    for ts in (
+        get_target_styles(domain, has_author_targets=(domain not in DOMAIN_ONLY)),
+        get_target_styles(domain),  # None default derives from DOMAIN_ONLY
+    ):
+        assert any(t.startswith('other_author') for t in ts)
+        assert any(t.startswith('other_domain') for t in ts)
+
+
+@pytest.mark.parametrize('domain', DOMAIN_ONLY_DOMAINS)
+def test_domain_only_domains_get_no_author_targets(domain):
+    for ts in (
+        get_target_styles(domain, has_author_targets=(domain not in DOMAIN_ONLY)),
+        get_target_styles(domain),
+    ):
+        assert not any(t.startswith('other_author') for t in ts)
+        assert any(t.startswith('other_domain') for t in ts)
+
+
+@pytest.mark.parametrize('domain', REAL_AUTHOR_DOMAINS + DOMAIN_ONLY_DOMAINS)
+def test_each_domain_name_resolves_to_a_ce_reference(domain):
+    # The scoring path passes the *domain name* as target_style for these
+    # fallbacks; every one of the 9 domains must resolve to a CE value (R2).
+    assert _lookup_target_ce(domain) is not None
+
+
+def test_new_real_author_domains_fall_back_to_domain_ce():
+    # pikabu / taiga_proza usernames are NOT in AUTHOR_CE and never will be; they
+    # resolve via DOMAIN_CE through the ficbook-style fallback (composite.py).
+    for domain in ('pikabu', 'taiga_proza'):
+        assert domain not in AUTHOR_CE
+        assert _lookup_target_ce(domain) == DOMAIN_CE[domain]
 
 
 def _passing_row(**over):

@@ -42,6 +42,15 @@ PERPLEXITY_BATCH_SIZE = 8
 
 DEFAULT_SEED = 1991
 
+# Domain-only target domains (2A.8.1b taxonomy): no per-author targets in the
+# style pool. Real-author domains (writers/ficbook/taiga_proza/pikabu) get
+# author+domain targets; these get domain-only targets (like news). 'political'
+# carries author names (Putin/Medvedev) but is domain-targets-only by decision.
+# Derive has_author_targets from this explicit set, NOT from style-pool author
+# cardinality: cardinality wrongly flips 'political' (2 authors) to author-targets
+# and a real-author domain that happens to sample a single author to domain-only.
+DOMAIN_ONLY = {'news', 'wikipedia', 'taiga_magazines', 'Bible', 'political'}
+
 # ---------------- Helper functions ----------------
 
 def _as_array(vec):
@@ -217,16 +226,15 @@ def sim_measure_series(df, target_emb_col, source_emb_col="text_style_emb"):
 def get_target_styles(current_domain, has_author_targets=None):
     """Target-style-type list for a source domain.
 
-    ``has_author_targets=None`` keeps the legacy rule (news = domain targets
-    only, everything else also gets author targets). Label-less content
-    domains (2A.7 pools: wikipedia/pikabu/taiga_* — no per-author styles in
-    the style pool) must pass ``has_author_targets=False`` to get news-like
-    domain-only targets; PphGenerator derives this from the style pool.
+    ``has_author_targets=None`` derives the flag from the 2A.8.1b ``DOMAIN_ONLY``
+    set: domain-only domains (news/wikipedia/taiga_magazines/Bible/political) get
+    domain targets only, real-author domains also get author targets. Callers
+    (PphGenerator) normally pass the flag explicitly.
     """
     base_domain_target_style_types = ['other_domain', '2_domains_weighted_avg']
     base_author_target_style_types = ['other_author', '2_authors_weighted_avg']
     if has_author_targets is None:
-        has_author_targets = current_domain != 'news'
+        has_author_targets = current_domain not in DOMAIN_ONLY
     if not has_author_targets:
         base_target_styles = base_domain_target_style_types
     else:
@@ -468,9 +476,12 @@ class PphGenerator:
         self.rows_at_once = rows_at_once
         current_domain = self.base_df.iloc[0].domain
         in_domain = self.style_df[self.style_df.domain == current_domain]
-        # news and label-less domains (no rows in the style pool, e.g. the 2A.7
-        # wikipedia/pikabu/taiga_* pools) get domain-only target styles.
-        has_author_targets = (current_domain != 'news') and not in_domain.empty
+        # 2A.8.1b: domain-only domains (news/wikipedia/taiga_magazines/Bible/
+        # political) get domain-only target styles; real-author domains also get
+        # author targets. Use the explicit DOMAIN_ONLY set — NOT in_domain.empty,
+        # which flips to author-targets once author-less domains carry
+        # author=<domain> rows in style_sample_v2.
+        has_author_targets = current_domain not in DOMAIN_ONLY
         self.target_styles = get_target_styles(
             current_domain, has_author_targets=has_author_targets)
         self.in_domain_style_df = in_domain if has_author_targets else None
