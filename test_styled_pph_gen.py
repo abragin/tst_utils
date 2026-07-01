@@ -20,9 +20,16 @@ from tst_utils.styled_pph_gen import (
     phase1_keep_mask,
     _rescale_targets_to_source_norms,
     produce_target_style,
+    produce_target_style_other_domain,
+    produce_target_style_2_other_domains,
+    add_target_style_emb,
+    compute_domain_target_weights,
     save_tst_results,
     get_target_styles,
     DOMAIN_ONLY,
+    DOMAIN_CENTROID_SIM,
+    TARGET_WEIGHT_FLOOR,
+    TARGET_WEIGHT_TAU,
     CHRF_UB, BI_SCORE_UB, CL_SCORE_UB, GENDER_SCORE_LB,
     ENTITY_SCORE_LB, MEANING_SCORE_LB, SIM_MEASURE_UB, NAT_V2_LB,
 )
@@ -33,11 +40,13 @@ from tst_utils.eval.metrics.composite import (
 
 # ---------------- 2A.8.1b: domain -> target-style routing ----------------
 
-# The 9-domain pool_v2 taxonomy. Real-author domains carry per-author style
-# targets; domain-only domains do not (news pattern). 'political' carries author
-# names but is domain-targets-only.
-REAL_AUTHOR_DOMAINS = ['writers', 'ficbook', 'taiga_proza', 'pikabu']
-DOMAIN_ONLY_DOMAINS = ['news', 'wikipedia', 'taiga_magazines', 'Bible', 'political']
+# The 9-domain pool_v2 taxonomy. Only 'writers' carries per-author style targets;
+# every other domain is domain-only (news pattern). ficbook/taiga_proza/pikabu
+# were demoted to domain-only by the 2A.8.2 author-separability diagnostic;
+# 'political' carries author names but is domain-targets-only.
+REAL_AUTHOR_DOMAINS = ['writers']
+DOMAIN_ONLY_DOMAINS = ['news', 'wikipedia', 'taiga_magazines', 'Bible', 'political',
+                       'ficbook', 'taiga_proza', 'pikabu']
 
 
 def test_domain_only_set_matches_taxonomy():
@@ -235,6 +244,151 @@ def test_produce_target_style_legacy_keeps_source_norm():
                                rng=np.random.default_rng(1), target_norm=None)
     for v, n in zip(out, src_norms):
         assert np.isclose(np.linalg.norm(v), n)
+
+
+# ---------------- 2A.8.2: per-source target-domain weighting ----------------
+
+ALL_DOMAINS = list(DOMAIN_CENTROID_SIM.keys())
+
+
+def test_domain_weights_normalized_and_exclude_self():
+    for s in ALL_DOMAINS:
+        w = compute_domain_target_weights(s)
+        assert s not in w                              # own key excluded
+        assert set(w) == set(ALL_DOMAINS) - {s}        # every other domain present
+        assert np.isclose(sum(w.values()), 1.0)        # probability vector
+
+
+def test_domain_weights_floor_keeps_all_positive():
+    # Every candidate must be strictly positive so n_picks=2 (replace=False)
+    # always has >= 2 non-zero entries. The nearest neighbor is the smallest.
+    for s in ALL_DOMAINS:
+        w = compute_domain_target_weights(s)
+        assert all(v > 0 for v in w.values())
+
+
+def test_domain_weights_downweight_near_neighbors():
+    # Penalty-only: the nearest register is suppressed to the minimum; distant
+    # registers sit at the uniform baseline (NOT boosted).
+    w = compute_domain_target_weights('news')
+    assert min(w, key=w.get) == 'wikipedia'            # news's nearest (0.965)
+    # symmetric flagged pair: ficbook's nearest is pikabu.
+    wf = compute_domain_target_weights('ficbook')
+    assert min(wf, key=wf.get) == 'pikabu'             # ficbook's nearest (0.943)
+
+
+def test_domain_weights_penalty_only_distant_at_baseline():
+    # Distant/outlier domains (below tau) must NOT be boosted above the uniform
+    # baseline — Bible (news sim 0.431) sits with the other un-penalized domains,
+    # not as a lone maximum (the old reward-distance formula gave it ~0.27).
+    w = compute_domain_target_weights('news')
+    unpenalized = [t for t in w if DOMAIN_CENTROID_SIM['news'][t] <= TARGET_WEIGHT_TAU]
+    assert 'Bible' in unpenalized
+    # all un-penalized domains share one baseline weight (renormalized uniform)
+    vals = [w[t] for t in unpenalized]
+    assert max(vals) - min(vals) < 1e-9
+    # and the near-neighbor is strictly below that baseline
+    assert w['wikipedia'] < min(vals)
+
+
+def test_domain_weights_unknown_domain_returns_none():
+    assert compute_domain_target_weights('nonexistent') is None
+
+
+def _domain_pool():
+    rng = np.random.default_rng(0)
+    rows = []
+    for dom in ALL_DOMAINS:
+        for _ in range(4):
+            rows.append({"domain": dom,
+                         "text_style_emb": rng.normal(size=8) * 7.0})
+    return pd.DataFrame(rows)
+
+
+def test_weighted_draw_biases_toward_low_similarity():
+    # Empirically, weighted target-domain selection should pick down-weighted
+    # neighbors far less than favored distant registers.
+    pool = _domain_pool()
+    short = pd.concat([pool[pool.domain == 'news'].iloc[[0]]] * 2000, ignore_index=True)
+    w = compute_domain_target_weights('news')
+    rng = np.random.default_rng(7)
+    # Reproduce the which-key draw the function performs internally.
+    candidates = [d for d in ALL_DOMAINS if d != 'news']
+    p = np.array([w[c] for c in candidates]); p = p / p.sum()
+    picks = rng.choice(candidates, size=20000, p=p)
+    counts = pd.Series(picks).value_counts(normalize=True)
+    assert counts['wikipedia'] < counts['Bible']       # near neighbor suppressed
+    assert counts['wikipedia'] < 0.05                  # ~0.9% expected
+
+
+def test_weighted_n_picks_2_no_crash():
+    # The positive floor guarantees >= 2 non-zero entries, so the n_picks=2
+    # replace=False draw never raises "fewer non-zero entries in p than size".
+    pool = _domain_pool()
+    short = pool[pool.domain == 'news'].copy()
+    out = produce_target_style_2_other_domains(
+        short, pool, rng=np.random.default_rng(1), target_norm=1.0,
+        domain_weights=compute_domain_target_weights('news'),
+    )
+    assert len(out) == len(short)
+    for v in out:
+        assert np.isclose(np.linalg.norm(v), 1.0)
+
+
+def test_weighted_draw_reproducible_and_differs_from_uniform():
+    # Same seed -> identical output (new weighted stream is deterministic);
+    # weighting shifts the stream vs uniform, so results differ.
+    pool = _domain_pool()
+    short = pool[pool.domain == 'news'].copy()
+    w = compute_domain_target_weights('news')
+    a = produce_target_style_other_domain(
+        short, pool, rng=np.random.default_rng(3), target_norm=1.0, domain_weights=w)
+    b = produce_target_style_other_domain(
+        short, pool, rng=np.random.default_rng(3), target_norm=1.0, domain_weights=w)
+    u = produce_target_style_other_domain(
+        short, pool, rng=np.random.default_rng(3), target_norm=1.0, domain_weights=None)
+    assert all(np.allclose(x, y) for x, y in zip(a, b))          # reproducible
+    assert not all(np.allclose(x, y) for x, y in zip(a, u))      # differs from uniform
+
+
+def test_2domain_mixes_stay_uniform_wiring():
+    # 2A.8.2 decision: per-source weighting applies ONLY to single-domain
+    # (other_domain) selection; 2-domain weighted-average mixes stay uniform
+    # because a mixture's closeness to source isn't monotonic in its components'.
+    # This guards add_target_style_emb's routing so a future refactor can't
+    # silently forward domain_weights to the 2-domain path.
+    from unittest import mock
+    import tst_utils.styled_pph_gen as m
+
+    df = pd.DataFrame({
+        'text_style_emb': [np.ones(4) * 7.0, np.ones(4) * 7.0],
+        'domain': ['news', 'news'],
+        'target_style_desc': ['other_domain', '2_domains_weighted_avg'],
+    })
+    weights = compute_domain_target_weights('news')
+
+    def fake(df_sub, *a, **k):
+        return [np.zeros(4) for _ in range(len(df_sub))]
+
+    with mock.patch.object(m, 'produce_target_style_other_domain', side_effect=fake) as p1, \
+         mock.patch.object(m, 'produce_target_style_2_other_domains', side_effect=fake) as p2:
+        m.add_target_style_emb(df, _domain_pool(), domain_weights=weights)
+
+    # single-domain path receives the weights; 2-domain path must NOT
+    assert p1.call_args.kwargs.get('domain_weights') == weights
+    assert p2.call_args.kwargs.get('domain_weights') is None
+
+
+def test_degenerate_all_zero_weights_falls_back_to_uniform():
+    # A weight map that zeroes every candidate for a row must not crash; the
+    # function drops to uniform sampling for that row.
+    pool = _domain_pool()
+    short = pool[pool.domain == 'news'].copy()
+    out = produce_target_style_other_domain(
+        short, pool, rng=np.random.default_rng(1), target_norm=1.0,
+        domain_weights={d: 0.0 for d in ALL_DOMAINS},
+    )
+    assert len(out) == len(short)
 
 
 # ---------------- save_tst_results required-column guard ----------------

@@ -10,7 +10,7 @@ from typing import Optional, List
 
 from tst_utils.eval.performance import TstPerformanceMetrics
 from tst_utils.eval.performance.source_cache import ensure_source_caches
-from tst_utils.eval.metrics.style import sim_measure
+from tst_utils.eval.metrics.style import sim_measure, calc_style_embeddings
 from tst_utils.eval.metrics.composite import compute_nat_v2
 from tst_utils.eval.metrics.alignment import BatchedAligner
 from tst_utils.eval.metrics.gender_consistency import GenderConsistencyScorer
@@ -49,14 +49,102 @@ PERPLEXITY_BATCH_SIZE = 8
 
 DEFAULT_SEED = 1991
 
-# Domain-only target domains (2A.8.1b taxonomy): no per-author targets in the
-# style pool. Real-author domains (writers/ficbook/taiga_proza/pikabu) get
-# author+domain targets; these get domain-only targets (like news). 'political'
-# carries author names (Putin/Medvedev) but is domain-targets-only by decision.
-# Derive has_author_targets from this explicit set, NOT from style-pool author
-# cardinality: cardinality wrongly flips 'political' (2 authors) to author-targets
-# and a real-author domain that happens to sample a single author to domain-only.
-DOMAIN_ONLY = {'news', 'wikipedia', 'taiga_magazines', 'Bible', 'political'}
+# Domain-only target domains: no per-author targets in the style pool. Only
+# 'writers' retains author+domain targets; every other domain gets domain-only
+# targets. 'political' carries author names (Putin/Medvedev) but is
+# domain-targets-only by decision. ficbook/taiga_proza/pikabu were demoted here
+# by the 2A.8.2 author-separability diagnostic: their per-author style centroids
+# do not separate under the style encoder (silhouette −0.10/−0.19/−0.18 vs
+# writers +0.15), and ficbook's deployed pool support is ~1 chunk/author, so an
+# "author target" is operationally a domain draw. Derive has_author_targets from
+# this explicit set, NOT from style-pool author cardinality: cardinality wrongly
+# flips 'political' (2 authors) to author-targets and a real-author domain that
+# happens to sample a single author to domain-only.
+DOMAIN_ONLY = {'news', 'wikipedia', 'taiga_magazines', 'Bible', 'political',
+               'ficbook', 'taiga_proza', 'pikabu'}
+
+# ---- 2A.8.2 per-source target-domain weighting ----
+# Domain-centroid cosine similarity (9x9, symmetric), measured on the final v2
+# source pools (1000 chunks/domain, normalized-mean centroids, style encoder
+# `abragin/ruBert-style-base`, seed 20260701; see notebook 16/14). Used to
+# down-weight target domains that are too close to the source (near-identity,
+# weak-transfer pairs) — e.g. news<->wikipedia 0.965, ficbook<->pikabu 0.943.
+# The per-pair SIM_MEASURE_TARGET_STYLE_UB filter catches literal near-duplicate
+# embeddings (drops 71% of news<->wiki) but is nearly blind to same-register
+# non-duplicate pairs (16% of ficbook<->pikabu); this weighting covers that gap.
+DOMAIN_CENTROID_SIM = {
+    'news':            {'news': 1.0000, 'wikipedia': 0.9652, 'ficbook': 0.5094, 'pikabu': 0.6555, 'taiga_proza': 0.5734, 'taiga_magazines': 0.6505, 'writers': 0.5271, 'Bible': 0.4305, 'political': 0.5698},
+    'wikipedia':       {'news': 0.9652, 'wikipedia': 1.0000, 'ficbook': 0.6739, 'pikabu': 0.7914, 'taiga_proza': 0.7523, 'taiga_magazines': 0.8169, 'writers': 0.6901, 'Bible': 0.5123, 'political': 0.6615},
+    'ficbook':         {'news': 0.5094, 'wikipedia': 0.6739, 'ficbook': 1.0000, 'pikabu': 0.9428, 'taiga_proza': 0.9414, 'taiga_magazines': 0.8627, 'writers': 0.7443, 'Bible': 0.5099, 'political': 0.6232},
+    'pikabu':          {'news': 0.6555, 'wikipedia': 0.7914, 'ficbook': 0.9428, 'pikabu': 1.0000, 'taiga_proza': 0.9381, 'taiga_magazines': 0.8902, 'writers': 0.7765, 'Bible': 0.5345, 'political': 0.7171},
+    'taiga_proza':     {'news': 0.5734, 'wikipedia': 0.7523, 'ficbook': 0.9414, 'pikabu': 0.9381, 'taiga_proza': 1.0000, 'taiga_magazines': 0.9606, 'writers': 0.8521, 'Bible': 0.5651, 'political': 0.6980},
+    'taiga_magazines': {'news': 0.6505, 'wikipedia': 0.8169, 'ficbook': 0.8627, 'pikabu': 0.8902, 'taiga_proza': 0.9606, 'taiga_magazines': 1.0000, 'writers': 0.8701, 'Bible': 0.5447, 'political': 0.6728},
+    'writers':         {'news': 0.5271, 'wikipedia': 0.6901, 'ficbook': 0.7443, 'pikabu': 0.7765, 'taiga_proza': 0.8521, 'taiga_magazines': 0.8701, 'writers': 1.0000, 'Bible': 0.5859, 'political': 0.6245},
+    'Bible':           {'news': 0.4305, 'wikipedia': 0.5123, 'ficbook': 0.5099, 'pikabu': 0.5345, 'taiga_proza': 0.5651, 'taiga_magazines': 0.5447, 'writers': 0.5859, 'Bible': 1.0000, 'political': 0.5059},
+    'political':       {'news': 0.5698, 'wikipedia': 0.6615, 'ficbook': 0.6232, 'pikabu': 0.7171, 'taiga_proza': 0.6980, 'taiga_magazines': 0.6728, 'writers': 0.6245, 'Bible': 0.5059, 'political': 1.0000},
+}
+
+# Penalty-only weighting (2A.8.2, revised): the goal is "avoid target domains too
+# CLOSE to the source", NOT "prefer the most distant". So every candidate sits at
+# a uniform baseline (weight 1.0) and is *penalized* only when its centroid sim to
+# the source exceeds TAU; the penalty ramps linearly to the floor at SIM_HI. This
+# leaves distant/outlier registers (notably Bible, cos ~0.43-0.59) at ~uniform
+# instead of hoarding the target budget (the earlier reward-distance formula gave
+# Bible ~0.27), while still driving the genuinely near-register pairs (news<->wiki
+# 0.965, ficbook<->pikabu 0.943, the prose cluster) toward the floor.
+#   TAU=0.82   threshold on the raw centroid COSINE in DOMAIN_CENTROID_SIM (NOT
+#              sim_measure): below = not too close = uniform baseline. Chosen
+#              empirically — it cleanly separates the same-register/near-identity
+#              cluster (informal prose + news<->wiki, all 0.86-0.965) from the
+#              cross-register pairs and outliers (<=0.85). A reasonable data-driven
+#              cut, not a first-principles constant; retune if the pool/encoder
+#              changes (see target_pool_diagnostics.py for the matrix's origin).
+#   SIM_HI=0.97 at/above this = maximal penalty (weight -> FLOOR); anchored to the
+#              single tightest observed pair (news<->wikipedia 0.965), so the top
+#              of the penalty ramp is effectively exercised by that one pair.
+#   FLOOR=0.05 positivity floor: keeps every register reachable and guarantees
+#              rng.choice(replace=False, p=) for n_picks=2 always has >=2 non-zero
+#              entries. Post-renorm the smallest weight lands ~0.01 (a floor on the
+#              pre-renorm weight, not a guaranteed minimum sampling probability).
+TARGET_WEIGHT_FLOOR = 0.05
+TARGET_WEIGHT_TAU = 0.82
+TARGET_WEIGHT_SIM_HI = 0.97
+
+
+def compute_domain_target_weights(source_domain, sim=DOMAIN_CENTROID_SIM,
+                                  floor=TARGET_WEIGHT_FLOOR,
+                                  tau=TARGET_WEIGHT_TAU,
+                                  sim_hi=TARGET_WEIGHT_SIM_HI):
+    """Per-source target-domain sampling weights (2A.8.2, penalty-only).
+
+    For source ``s`` and each candidate target ``t != s``, start from a uniform
+    baseline and apply a closeness penalty only above ``tau``::
+
+        excess  = clip((sim(s, t) - tau) / (sim_hi - tau), 0, 1)
+        w_{s,t} = 1 - (1 - floor) * excess
+
+    then renormalize over the candidate set to a probability vector. Distant
+    domains (``sim <= tau``) stay at the uniform baseline; near-register domains
+    are suppressed toward ``floor``. This is applied only to single-domain
+    (``other_domain``) target selection — 2-domain mixes stay uniform, because a
+    mixture's closeness to the source is not monotonic in its components' (see
+    ``add_target_style_emb``).
+
+    Returns a ``{target_domain: weight}`` dict summing to 1 over all domains
+    except ``source_domain``, or ``None`` if ``source_domain`` is unknown (caller
+    then falls back to uniform sampling).
+    """
+    if source_domain not in sim:
+        return None
+    span = (sim_hi - tau) or 1.0
+    raw = {}
+    for t in sim:
+        if t == source_domain:
+            continue
+        excess = min(max((sim[source_domain][t] - tau) / span, 0.0), 1.0)
+        raw[t] = 1.0 - (1.0 - floor) * excess
+    total = sum(raw.values())
+    return {t: w / total for t, w in raw.items()}
 
 # ---------------- Helper functions ----------------
 
@@ -102,6 +190,7 @@ def produce_target_style(
     source_emb_col: str = "text_style_emb",
     rng: Optional[np.random.Generator] = None,
     target_norm: Optional[float] = None,
+    key_weights: Optional[dict] = None,
 ) -> List[np.ndarray]:
     """
     For each row in short_df:
@@ -109,6 +198,17 @@ def produce_target_style(
       - sample one embedding per chosen group
       - mix them using random weights (if n_picks > 1)
       - rescale to ``target_norm`` if given, else to the source embedding's norm
+
+    ``key_weights`` optionally biases the *which-key* draw (2A.8.2): a
+    ``{key_value: weight}`` map over candidate keys. When given, candidates are
+    sampled with ``p`` proportional to these weights (renormalized over the
+    candidate set after own-key exclusion), rather than uniformly. Keys missing
+    from the map fall back to weight 0 among present ones — callers must supply a
+    strictly-positive floor for every candidate so a probability vector always
+    exists and ``replace=False`` for ``n_picks=2`` never hits "fewer non-zero
+    entries than size". Passing ``key_weights`` changes ``Generator.choice``'s
+    internal algorithm, so the seeded RNG bit stream differs from the unweighted
+    path (reproducible, but re-baselined — see tests).
 
     The ``n_picks=2`` mix keeps the raw weighted sum (no per-pick unit
     normalization) — a deliberate choice preserved from the original mixing
@@ -136,9 +236,26 @@ def produce_target_style(
         if not candidates:
             candidates = all_keys
 
+        # Optional weighted draw over candidate keys (renormalized per row after
+        # own-key exclusion). Uniform when key_weights is None.
+        p = None
+        if key_weights is not None:
+            w = np.array([key_weights.get(k, 0.0) for k in candidates], dtype=float)
+            total = w.sum()
+            if total <= 0:
+                p = None  # degenerate map for this candidate set → uniform
+            else:
+                p = w / total
+
         # Pick n_picks distinct or with replacement if not enough
         replace = len(candidates) < n_picks
-        picks = rng.choice(candidates, size=n_picks, replace=replace)
+        if p is not None and not replace and int((p > 0).sum()) < n_picks:
+            # Sparse weight map: fewer non-zero candidates than n_picks would make
+            # a without-replacement weighted draw raise "fewer non-zero entries in
+            # p than size". The production floor keeps p fully positive so this
+            # only guards misuse of the public wrappers — degrade to replacement.
+            replace = True
+        picks = rng.choice(candidates, size=n_picks, replace=replace, p=p)
 
         # Sample one embedding from each group
         embs = [grouped[pick][rng.integers(0, len(grouped[pick]))] for pick in picks]
@@ -178,20 +295,22 @@ def produce_target_style_2_random_writers(
 
 def produce_target_style_other_domain(
     short_df, complete_df, domain_col="domain", source_emb_col="text_style_emb",
-    rng=None, target_norm=None
+    rng=None, target_norm=None, domain_weights=None
 ):
     return produce_target_style(
         short_df, complete_df, key_col=domain_col, n_picks=1,
-        source_emb_col=source_emb_col, rng=rng, target_norm=target_norm
+        source_emb_col=source_emb_col, rng=rng, target_norm=target_norm,
+        key_weights=domain_weights,
     )
 
 def produce_target_style_2_other_domains(
     short_df, complete_df, domain_col="domain", source_emb_col="text_style_emb",
-    rng=None, target_norm=None
+    rng=None, target_norm=None, domain_weights=None
 ):
     return produce_target_style(
         short_df, complete_df, key_col=domain_col, n_picks=2,
-        source_emb_col=source_emb_col, rng=rng, target_norm=target_norm
+        source_emb_col=source_emb_col, rng=rng, target_norm=target_norm,
+        key_weights=domain_weights,
     )
 
 # ---------- Perturbation-based style sampling ----------
@@ -255,7 +374,8 @@ def get_target_styles(current_domain, has_author_targets=None):
     ]
     return target_styles
 
-def add_target_style_emb(df, style_df, in_domain_style_df=None, target_norm=None, rng=None):
+def add_target_style_emb(df, style_df, in_domain_style_df=None, target_norm=None,
+                         rng=None, domain_weights=None):
     for target_style_desc in df.target_style_desc.unique():
         df_target_style = df[df.target_style_desc == target_style_desc]
         if not df_target_style.empty:
@@ -269,11 +389,17 @@ def add_target_style_emb(df, style_df, in_domain_style_df=None, target_norm=None
                 )
             elif 'other_domain' in target_style_desc:
                 target_style_embs = produce_target_style_other_domain(
-                    df_target_style, style_df, rng=rng, target_norm=target_norm
+                    df_target_style, style_df, rng=rng, target_norm=target_norm,
+                    domain_weights=domain_weights,
                 )
             elif '2_domains_weighted_avg' in target_style_desc:
+                # 2-domain mixes stay UNIFORM (domain_weights not forwarded): a
+                # mixture's closeness to the source is not monotonic in its two
+                # components' closeness, so per-pick weighting can't faithfully
+                # control it. The per-pair SIM_MEASURE_TARGET_STYLE_UB filter
+                # backstops any too-close mixture (2A.8.2 decision).
                 target_style_embs = produce_target_style_2_other_domains(
-                    df_target_style, style_df, rng=rng, target_norm=target_norm
+                    df_target_style, style_df, rng=rng, target_norm=target_norm,
                 )
             else:
                 raise Exception('Unsupported target style type: ' + target_style_desc)
@@ -332,6 +458,7 @@ def gen_paraphrases(
     current_df, tst_generator, style_df, in_domain_style_df, target_styles,
     alignment_scorer, gender_scorer, entity_scorer,
     target_norm=None, perplexity_batch_size=PERPLEXITY_BATCH_SIZE, rng=None,
+    domain_weights=None,
 ):
     current_df = current_df.copy()
     if rng is None:
@@ -340,7 +467,8 @@ def gen_paraphrases(
         target_styles, size=current_df.shape[0]
     )
     add_target_style_emb(
-        current_df, style_df, in_domain_style_df, target_norm=target_norm, rng=rng
+        current_df, style_df, in_domain_style_df, target_norm=target_norm, rng=rng,
+        domain_weights=domain_weights,
     )
     current_df['target_style_sim_measure'] = sim_measure_series(
         current_df, 'target_style_emb'
@@ -481,8 +609,27 @@ class PphGenerator:
         self.style_df = pd.read_parquet(style_df_path)
         self.results_path = results_path
         self.rows_at_once = rows_at_once
+        # 2A.8.2: fresh-encode the target style pool from its text rather than
+        # trusting a stored embedding column. style_sample_v2 ships text only
+        # ([author, domain, text_chunk], no text_style_emb), and legacy pools had
+        # a ~10% text<->embedding desync — re-encoding here guarantees the target
+        # geometry matches the pool text. Write into `text_style_emb` because
+        # produce_target_style groups the pool on that column. normalize=False
+        # keeps the source-norm convention; target_norm handles any rescale.
+        pool_text_col = 'text_chunk' if 'text_chunk' in self.style_df.columns else 'text'
+        self.style_df['text_style_emb'] = calc_style_embeddings(
+            self.style_df[pool_text_col].tolist(), normalize=False
+        )
+        # calc_style_embeddings builds a fresh SentenceTransformer and does not
+        # free it; release the VRAM before TinyStyler + the 3 resident scorers
+        # load onto tallin's ~8 GB card.
+        gc.collect()
+        torch.cuda.empty_cache()
         current_domain = self.base_df.iloc[0].domain
         in_domain = self.style_df[self.style_df.domain == current_domain]
+        # Per-source target-domain weights (2A.8.2): down-weight near-neighbor
+        # target registers. None for unknown domains -> uniform sampling.
+        self.domain_weights = compute_domain_target_weights(current_domain)
         # 2A.8.1b: domain-only domains (news/wikipedia/taiga_magazines/Bible/
         # political) get domain-only target styles; real-author domains also get
         # author targets. Use the explicit DOMAIN_ONLY set — NOT in_domain.empty,
@@ -570,6 +717,7 @@ class PphGenerator:
                 target_norm=self.target_norm,
                 perplexity_batch_size=self.perplexity_batch_size,
                 rng=self.rng,
+                domain_weights=self.domain_weights,
             )
             save_tst_results(tst_df, self.results_path)
             completed_ids = set(tst_df.index)
