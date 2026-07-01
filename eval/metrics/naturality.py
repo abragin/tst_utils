@@ -59,6 +59,14 @@ def calculate_perplexity(model_output, aggregate=False, sep='\n', batch_size=32)
 
 
 def naturality_score(source_perplexity, target_perplexity):
+    """DEPRECATED (superseded by nat_v2 in composite.py). Absolute+relative CE
+    naturality score. Retained only for the v1 composite `score` (scoring.py) and
+    its golden test; not a generation gate. NOT recalibrated and does not need to be:
+    it predates the left-padding CE bug and its thresholds (4 / k_abs 8 / k_rel 20)
+    were tuned on the correct bs=1 CE scale, so with calculate_perplexity now fixed
+    it operates on the correct scale again (mean corrected CE ~3.76). The args named
+    *_perplexity are mean per-token CE, not perplexity. Unlikely to be used going
+    forward; kept for backward compatibility. Do not alter the constants here."""
     perpl_scaled_abs = np.maximum(target_perplexity - 4, 0)
     perpl_scaled_rel = np.maximum(
         target_perplexity - np.maximum(source_perplexity, 4), 0

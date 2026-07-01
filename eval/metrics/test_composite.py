@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 from tst_utils.eval.metrics.composite import (
-    AUTHOR_CE, DOMAIN_CE, base_score_v2, nat_v2_score, compute_nat_v2,
+    AUTHOR_CE, DOMAIN_CE, NAT_V2_MARGIN, base_score_v2, nat_v2_score, compute_nat_v2,
 )
 from tst_utils.eval.performance import TstPerformanceMetrics
 
@@ -39,61 +39,66 @@ def test_base_score_vectorised():
 # ---------------------------------------------------------------------------
 
 def test_nat_v2_known_author_no_penalty():
-    # styled CE well within Tolstoy range → no penalty
-    assert nat_v2_score(6.0, 5.0, 'Tolstoy') == pytest.approx(1.0)
+    # styled within margin of the reference → no penalty (gap < NAT_V2_MARGIN).
+    # source above author CE so tgt_ce_ref = source; gap = half the margin.
+    ce = AUTHOR_CE['Tolstoy']
+    source = ce + 1.0
+    styled = source + NAT_V2_MARGIN * 0.5
+    assert nat_v2_score(styled, source, 'Tolstoy') == pytest.approx(1.0)
 
 
 def test_nat_v2_known_author_with_penalty():
-    # Expected derived from the imported AUTHOR_CE (robust to CE recalibration).
+    # Expected derived from imported AUTHOR_CE + NAT_V2_MARGIN (robust to recalibration).
     # source below the author CE so tgt_ce_ref = author CE; styled well above it.
     ce = AUTHOR_CE['Tolstoy']
     styled, source = ce + 5.0, ce - 0.5
     ref = max(ce, source)  # = ce
-    expected = 1.0 / ((styled - ref - 2.0) + 1)  # excess = 3.0 → 0.25
+    expected = 1.0 / ((styled - ref - NAT_V2_MARGIN) + 1)  # excess = 5.0 - margin
     result = nat_v2_score(styled, source, 'Tolstoy')
     assert result == pytest.approx(expected, abs=1e-3)
     assert result < 1.0  # a penalty actually fired
 
 
 def test_nat_v2_source_ce_floor():
-    # source_ce > author_ce → source_ce used as floor
-    # styled=8.0, source=10.0, Tolstoy CE=6.637
-    # tgt_ce_ref = max(6.637, 10.0) = 10.0
-    # style_gap = 8.0 - 10.0 = -2.0 → no penalty
+    # source_ce > author_ce → source_ce used as floor.
+    # styled=8.0, source=10.0, Tolstoy CE≈3.74 → tgt_ce_ref = max(3.74, 10.0) = 10.0
+    # style_gap = 8.0 - 10.0 = -2.0 → no penalty (regardless of margin)
     assert nat_v2_score(8.0, 10.0, 'Tolstoy') == pytest.approx(1.0)
 
 
 def test_nat_v2_unknown_author_falls_back_to_source_ce():
-    # Unknown author: tgt_ce_ref = source_ce; style_gap = delta_CE
-    # styled=6.0, source=5.0 → style_gap=1.0 < margin=2.0 → no penalty
-    assert nat_v2_score(6.0, 5.0, 'UnknownAuthor') == pytest.approx(1.0)
+    # Unknown author: tgt_ce_ref = source_ce; style_gap = styled - source.
+    # gap = half the margin < NAT_V2_MARGIN → no penalty.
+    source = 5.0
+    styled = source + NAT_V2_MARGIN * 0.5
+    assert nat_v2_score(styled, source, 'UnknownAuthor') == pytest.approx(1.0)
 
 
 def test_nat_v2_domain_fallback():
     # 'writers' is only in DOMAIN_CE (not AUTHOR_CE) → exercises the domain fallback.
-    # Expected derived from the imported DOMAIN_CE (robust to CE recalibration).
+    # Expected derived from imported DOMAIN_CE + NAT_V2_MARGIN (robust to recalibration).
     ce = DOMAIN_CE['writers']
     styled, source = ce + 4.0, ce - 0.5
     ref = max(ce, source)  # = ce
-    expected = 1.0 / ((styled - ref - 2.0) + 1)  # excess = 2.0 → 1/3
+    expected = 1.0 / ((styled - ref - NAT_V2_MARGIN) + 1)  # excess = 4.0 - margin
     result = nat_v2_score(styled, source, 'writers')
     assert result == pytest.approx(expected, abs=1e-3)
     assert result < 1.0  # a penalty actually fired via the domain reference
 
 
 def test_compute_nat_v2_vectorised():
-    # Inputs framed relative to the imported AUTHOR_CE (robust to CE recalibration):
-    #   row0: styled just above ref, gap < margin → no penalty
+    # Inputs framed relative to the imported AUTHOR_CE + NAT_V2_MARGIN (recalibration-robust):
+    #   row0: styled within margin of ref → no penalty
     #   row1: styled well above ref → penalty
     #   row2: source above ref → source floor → no penalty
     ce = AUTHOR_CE['Tolstoy']
-    sty = [ce + 1.0, ce + 5.0, ce + 1.0]
+    sty = [ce + NAT_V2_MARGIN * 0.5, ce + 5.0, ce + 1.0]
     src = [ce - 1.0, ce - 1.0, ce + 3.0]
     styles = ['Tolstoy', 'Tolstoy', 'Tolstoy']
     results = compute_nat_v2(sty, src, styles)
-    assert results[0] == pytest.approx(1.0)                           # no penalty
-    assert results[1] == pytest.approx(1.0 / ((5.0 - 2.0) + 1), abs=1e-3)  # penalty, excess=3
-    assert results[2] == pytest.approx(1.0)                           # source floor
+    assert results[0] == pytest.approx(1.0)                                    # no penalty
+    assert results[1] == pytest.approx(1.0 / ((5.0 - NAT_V2_MARGIN) + 1), abs=1e-3)  # penalty
+    assert results[2] == pytest.approx(1.0)                                    # source floor
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +134,7 @@ def test_compute_composite_v2_missing_quality_cols():
 
 def test_compute_composite_v2_happy_path():
     # All inputs perfect, Tolstoy target: styled_CE=5.0, source_CE=5.0
-    # tgt_ce_ref = max(6.637, 5.0) = 6.637; style_gap = 5.0 - 6.637 < 0 → nat_v2=1.0
+    # tgt_ce_ref = max(Tolstoy CE≈3.74, 5.0) = 5.0; style_gap = 5.0 - 5.0 = 0 → nat_v2=1.0
     df = pd.DataFrame({
         'style_score': [1.0], 'bert_score': [1.0], 'labse_score': [1.0],
         'text_perplexity': [5.0], 'styled_text_perplexity': [5.0],

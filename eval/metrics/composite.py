@@ -12,7 +12,7 @@ base_score   = (style^1.0 × meaning_v2^2.5)^(1/3.5)
 
 tgt_ce_ref = max(author_lookup(target_style), source_CE)  # source_CE is always a floor
 style_gap  = styled_CE − tgt_ce_ref
-nat_v2     = 1 / (max(0, style_gap − 2.0) + 1)
+nat_v2     = 1 / (max(0, style_gap − 0.70) + 1)
 
 score_v2   = base_score × nat_v2
 
@@ -26,13 +26,25 @@ Domain medians are the fallback when target_style is not in AUTHOR_CE.
 NOTE (2026-06-21): the previous values were corrupted by a left-padding bug in
 calculate_perplexity that made CE batch-composition dependent (see
 docs/issues/resolved/calculate-perplexity-left-pad-batch-dependence.md). These corrected
-values are ~2 CE units lower and on a compressed scale (span ~0.9). The nat_v2
-`margin` (2.0) was tuned on the old inflated scale and now leaves nat_v2 ~ 1.0 for
-almost all inputs; it should be recalibrated on this scale to regain discrimination.
+values are ~2 CE units lower and on a compressed scale (span ~0.9).
+
+NOTE (2026-07-01): the nat_v2 `margin` was recalibrated from 2.0 (tuned on the old
+inflated scale, left nat_v2 ~ 1.0 for ~all inputs) to **0.70** on this corrected scale.
+0.70 is the p90 of the source-referenced delta_CE on the real best-of-1 generation
+distribution (static_set_scored); it makes the penalty fire on ~10% of generations /
+~7% of eval rows and restores nat_v2's spread. score_v2 rankings are unchanged
+(per-target-style Spearman 1.000, same top). The paired generation gate NAT_V2_LB was
+set to 0.75 (soft) in styled_pph_gen.py. Derivation + eyeball validation:
+15 metrics exploration/13 nat_v2 margin recalibration.ipynb.
 """
 
 import numpy as np
 import pandas as pd
+
+# nat_v2 penalty onset (style_gap CE units). Recalibrated 2026-07-01: 2.0 → 0.70 on
+# the corrected CE scale (= p90 of source-referenced delta_CE on the real best-of-1
+# generation distribution). Single source of truth for the default below.
+NAT_V2_MARGIN = 0.70
 
 AUTHOR_CE = {
     'Chekhov':        3.641447,
@@ -105,7 +117,7 @@ def base_score_v2(
 
 
 def nat_v2_score(
-    styled_ce: float, source_ce: float, target_style: str = '', margin: float = 2.0
+    styled_ce: float, source_ce: float, target_style: str = '', margin: float = NAT_V2_MARGIN
 ) -> float:
     """Compute nat_v2 for a single example.
 
@@ -118,7 +130,7 @@ def nat_v2_score(
     return 1.0 / (max(0.0, style_gap - margin) + 1.0)
 
 
-def compute_nat_v2(styled_ce, source_ce, target_style_iter, margin: float = 2.0):
+def compute_nat_v2(styled_ce, source_ce, target_style_iter, margin: float = NAT_V2_MARGIN):
     """Vectorised nat_v2 over parallel iterables of CE values and target style names.
 
     Parameters

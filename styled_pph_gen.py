@@ -26,14 +26,21 @@ MEANING_SCORE_LB = 0.75
 
 # Phase-1 quality filters wired in 2A.4 (thresholds calibrated in task 1.10 on
 # the mBERT-span4 regime; all are REJECTION conditions, so the keep-mask negates
-# them). The absolute naturality_score gate is dropped — it is mis-calibrated for
-# folder-14 (rejects 88.5% of fluent literary transfers); nat_v2 replaces it.
+# them). The absolute naturality_score is not used as a Phase-1 gate here — the
+# relative nat_v2 (source-referenced CE gap) replaces it. (The earlier "rejects
+# 88.5% of fluent literary transfers" figure was an artifact of the left-padding
+# CE bug; naturality_score itself is correct on the fixed-CE scale and is retained
+# only in the v1 score. See docs/issues/resolved/calculate-perplexity-left-pad-batch-dependence.md.)
 CHRF_UB = 0.75          # keep chrf < 0.75 (copying diagnostic)
 BI_SCORE_UB = 0.12      # keep bi_score < 0.12 (span4 boilerplate insertion)
 CL_SCORE_UB = 0.10      # keep cl_score < 0.10 (span4 content loss)
 GENDER_SCORE_LB = 0.70  # keep gender_score >= 0.70, activated pairs only
 ENTITY_SCORE_LB = 0.70  # keep entity_score >= 0.70
-NAT_V2_LB = 0.5         # keep nat_v2 >= 0.5 (target/source-referenced CE gap)
+# nat_v2 = 1/(max(0, style_gap - margin) + 1), margin=0.70 (composite.py). Soft
+# generation gate: 0.75 rejects ~3% of best-of-1 generations (delta_CE > 1.03),
+# firing only on the extreme low-fluency tail. Recalibrated 2026-07-01 from 0.5
+# (which was inert post-CE-fix). See 15 metrics exploration/13 nat_v2 margin recalibration.ipynb.
+NAT_V2_LB = 0.75        # keep nat_v2 >= 0.75 (source-referenced CE gap; soft)
 
 # rugpt3 perplexity batch size for scoring. The per-batch logits tensor is the
 # only thing that overflows tallin's ~8 GB GPU with the generator resident;
