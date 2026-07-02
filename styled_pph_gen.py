@@ -191,6 +191,7 @@ def produce_target_style(
     rng: Optional[np.random.Generator] = None,
     target_norm: Optional[float] = None,
     key_weights: Optional[dict] = None,
+    return_keys: bool = False,
 ) -> List[np.ndarray]:
     """
     For each row in short_df:
@@ -214,6 +215,13 @@ def produce_target_style(
     normalization) — a deliberate choice preserved from the original mixing
     behaviour (task 2A.4 decision 3); the final ``_rescale_targets_to_source_norms``
     sets the norm.
+
+    ``return_keys`` (off by default to preserve the plain list-return contract of
+    all existing callers) additionally returns, per row, the concrete sampled
+    ``picks`` (the target author/domain identities) as a parallel list aligned
+    positionally with the embedding list: ``(target_embs, keys_per_row)`` where
+    each ``keys_per_row[i]`` is a length-``n_picks`` list of key values. This is
+    the ``target_keys`` provenance surfaced onto every generated pair.
     """
     if rng is None:
         rng = default_rng()
@@ -229,6 +237,7 @@ def produce_target_style(
     src_keys = short_df[key_col].to_list()
 
     target_embs = []
+    keys_per_row = []
 
     for key, src_emb in zip(src_keys, src_embs):
         # Choose candidates excluding current key if possible
@@ -256,6 +265,7 @@ def produce_target_style(
             # only guards misuse of the public wrappers — degrade to replacement.
             replace = True
         picks = rng.choice(candidates, size=n_picks, replace=replace, p=p)
+        keys_per_row.append(list(picks))
 
         # Sample one embedding from each group
         embs = [grouped[pick][rng.integers(0, len(grouped[pick]))] for pick in picks]
@@ -271,46 +281,51 @@ def produce_target_style(
         target_embs.append(combined)
 
     target_embs = np.stack(target_embs)
-    return _rescale_targets_to_source_norms(src_embs, target_embs, target_norm=target_norm)
+    rescaled = _rescale_targets_to_source_norms(src_embs, target_embs, target_norm=target_norm)
+    if return_keys:
+        return rescaled, keys_per_row
+    return rescaled
 
 # ---------------- Thin wrappers ----------------
 
 def produce_target_style_random_writer(
     short_df, writers_df, author_col="author", source_emb_col="text_style_emb",
-    rng=None, target_norm=None
+    rng=None, target_norm=None, return_keys=False
 ):
     return produce_target_style(
         short_df, writers_df, key_col=author_col, n_picks=1,
-        source_emb_col=source_emb_col, rng=rng, target_norm=target_norm
+        source_emb_col=source_emb_col, rng=rng, target_norm=target_norm,
+        return_keys=return_keys,
     )
 
 def produce_target_style_2_random_writers(
     short_df, writers_df, author_col="author", source_emb_col="text_style_emb",
-    rng=None, target_norm=None
+    rng=None, target_norm=None, return_keys=False
 ):
     return produce_target_style(
         short_df, writers_df, key_col=author_col, n_picks=2,
-        source_emb_col=source_emb_col, rng=rng, target_norm=target_norm
+        source_emb_col=source_emb_col, rng=rng, target_norm=target_norm,
+        return_keys=return_keys,
     )
 
 def produce_target_style_other_domain(
     short_df, complete_df, domain_col="domain", source_emb_col="text_style_emb",
-    rng=None, target_norm=None, domain_weights=None
+    rng=None, target_norm=None, domain_weights=None, return_keys=False
 ):
     return produce_target_style(
         short_df, complete_df, key_col=domain_col, n_picks=1,
         source_emb_col=source_emb_col, rng=rng, target_norm=target_norm,
-        key_weights=domain_weights,
+        key_weights=domain_weights, return_keys=return_keys,
     )
 
 def produce_target_style_2_other_domains(
     short_df, complete_df, domain_col="domain", source_emb_col="text_style_emb",
-    rng=None, target_norm=None, domain_weights=None
+    rng=None, target_norm=None, domain_weights=None, return_keys=False
 ):
     return produce_target_style(
         short_df, complete_df, key_col=domain_col, n_picks=2,
         source_emb_col=source_emb_col, rng=rng, target_norm=target_norm,
-        key_weights=domain_weights,
+        key_weights=domain_weights, return_keys=return_keys,
     )
 
 # ---------- Perturbation-based style sampling ----------
@@ -380,17 +395,19 @@ def add_target_style_emb(df, style_df, in_domain_style_df=None, target_norm=None
         df_target_style = df[df.target_style_desc == target_style_desc]
         if not df_target_style.empty:
             if 'other_author' in target_style_desc:
-                target_style_embs = produce_target_style_random_writer(
-                    df_target_style, in_domain_style_df, rng=rng, target_norm=target_norm
+                target_style_embs, target_keys = produce_target_style_random_writer(
+                    df_target_style, in_domain_style_df, rng=rng, target_norm=target_norm,
+                    return_keys=True,
                 )
             elif '2_authors_weighted_avg' in target_style_desc:
-                target_style_embs = produce_target_style_2_random_writers(
-                    df_target_style, in_domain_style_df, rng=rng, target_norm=target_norm
+                target_style_embs, target_keys = produce_target_style_2_random_writers(
+                    df_target_style, in_domain_style_df, rng=rng, target_norm=target_norm,
+                    return_keys=True,
                 )
             elif 'other_domain' in target_style_desc:
-                target_style_embs = produce_target_style_other_domain(
+                target_style_embs, target_keys = produce_target_style_other_domain(
                     df_target_style, style_df, rng=rng, target_norm=target_norm,
-                    domain_weights=domain_weights,
+                    domain_weights=domain_weights, return_keys=True,
                 )
             elif '2_domains_weighted_avg' in target_style_desc:
                 # 2-domain mixes stay UNIFORM (domain_weights not forwarded): a
@@ -398,11 +415,23 @@ def add_target_style_emb(df, style_df, in_domain_style_df=None, target_norm=None
                 # components' closeness, so per-pick weighting can't faithfully
                 # control it. The per-pair SIM_MEASURE_TARGET_STYLE_UB filter
                 # backstops any too-close mixture (2A.8.2 decision).
-                target_style_embs = produce_target_style_2_other_domains(
+                target_style_embs, target_keys = produce_target_style_2_other_domains(
                     df_target_style, style_df, rng=rng, target_norm=target_norm,
+                    return_keys=True,
                 )
             else:
                 raise Exception('Unsupported target style type: ' + target_style_desc)
+            # target_keys is the concrete sampled provenance; capture it BEFORE the
+            # noise/negation perturbations (which only touch the embedding list, not
+            # the sampled identities). Assert positional alignment so a mismatch
+            # fails loud rather than silently misattributing provenance on re-index.
+            assert len(target_keys) == len(target_style_embs), (
+                f"target_keys/embs length mismatch for {target_style_desc}: "
+                f"{len(target_keys)} vs {len(target_style_embs)}"
+            )
+            df.loc[df_target_style.index, 'target_keys'] = pd.Series(
+                target_keys, index=df_target_style.index, dtype=object
+            )
             # noise/negation are norm-preserving, so they do not disturb target_norm
             if '_with_noise' in target_style_desc:
                 target_style_embs = add_noise_to_embs(target_style_embs, scale=0.01, rng=rng)
@@ -519,11 +548,17 @@ REQUIRED_PERSIST_COLS = [
     'styled_text', 'styled_text_style_emb', 'meaning_score',
     'tst_result_style_sim', 'bi_score', 'cl_score', 'gender_score',
     'entity_score', 'chrf', 'nat_v2',
+    # target provenance (task: target_keys field). add_target_style_emb writes it
+    # unconditionally, so an absent target_keys means the whitelist upstream
+    # (core.py cols_to_copy) dropped it — fail loud rather than persist
+    # provenance-less v2 training data that cannot be retrofitted.
+    'target_keys',
 ]
 
 def save_tst_results(tst_df, results_path):
     tst_res_cols = [
-        'text', 'target_style_desc', 'target_style_sim_measure', 'styled_text',
+        'text', 'target_style_desc', 'target_keys',
+        'target_style_sim_measure', 'styled_text',
         'styled_text_style_emb', 'meaning_score',
         'tst_result_style_sim',
         # Phase-1 quality signals persisted for downstream auditing (2A.4):

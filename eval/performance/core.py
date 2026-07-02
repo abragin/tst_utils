@@ -110,9 +110,15 @@ class TstPerformanceMetrics:
         df["tst_model"] = self.tst_model
 
         precalculated_cols = ["text_perplexity", "text_style_emb", "text_labse_emb"]
+        # target_keys carries the concrete sampled target provenance (author/domain
+        # identities) written by add_target_style_emb. Copied through conditionally
+        # because callers that build test_df by hand may not set it; when present it
+        # must survive this whitelist or it is silently dropped before best_tst_results.
+        optional_provenance_cols = ["target_keys"]
         cols_to_copy = (
             ['example_number', 'text', 'author', 'target_style_emb', 'target_style_desc'] +
-            [c for c in precalculated_cols if c in self.test_df]
+            [c for c in precalculated_cols if c in self.test_df] +
+            [c for c in optional_provenance_cols if c in self.test_df]
         )
 
         self._log("Performing TST with target_style_embeddings")

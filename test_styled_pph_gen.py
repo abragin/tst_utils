@@ -368,7 +368,12 @@ def test_2domain_mixes_stay_uniform_wiring():
     weights = compute_domain_target_weights('news')
 
     def fake(df_sub, *a, **k):
-        return [np.zeros(4) for _ in range(len(df_sub))]
+        embs = [np.zeros(4) for _ in range(len(df_sub))]
+        # add_target_style_emb calls producers with return_keys=True and unpacks
+        # (embs, keys); mirror that contract so the routing assertions still run.
+        if k.get('return_keys'):
+            return embs, [['x'] for _ in range(len(df_sub))]
+        return embs
 
     with mock.patch.object(m, 'produce_target_style_other_domain', side_effect=fake) as p1, \
          mock.patch.object(m, 'produce_target_style_2_other_domains', side_effect=fake) as p2:
@@ -397,3 +402,165 @@ def test_save_tst_results_missing_required_raises(tmp_path):
     df = pd.DataFrame([{"styled_text": "x"}])   # missing most required cols
     with pytest.raises(KeyError, match="required columns missing"):
         save_tst_results(df, str(tmp_path) + "/")
+
+
+def _minimal_valid_tst_df(with_keys=True):
+    # A frame carrying every REQUIRED_PERSIST_COLS value so save_tst_results does
+    # not raise; two rows with n_picks 1 and 2 target_keys.
+    row = {
+        'text': 'src', 'target_style_desc': 'other_domain',
+        'target_style_sim_measure': 0.5, 'styled_text': 'out',
+        'styled_text_style_emb': np.ones(4, dtype=np.float32),
+        'meaning_score': 0.9, 'tst_result_style_sim': 0.3,
+        'bi_score': 0.1, 'cl_score': 0.1, 'gender_score': 0.9,
+        'gender_activated': False, 'entity_score': 1.0, 'chrf': 0.2,
+        'nat_v2': 0.5, 'naturality_score': 0.0, 'style_score': 0.0, 'score': 0.0,
+    }
+    r1 = dict(row); r1['target_keys'] = ['Bible']
+    r2 = dict(row, target_style_desc='2_domains_weighted_avg')
+    r2['target_keys'] = ['Bible', 'news']
+    df = pd.DataFrame([r1, r2])
+    if not with_keys:
+        df = df.drop(columns=['target_keys'])
+    return df
+
+
+def test_save_tst_results_persists_target_keys(tmp_path):
+    df = _minimal_valid_tst_df(with_keys=True)
+    save_tst_results(df, str(tmp_path) + "/")
+    back = pd.read_parquet(str(tmp_path) + "/part_00001.parquet.gzip")
+    assert 'target_keys' in back.columns
+    assert back['target_keys'].notna().all()
+    # parquet returns an ndarray, not a list — coerce before comparing (review #5)
+    assert [list(v) for v in back['target_keys']] == [['Bible'], ['Bible', 'news']]
+
+
+def test_save_tst_results_missing_target_keys_raises(tmp_path):
+    # target_keys is now a REQUIRED_PERSIST_COL: an absent column means the
+    # upstream whitelist dropped provenance — fail loud, don't persist blind.
+    df = _minimal_valid_tst_df(with_keys=False)
+    with pytest.raises(KeyError, match="required columns missing"):
+        save_tst_results(df, str(tmp_path) + "/")
+
+
+# ---------------- target_keys provenance ----------------
+
+def test_return_keys_off_preserves_list_contract():
+    # Default return_keys=False must keep the plain list-return that every
+    # existing caller (notebooks, add_styled_pph*.py) relies on.
+    pool = _style_pool()
+    short = pool[pool.author == "a"].copy()
+    out = produce_target_style(short, pool, key_col="author",
+                               rng=np.random.default_rng(1), target_norm=1.0)
+    assert isinstance(out, list)
+    assert all(isinstance(v, np.ndarray) for v in out)
+
+
+def test_return_keys_shape_and_membership_n_picks_1():
+    pool = _style_pool()
+    short = pool[pool.author == "a"].copy()
+    embs, keys = produce_target_style(
+        short, pool, key_col="author", n_picks=1,
+        rng=np.random.default_rng(1), target_norm=1.0, return_keys=True)
+    assert len(keys) == len(embs) == len(short)
+    candidates = set(pool.author) - {"a"}
+    for row_keys in keys:
+        assert len(row_keys) == 1                     # length == n_picks
+        assert "a" not in row_keys                    # own key excluded
+        assert set(row_keys) <= candidates            # drawn from candidate set
+
+
+def test_return_keys_shape_and_membership_n_picks_2():
+    pool = _style_pool()
+    short = pool[pool.author == "a"].copy()
+    embs, keys = produce_target_style(
+        short, pool, key_col="author", n_picks=2,
+        rng=np.random.default_rng(2), target_norm=1.0, return_keys=True)
+    candidates = set(pool.author) - {"a"}
+    for row_keys in keys:
+        assert len(row_keys) == 2                     # length == n_picks
+        assert "a" not in row_keys                    # own key excluded
+        assert len(set(row_keys)) == 2                # distinct (replace=False)
+        assert set(row_keys) <= candidates
+
+
+def test_return_keys_reproducible_unweighted():
+    # Same seed -> identical keys on the unweighted path.
+    pool = _domain_pool()
+    short = pool[pool.domain == 'news'].copy()
+    _, k1 = produce_target_style_other_domain(
+        short, pool, rng=np.random.default_rng(5), target_norm=1.0, return_keys=True)
+    _, k2 = produce_target_style_other_domain(
+        short, pool, rng=np.random.default_rng(5), target_norm=1.0, return_keys=True)
+    assert [list(r) for r in k1] == [list(r) for r in k2]
+
+
+def test_return_keys_reproducible_weighted_and_differs_from_uniform():
+    # The weighted draw is deterministic under a fixed seed, but diverges the RNG
+    # bit stream from the unweighted path (2A.8.2 note) — so the *keys* it yields
+    # differ from the uniform draw at the same seed. This re-baselines the
+    # per-path expectation without pinning the fragile internal candidate order.
+    pool = _domain_pool()
+    short = pd.concat([pool[pool.domain == 'news']] * 5, ignore_index=True)
+    w = compute_domain_target_weights('news')
+    _, a = produce_target_style_other_domain(
+        short, pool, rng=np.random.default_rng(9), target_norm=1.0,
+        domain_weights=w, return_keys=True)
+    _, b = produce_target_style_other_domain(
+        short, pool, rng=np.random.default_rng(9), target_norm=1.0,
+        domain_weights=w, return_keys=True)
+    _, u = produce_target_style_other_domain(
+        short, pool, rng=np.random.default_rng(9), target_norm=1.0,
+        domain_weights=None, return_keys=True)
+    ak = [list(r) for r in a]
+    assert ak == [list(r) for r in b]                 # reproducible
+    assert ak != [list(r) for r in u]                 # stream differs from uniform
+
+
+def _prov_pool():
+    # A pool with both author and domain columns so add_target_style_emb can
+    # route every target_style_desc branch.
+    rng = np.random.default_rng(0)
+    rows = []
+    for dom, authors in [('lit', ['Tolstoy', 'Chekhov', 'Dostoevsky'])]:
+        for a in authors:
+            for _ in range(4):
+                rows.append({"author": a, "domain": dom,
+                             "text_style_emb": rng.normal(size=8) * 7.0})
+    for dom in ['news', 'Bible', 'wikipedia']:
+        for _ in range(4):
+            rows.append({"author": dom, "domain": dom,
+                         "text_style_emb": rng.normal(size=8) * 7.0})
+    return pd.DataFrame(rows)
+
+
+def test_add_target_style_emb_writes_keys_every_branch():
+    pool = _prov_pool()
+    in_domain = pool[pool.domain == 'lit']
+    descs = ['other_author', '2_authors_weighted_avg',
+             'other_domain', '2_domains_weighted_avg',
+             'other_author_with_noise', 'other_domain_with_negations']
+    # one source row per desc, all from author Tolstoy / domain lit
+    df = in_domain[in_domain.author == 'Tolstoy'].iloc[[0]].copy()
+    df = pd.concat([df] * len(descs), ignore_index=True)
+    df['target_style_desc'] = descs
+
+    add_target_style_emb(df, pool, in_domain_style_df=in_domain,
+                         target_norm=1.0, rng=np.random.default_rng(3))
+
+    assert 'target_keys' in df.columns
+    assert df['target_keys'].notna().all()            # written for every branch
+    for _, row in df.iterrows():
+        desc = row.target_style_desc
+        keys = list(row.target_keys)
+        # cross-alignment: key count matches the mechanism implied by the desc
+        n_expected = 2 if desc.startswith('2_') else 1
+        assert len(keys) == n_expected
+        # own author/domain never appears in its own keys
+        assert 'Tolstoy' not in keys                  # own author excluded
+        assert 'lit' not in keys                      # own domain excluded
+        # author vs domain namespace matches the mechanism
+        if 'author' in desc:
+            assert all(k in {'Chekhov', 'Dostoevsky'} for k in keys)
+        else:
+            assert all(k in {'news', 'Bible', 'wikipedia'} for k in keys)
