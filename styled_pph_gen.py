@@ -1,8 +1,11 @@
 import gc
+import hashlib
+import json
 import numpy as np
 from numpy.random import default_rng
 import pandas as pd
 import os
+import time
 import torch
 from transformers import AutoTokenizer
 from datetime import datetime
@@ -23,6 +26,20 @@ from tst_utils.utils import set_global_seed
 SIM_MEASURE_UB = 0.92
 SIM_MEASURE_TARGET_STYLE_UB = 0.9
 MEANING_SCORE_LB = 0.75
+
+# ---- 2A.8.6 close-target accounting ----
+# A sampled target that lands too close to the source (sim >= UB above) is a
+# *sampling miss*, not a quality failure: it is resolved inside
+# add_target_style_emb by bounded in-place resampling, falling back to an exact
+# angle rotation — it never drops the row and never charges a retry attempt
+# (docs/ideas/retry-cap-close-target-drops.md, hybrid decision).
+MAX_TARGET_REDRAWS = 5   # bounded per-row resamples before the rotation fallback
+# Rotation lands on the batch-median accepted target sim (a "healthy margin",
+# not UB−ε which would bias toward minimal transfer). The cap keeps a
+# pathological median out of the boundary zone; the fallback covers a batch
+# where every draw was close (no median to take).
+ROTATE_SIM_CAP = 0.88       # never rotate to a sim above this
+ROTATE_SIM_FALLBACK = 0.85  # θ = 54°; used when the batch has no accepted draws
 
 # Phase-1 quality filters wired in 2A.4 (thresholds calibrated in task 1.10 on
 # the mBERT-span4 regime; all are REJECTION conditions, so the keep-mask negates
@@ -179,6 +196,41 @@ def _rescale_targets_to_source_norms(source_embs, target_embs, target_norm=None)
     tgt_norms_safe = np.where(tgt_norms == 0, 1.0, tgt_norms)
     scaled = target_embs * (dst_norms / tgt_norms_safe)[:, None]
     return [scaled[i] for i in range(scaled.shape[0])]
+
+def sim_measure_to_angle(sim):
+    """Invert ``sim_measure`` (angle-only, ``sim = 1 - θ/(2π)``): θ = 2π(1 - sim).
+
+    ``sim_measure``'s range is [0.5, 1.0] (θ ∈ [0, π]), so e.g.
+    ``SIM_MEASURE_TARGET_STYLE_UB = 0.9`` ⇔ θ = 36°.
+    """
+    return 2.0 * np.pi * (1.0 - sim)
+
+def _rotate_target_away_from_source(src, tgt, sim_target):
+    """Rotate ``tgt`` within span{src, tgt} to exactly ``sim_target`` from ``src``.
+
+    Preserves ``|tgt|`` (the target_norm invariant: rotation happens *after*
+    ``_rescale_targets_to_source_norms``, and only changes direction). The new
+    vector stays coplanar with src/tgt on tgt's side, per the construction in
+    docs/ideas/retry-cap-close-target-drops.md. If tgt is (anti)parallel to src
+    there is no unique plane; a deterministic orthogonal direction is built from
+    the basis vector least aligned with src.
+    """
+    src = _as_array(src)
+    tgt = _as_array(tgt)
+    t_norm = np.linalg.norm(tgt) or 1.0
+    s_hat = src / (np.linalg.norm(src) or 1.0)
+    t_hat = tgt / t_norm
+    perp = t_hat - np.dot(t_hat, s_hat) * s_hat
+    p_norm = np.linalg.norm(perp)
+    if p_norm < 1e-8:
+        k = int(np.argmin(np.abs(s_hat)))
+        e = np.zeros_like(s_hat)
+        e[k] = 1.0
+        perp = e - np.dot(e, s_hat) * s_hat
+        p_norm = np.linalg.norm(perp)
+    u_hat = perp / p_norm
+    theta = sim_measure_to_angle(sim_target)
+    return (np.cos(theta) * s_hat + np.sin(theta) * u_hat) * t_norm
 
 # ---------------- Main generic function ----------------
 
@@ -389,58 +441,147 @@ def get_target_styles(current_domain, has_author_targets=None):
     ]
     return target_styles
 
+def _draw_targets_for_desc(df_target_style, target_style_desc, style_df,
+                           in_domain_style_df, target_norm, rng, domain_weights):
+    """One target draw for every row of a single-desc subset.
+
+    Returns ``(target_style_embs, target_keys)`` with the desc's noise/negation
+    perturbation already applied to the embeddings (perturbations are
+    norm-preserving, so they do not disturb ``target_norm``); ``target_keys``
+    is captured BEFORE the perturbation (which only touches the embedding list,
+    not the sampled identities).
+    """
+    if 'other_author' in target_style_desc:
+        target_style_embs, target_keys = produce_target_style_random_writer(
+            df_target_style, in_domain_style_df, rng=rng, target_norm=target_norm,
+            return_keys=True,
+        )
+    elif '2_authors_weighted_avg' in target_style_desc:
+        target_style_embs, target_keys = produce_target_style_2_random_writers(
+            df_target_style, in_domain_style_df, rng=rng, target_norm=target_norm,
+            return_keys=True,
+        )
+    elif 'other_domain' in target_style_desc:
+        target_style_embs, target_keys = produce_target_style_other_domain(
+            df_target_style, style_df, rng=rng, target_norm=target_norm,
+            domain_weights=domain_weights, return_keys=True,
+        )
+    elif '2_domains_weighted_avg' in target_style_desc:
+        # 2-domain mixes stay UNIFORM (domain_weights not forwarded): a
+        # mixture's closeness to the source is not monotonic in its two
+        # components' closeness, so per-pick weighting can't faithfully
+        # control it. The close-target resample/rotate loop in
+        # add_target_style_emb backstops any too-close mixture (2A.8.2
+        # decision, close-target handling revised in 2A.8.6).
+        target_style_embs, target_keys = produce_target_style_2_other_domains(
+            df_target_style, style_df, rng=rng, target_norm=target_norm,
+            return_keys=True,
+        )
+    else:
+        raise Exception('Unsupported target style type: ' + target_style_desc)
+    # Assert positional alignment so a mismatch fails loud rather than silently
+    # misattributing provenance on re-index.
+    assert len(target_keys) == len(target_style_embs), (
+        f"target_keys/embs length mismatch for {target_style_desc}: "
+        f"{len(target_keys)} vs {len(target_style_embs)}"
+    )
+    if '_with_noise' in target_style_desc:
+        target_style_embs = add_noise_to_embs(target_style_embs, scale=0.01, rng=rng)
+    elif '_with_negations' in target_style_desc:
+        qt = 0.02 if 'author' in target_style_desc else 0.01
+        target_style_embs = negate_some_vals(target_style_embs, quantile=qt, rng=rng)
+    return target_style_embs, target_keys
+
+
+def _assign_drawn_targets(df, subset, style_df, in_domain_style_df, target_norm,
+                          rng, domain_weights):
+    """(Re)draw targets for ``subset`` rows of ``df``, writing emb + keys in place."""
+    for target_style_desc in subset.target_style_desc.unique():
+        df_target_style = subset[subset.target_style_desc == target_style_desc]
+        if df_target_style.empty:
+            continue
+        target_style_embs, target_keys = _draw_targets_for_desc(
+            df_target_style, target_style_desc, style_df, in_domain_style_df,
+            target_norm, rng, domain_weights,
+        )
+        df.loc[df_target_style.index, 'target_keys'] = pd.Series(
+            target_keys, index=df_target_style.index, dtype=object
+        )
+        df.loc[df_target_style.index, 'target_style_emb'] = pd.Series(
+            target_style_embs, index=df_target_style.index, dtype=object
+        )
+
+
 def add_target_style_emb(df, style_df, in_domain_style_df=None, target_norm=None,
-                         rng=None, domain_weights=None):
-    for target_style_desc in df.target_style_desc.unique():
-        df_target_style = df[df.target_style_desc == target_style_desc]
-        if not df_target_style.empty:
-            if 'other_author' in target_style_desc:
-                target_style_embs, target_keys = produce_target_style_random_writer(
-                    df_target_style, in_domain_style_df, rng=rng, target_norm=target_norm,
-                    return_keys=True,
-                )
-            elif '2_authors_weighted_avg' in target_style_desc:
-                target_style_embs, target_keys = produce_target_style_2_random_writers(
-                    df_target_style, in_domain_style_df, rng=rng, target_norm=target_norm,
-                    return_keys=True,
-                )
-            elif 'other_domain' in target_style_desc:
-                target_style_embs, target_keys = produce_target_style_other_domain(
-                    df_target_style, style_df, rng=rng, target_norm=target_norm,
-                    domain_weights=domain_weights, return_keys=True,
-                )
-            elif '2_domains_weighted_avg' in target_style_desc:
-                # 2-domain mixes stay UNIFORM (domain_weights not forwarded): a
-                # mixture's closeness to the source is not monotonic in its two
-                # components' closeness, so per-pick weighting can't faithfully
-                # control it. The per-pair SIM_MEASURE_TARGET_STYLE_UB filter
-                # backstops any too-close mixture (2A.8.2 decision).
-                target_style_embs, target_keys = produce_target_style_2_other_domains(
-                    df_target_style, style_df, rng=rng, target_norm=target_norm,
-                    return_keys=True,
-                )
-            else:
-                raise Exception('Unsupported target style type: ' + target_style_desc)
-            # target_keys is the concrete sampled provenance; capture it BEFORE the
-            # noise/negation perturbations (which only touch the embedding list, not
-            # the sampled identities). Assert positional alignment so a mismatch
-            # fails loud rather than silently misattributing provenance on re-index.
-            assert len(target_keys) == len(target_style_embs), (
-                f"target_keys/embs length mismatch for {target_style_desc}: "
-                f"{len(target_keys)} vs {len(target_style_embs)}"
+                         rng=None, domain_weights=None,
+                         max_target_redraws=MAX_TARGET_REDRAWS):
+    """Sample a target style embedding for every row of ``df`` (in place).
+
+    2A.8.6: a draw landing too close to the source
+    (``target_style_sim_measure >= SIM_MEASURE_TARGET_STYLE_UB``) is a sampling
+    miss, resolved HERE rather than dropped downstream: up to
+    ``max_target_redraws`` in-place resamples (on-manifold, honest
+    ``target_keys``), then an exact angle rotation to the batch-median accepted
+    sim (capped at ``ROTATE_SIM_CAP``, fallback ``ROTATE_SIM_FALLBACK``).
+    Rotation preserves the target norm, so the ``target_norm`` invariant set by
+    ``_rescale_targets_to_source_norms`` survives. No code path drops a row.
+
+    Requires ``text_style_emb`` on ``df`` (needed for the source-target sim).
+    Writes: ``target_style_emb``, ``target_keys``, ``target_style_sim_measure``,
+    and the adjustment provenance ``target_adjusted`` (bool),
+    ``target_adjustment`` ('none'|'resampled'|'rotated'), ``target_redraws``
+    (int). Rotated rows keep the ``target_keys`` of their last draw but are
+    synthetic — consumers must treat ``target_adjustment == 'rotated'`` as
+    "keys no longer describe the embedding".
+    """
+    if rng is None:
+        rng = default_rng()
+    _assign_drawn_targets(df, df, style_df, in_domain_style_df, target_norm,
+                          rng, domain_weights)
+    df['target_redraws'] = 0
+    df['target_adjustment'] = 'none'
+    df['target_style_sim_measure'] = sim_measure_series(df, 'target_style_emb')
+    for _ in range(max_target_redraws):
+        close_idx = df.index[
+            df['target_style_sim_measure'] >= SIM_MEASURE_TARGET_STYLE_UB
+        ]
+        if close_idx.empty:
+            break
+        _assign_drawn_targets(df, df.loc[close_idx], style_df, in_domain_style_df,
+                              target_norm, rng, domain_weights)
+        df.loc[close_idx, 'target_redraws'] += 1
+        df.loc[close_idx, 'target_adjustment'] = 'resampled'
+        df.loc[close_idx, 'target_style_sim_measure'] = sim_measure_series(
+            df.loc[close_idx], 'target_style_emb'
+        )
+    still_idx = df.index[
+        df['target_style_sim_measure'] >= SIM_MEASURE_TARGET_STYLE_UB
+    ]
+    if len(still_idx):
+        ok_sims = df.loc[~df.index.isin(still_idx), 'target_style_sim_measure']
+        if len(ok_sims):
+            margin_sim = float(min(np.median(ok_sims), ROTATE_SIM_CAP))
+        else:
+            margin_sim = ROTATE_SIM_FALLBACK
+        rotated = [
+            _rotate_target_away_from_source(
+                df.at[i, 'text_style_emb'], df.at[i, 'target_style_emb'], margin_sim
             )
-            df.loc[df_target_style.index, 'target_keys'] = pd.Series(
-                target_keys, index=df_target_style.index, dtype=object
-            )
-            # noise/negation are norm-preserving, so they do not disturb target_norm
-            if '_with_noise' in target_style_desc:
-                target_style_embs = add_noise_to_embs(target_style_embs, scale=0.01, rng=rng)
-            elif '_with_negations' in target_style_desc:
-                qt = 0.02 if 'author' in target_style_desc else 0.01
-                target_style_embs = negate_some_vals(target_style_embs, quantile=qt, rng=rng)
-            df.loc[df_target_style.index, 'target_style_emb'] = pd.Series(
-                target_style_embs, index=df_target_style.index, dtype=object
-            )
+            for i in still_idx
+        ]
+        df.loc[still_idx, 'target_style_emb'] = pd.Series(
+            rotated, index=still_idx, dtype=object
+        )
+        df.loc[still_idx, 'target_adjustment'] = 'rotated'
+        df.loc[still_idx, 'target_style_sim_measure'] = sim_measure_series(
+            df.loc[still_idx], 'target_style_emb'
+        )
+        # Rotation sets the angle exactly; a residual close target is a geometry bug.
+        assert (
+            df.loc[still_idx, 'target_style_sim_measure']
+            < SIM_MEASURE_TARGET_STYLE_UB
+        ).all(), "rotated targets still above SIM_MEASURE_TARGET_STYLE_UB"
+    df['target_adjusted'] = df['target_adjustment'] != 'none'
 
 # Columns the keep-mask reads; perplexity/nat_v2 etc. must already be populated.
 PHASE1_FILTER_COLS = [
@@ -483,15 +624,50 @@ def phase1_keep_mask(tst_res):
         (tst_res.nat_v2 >= NAT_V2_LB)
     )
 
+# Provenance columns written by add_target_style_emb, re-attached onto the
+# result table from current_df (the TstPerformanceMetrics cols_to_copy whitelist
+# would otherwise silently drop them before best_tst_results).
+TARGET_PROVENANCE_COLS = [
+    'target_style_sim_measure', 'target_adjusted', 'target_adjustment',
+    'target_redraws',
+]
+
 def gen_paraphrases(
     current_df, tst_generator, style_df, in_domain_style_df, target_styles,
     alignment_scorer, gender_scorer, entity_scorer,
     target_norm=None, perplexity_batch_size=PERPLEXITY_BATCH_SIZE, rng=None,
     domain_weights=None,
 ):
+    """Generate + score one chunk; return a per-INPUT result table (2A.8.6).
+
+    Every row of ``current_df`` appears exactly once in the returned frame
+    (same index), with an ``outcome`` column:
+
+    - ``accepted``       — generated and passed ``phase1_keep_mask``; full
+                           scoring columns populated.
+    - ``quality_reject`` — generated, scored clean, failed the keep-mask.
+    - ``empty_output``   — every generated version was empty/whitespace; never
+                           reached the scorers (2A.8.5 carry-over: empty text
+                           would NaN the scorers and crash the mask).
+    - ``scorer_error``   — generated non-empty but no clean scored row (NaN in
+                           a filter column, or dropped by best-version
+                           selection). Not the row's fault: callers should
+                           requeue without charging a retry attempt.
+
+    Close-target draws are resolved inside ``add_target_style_emb``
+    (resample→rotate, see ``target_adjustment``) and never surface as an
+    outcome — no pre-generation code path drops a row. Retry attempts should
+    be charged only on ``quality_reject``/``empty_output``.
+
+    Chunk-level timers land in ``result.attrs['timings']``:
+    ``{'target_s', 'source_s', 'gen_s', 'score_s', 'n_inputs'}`` (gen vs score
+    split — the smoke's cost-per-attempt input). ``attrs`` do not survive every
+    pandas op; read them before slicing.
+    """
     current_df = current_df.copy()
     if rng is None:
         rng = np.random.default_rng()
+    t0 = time.monotonic()
     current_df['target_style_desc'] = rng.choice(
         target_styles, size=current_df.shape[0]
     )
@@ -499,12 +675,7 @@ def gen_paraphrases(
         current_df, style_df, in_domain_style_df, target_norm=target_norm, rng=rng,
         domain_weights=domain_weights,
     )
-    current_df['target_style_sim_measure'] = sim_measure_series(
-        current_df, 'target_style_emb'
-    )
-    current_df = current_df[
-        current_df.target_style_sim_measure < SIM_MEASURE_TARGET_STYLE_UB
-    ].copy()
+    target_s = time.monotonic() - t0
     pm = TstPerformanceMetrics(
         test_df=current_df,
         tst_func=tst_generator.perform_tst,
@@ -518,28 +689,80 @@ def gen_paraphrases(
     #   compute_scores -> compute_quality_scores -> select_best -> copying metrics.
     # quality scores run on *all* versions (before selection) so they survive into
     # best_tst_results; perplexity uses the reduced batch size to fit 8 GB.
+    t1 = time.monotonic()
     pm.add_source_ppx_and_emb()
+    source_s = time.monotonic() - t1
+    t2 = time.monotonic()
     pm.produce_tst_results()
-    pm.compute_scores()
-    pm.compute_quality_scores(alignment_scorer, gender_scorer, entity_scorer)
-    pm.select_best_tst_version()
-    pm.compute_copying_metrics()  # chrf on best_tst_results
-    tst_res = pm.best_tst_results.set_index(
-        pm.best_tst_results.example_number
-    )
-    tst_res.index.name = None
-    expected = set(current_df.index)
-    actual = set(tst_res.index)
-    extra = actual - expected
-    if extra:
-        raise ValueError(f"TST generator returned invalid indices: {extra}")
-    tst_res['tst_result_style_sim'] = sim_measure_series(
-        tst_res, 'styled_text_style_emb'
-    )
-    tst_res['nat_v2'] = compute_nat_v2(
-        tst_res.styled_text_perplexity, tst_res.text_perplexity, tst_res.target_style_desc
-    )
-    return tst_res[phase1_keep_mask(tst_res)]
+    gen_s = time.monotonic() - t2
+    # Empty/whitespace outputs never reach the scorers: they would come back as
+    # NaN and either crash phase1_keep_mask (hard raise) or silently vanish.
+    styled = pm.tst_results['styled_text']
+    empty_version = styled.isna() | (styled.astype(str).str.strip() == '')
+    generated_examples = set(pm.tst_results['example_number'])
+    pm.tst_results = pm.tst_results[~empty_version].copy()
+    empty_examples = generated_examples - set(pm.tst_results['example_number'])
+
+    tst_res = None
+    score_s = 0.0
+    if not pm.tst_results.empty:
+        t3 = time.monotonic()
+        pm.compute_scores()
+        pm.compute_quality_scores(alignment_scorer, gender_scorer, entity_scorer)
+        if pm.tst_results['score'].notna().any():
+            pm.select_best_tst_version()
+            pm.compute_copying_metrics()  # chrf on best_tst_results
+            tst_res = pm.best_tst_results.set_index(
+                pm.best_tst_results.example_number
+            )
+            tst_res.index.name = None
+        score_s = time.monotonic() - t3
+
+    expected = current_df.index
+    outcome = pd.Series('scorer_error', index=expected, dtype=object)
+    if empty_examples:
+        outcome.loc[list(empty_examples)] = 'empty_output'
+    if tst_res is not None:
+        extra = set(tst_res.index) - set(expected)
+        if extra:
+            raise ValueError(f"TST generator returned invalid indices: {extra}")
+        tst_res['tst_result_style_sim'] = sim_measure_series(
+            tst_res, 'styled_text_style_emb'
+        )
+        tst_res['nat_v2'] = compute_nat_v2(
+            tst_res.styled_text_perplexity, tst_res.text_perplexity,
+            tst_res.target_style_desc,
+        )
+        # NaN in a filter column marks a scorer failure on that row: route it to
+        # 'scorer_error' instead of letting phase1_keep_mask hard-raise and kill
+        # an unattended multi-day run. The mask's own NaN raise stays as a belt
+        # for the clean subset.
+        plain = [c for c in PHASE1_FILTER_COLS
+                 if c not in ('gender_score', 'gender_activated')]
+        nan_rows = tst_res[plain].isna().any(axis=1) | (
+            tst_res.gender_activated.astype(bool) & tst_res.gender_score.isna()
+        )
+        clean = tst_res[~nan_rows]
+        if len(clean):
+            keep = phase1_keep_mask(clean).to_numpy()
+            outcome.loc[clean.index[keep]] = 'accepted'
+            outcome.loc[clean.index[~keep]] = 'quality_reject'
+        res = tst_res.reindex(expected)
+    else:
+        res = pd.DataFrame(index=expected)
+    # Source identity + target provenance are authoritative on current_df (the
+    # pm cols_to_copy whitelist forwards only a subset); overwrite for ALL rows
+    # so non-generated outcomes still carry them.
+    for col in (['source_uid', 'split', 'text', 'author', 'domain',
+                 'target_style_desc', 'target_keys'] + TARGET_PROVENANCE_COLS):
+        if col in current_df.columns:
+            res[col] = current_df[col]
+    res['outcome'] = outcome
+    res.attrs['timings'] = {
+        'target_s': target_s, 'source_s': source_s, 'gen_s': gen_s,
+        'score_s': score_s, 'n_inputs': int(len(expected)),
+    }
+    return res
 
 # Columns that must reach disk for a survivor to be auditable downstream; if any
 # is absent from the results frame, the scoring order upstream is broken — fail
@@ -553,12 +776,29 @@ REQUIRED_PERSIST_COLS = [
     # (core.py cols_to_copy) dropped it — fail loud rather than persist
     # provenance-less v2 training data that cannot be retrofitted.
     'target_keys',
+    # 2A.8.6 target-adjustment provenance: without these a rotated (synthetic)
+    # target is indistinguishable from a real pool draw downstream — fail loud.
+    'target_adjusted', 'target_adjustment', 'target_redraws',
 ]
 
 def save_tst_results(tst_df, results_path):
+    """Persist one chunk's accepted rows as the next ``part_NNNNN.parquet.gzip``.
+
+    2A.8.6: the write is ATOMIC (temp file in the same dir, then
+    ``os.replace``) so a crash/restart mid-write can never leave a truncated
+    parquet that would crash-loop the resume path under systemd. Returns the
+    written part filename (basename) for the caller's output manifest, or
+    ``None`` if ``tst_df`` is empty.
+    """
     tst_res_cols = [
-        'text', 'target_style_desc', 'target_keys',
-        'target_style_sim_measure', 'styled_text',
+        # 2A.8.6 row identity (orchestrator-provided; soft — legacy single-pool
+        # runs don't carry them, the orchestrator validates their presence):
+        'source_uid', 'split',
+        'text', 'author', 'domain', 'target_style_desc', 'target_keys',
+        'target_style_sim_measure',
+        # 2A.8.6 target-adjustment provenance (see add_target_style_emb):
+        'target_adjusted', 'target_adjustment', 'target_redraws',
+        'styled_text',
         'styled_text_style_emb', 'meaning_score',
         'tst_result_style_sim',
         # Phase-1 quality signals persisted for downstream auditing (2A.4):
@@ -571,11 +811,13 @@ def save_tst_results(tst_df, results_path):
     missing = [c for c in REQUIRED_PERSIST_COLS if c not in tst_df.columns]
     if missing:
         raise KeyError(f"save_tst_results: required columns missing: {missing}")
+    if tst_df.empty:
+        return None
     tst_res_cols = [c for c in tst_res_cols if c in tst_df.columns]
     results_files = [
         fn
         for fn in os.listdir(results_path)
-        if '.parquet.gzip' in fn
+        if fn.endswith('.parquet.gzip') and fn.startswith('part_')
     ]
     if results_files:
         nums = [
@@ -589,38 +831,330 @@ def save_tst_results(tst_df, results_path):
         lambda se: se.astype(np.float16)
     )
     next_result_str_num = str(next_result_num).zfill(5)
-    new_result_path = results_path + f"part_{next_result_str_num}.parquet.gzip"
-    tst_df[tst_res_cols].to_parquet(new_result_path, compression='gzip')
+    part_name = f"part_{next_result_str_num}.parquet.gzip"
+    tmp_path = os.path.join(results_path, f".tmp_{part_name}")
+    tst_df[tst_res_cols].to_parquet(tmp_path, compression='gzip')
+    os.replace(tmp_path, os.path.join(results_path, part_name))
+    return part_name
 
-def join_generated_files(results_path):
-    results_files = [
+def join_generated_files(results_path, compact=False):
+    """Load all part files under ``results_path`` into one frame.
+
+    2A.8.6: read-only by default. The legacy always-on compaction
+    (write-combined → delete parts → rename) could destroy accepted rows if
+    the process died between the deletes and the rename — under systemd, where
+    restarts are routine, that is a data-loss lottery, so compaction is now
+    opt-in (``compact=True``, still NOT crash-safe — use only in manual
+    finalization, never in the resume path). Rows duplicated across parts
+    (possible if a crash landed between an atomic part write and the state
+    commit, and the chunk was then regenerated) are dropped on ``source_uid``
+    when present, else on the frame index, keeping the first occurrence.
+    """
+    results_files = sorted(
         fn
         for fn in os.listdir(results_path)
-        if '.parquet.gzip' in fn
-    ]
+        if fn.endswith('.parquet.gzip') and fn.startswith('part_')
+    )
     if len(results_files) > 0:
         results_df = pd.concat(
             [
-                pd.read_parquet(results_path + fn)
+                pd.read_parquet(os.path.join(results_path, fn))
                 for fn in results_files
             ]
         ).sort_index()
-        if len(results_files) > 1:
-            new_file_path = results_path + "part_00001_new.parquet.gzip"
+        if 'source_uid' in results_df.columns:
+            dup = results_df['source_uid'].duplicated()
+            if dup.any():
+                print(f"join_generated_files: dropping {int(dup.sum())} "
+                      f"duplicate source_uid rows")
+                results_df = results_df[~dup]
+        else:
+            dup = results_df.index.duplicated()
+            if dup.any():
+                print(f"join_generated_files: dropping {int(dup.sum())} "
+                      f"duplicate-index rows")
+                results_df = results_df[~dup]
+        if compact and len(results_files) > 1:
+            new_file_path = os.path.join(
+                results_path, ".tmp_part_00001.parquet.gzip")
             results_df.to_parquet(new_file_path, compression='gzip')
             for fn in results_files:
-                os.remove(results_path + fn)
-            os.rename(new_file_path, results_path + "part_00001.parquet.gzip")
+                os.remove(os.path.join(results_path, fn))
+            os.rename(new_file_path,
+                      os.path.join(results_path, "part_00001.parquet.gzip"))
         return results_df
     return None
+
+# ---------------- 2A.8.6 restart-durable run state ----------------
+
+STATE_VERSION = 1
+
+def compute_config_hash(config):
+    """Stable short hash of a run-config dict (sorted-key JSON, sha256/16)."""
+    blob = json.dumps(config, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+class GenRunState:
+    """Restart-durable bookkeeping for the multi-domain generation run (2A.8.6).
+
+    Authority split (execution contract): **output part files are authoritative
+    for accepted rows**; **this state file is authoritative for
+    queues/attempts/counters/RNG**. The state file is JSON, written atomically
+    (temp → ``os.replace``) on every transition.
+
+    Keys are ``"{split}/{domain}"``; row identity is
+    ``source_uid = f"{key}#{source_index}"`` (queues store the bare integer
+    indexes to keep the file small — the uid is derivable).
+
+    Chunk transaction::
+
+        state.begin_chunk(key, idxs, rng)      # in-flight marked, state saved
+        part = save_tst_results(accepted, dir) # atomic part write
+        state.commit_chunk(key, part, ...)     # manifest/counters/queues, saved
+
+    Crash windows and their resume behaviour (``reconcile()``):
+
+    - died before the part write → no orphan part: the in-flight indexes are
+      requeued (back of the queue), nothing charged;
+    - died between part write and commit → the unknown ("orphan") part file is
+      ADOPTED: its ``source_uid`` rows are counted accepted, the remaining
+      in-flight indexes requeued without charge. This is why a duplicated
+      accepted row is impossible by construction (adopted rows never re-enter
+      the queue) and why ``join_generated_files`` deduping is only a belt.
+
+    Resume refuses a changed config (``config_hash``) unless
+    ``allow_config_change=True`` — a resumed run must not silently mix
+    incompatible generation settings under one output directory. A corrupt
+    state file is moved aside (``.corrupt``) and ``load`` returns ``None``:
+    the caller rebuilds queues from the pools minus the on-disk part files.
+    """
+
+    def __init__(self, state_path, config, queues=None):
+        self.state_path = state_path
+        self.config = dict(config)
+        self.config_hash = compute_config_hash(self.config)
+        # key -> list of integer source indexes still to process (front = next)
+        self.queues = {k: [int(i) for i in v] for k, v in (queues or {}).items()}
+        self.in_flight = None            # {'key': str, 'idxs': [int, ...]}
+        # attempts/scorer_errors hold only LIVE rows (still queued/in-flight):
+        # callers should prune a row's entries once it is accepted or
+        # abandoned, or these dicts grow with every processed row and the
+        # per-chunk state rewrite inflates toward tens of MB on the real
+        # 2.4M-row pools (results-review finding).
+        self.attempts = {}               # uid -> failed generation attempts
+        self.scorer_errors = {}          # uid -> scorer-error requeues
+        self.abandoned = {}              # key -> COUNT of capped-out rows
+        self.counters = {}               # cumulative: accepted/abandoned/gen_s/...
+        self.manifest = {}               # key -> [part filenames]
+        self.rng_state = None            # numpy bit_generator.state
+        self.version = STATE_VERSION
+
+    # ---- persistence ----
+
+    def to_dict(self):
+        return {
+            'version': self.version,
+            'config_hash': self.config_hash,
+            'config': self.config,
+            'queues': self.queues,
+            'in_flight': self.in_flight,
+            'attempts': self.attempts,
+            'scorer_errors': self.scorer_errors,
+            'abandoned': self.abandoned,
+            'counters': self.counters,
+            'manifest': self.manifest,
+            'rng_state': self.rng_state,
+            'updated_at': datetime.now().isoformat(timespec='seconds'),
+        }
+
+    def save(self):
+        tmp = self.state_path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(self.to_dict(), f)
+        os.replace(tmp, self.state_path)
+
+    @classmethod
+    def load(cls, state_path, config, allow_config_change=False):
+        """Load an existing state file; ``None`` if absent or corrupt.
+
+        Corrupt files are renamed to ``<state_path>.corrupt`` (forensics) so
+        the caller can rebuild from the output part files instead of crash-
+        looping on the same unreadable state under systemd Restart=on-failure.
+        """
+        if not os.path.exists(state_path):
+            return None
+        try:
+            with open(state_path, encoding='utf-8') as f:
+                d = json.load(f)
+            if d['version'] != STATE_VERSION:
+                raise ValueError(f"state version {d['version']} != {STATE_VERSION}")
+            for req in ('config_hash', 'queues', 'counters', 'manifest'):
+                if req not in d:
+                    raise KeyError(req)
+        except (json.JSONDecodeError, KeyError, ValueError, OSError) as e:
+            corrupt = state_path + '.corrupt'
+            print(f"GenRunState: state file unreadable ({e!r}) — moving to "
+                  f"{corrupt}; caller must rebuild from output parts.")
+            os.replace(state_path, corrupt)
+            return None
+        st = cls(state_path, config)
+        if d['config_hash'] != st.config_hash:
+            if not allow_config_change:
+                raise ValueError(
+                    "GenRunState: config changed since this run started "
+                    f"(state {d['config_hash']} vs current {st.config_hash}). "
+                    "Resuming would mix incompatible generation settings in "
+                    "one output dir; pass allow_config_change=True to force. "
+                    f"Stored config: {d.get('config')}"
+                )
+            print("GenRunState: WARNING — resuming with a CHANGED config "
+                  f"(state {d['config_hash']} vs current {st.config_hash}).")
+        st.queues = {k: [int(i) for i in v] for k, v in d['queues'].items()}
+        st.in_flight = d.get('in_flight')
+        st.attempts = d.get('attempts', {})
+        st.scorer_errors = d.get('scorer_errors', {})
+        # pre-pruning states stored abandoned as index LISTS; accept both
+        st.abandoned = {k: (v if isinstance(v, int) else len(v))
+                        for k, v in d.get('abandoned', {}).items()}
+        st.counters = d['counters']
+        st.manifest = d['manifest']
+        st.rng_state = d.get('rng_state')
+        return st
+
+    # ---- rng ----
+
+    def capture_rng(self, rng):
+        if rng is not None:
+            self.rng_state = rng.bit_generator.state
+
+    def restore_rng(self, rng):
+        """Restore the target-sampling RNG stream (best-effort determinism)."""
+        if self.rng_state is not None:
+            rng.bit_generator.state = self.rng_state
+
+    # ---- chunk transaction ----
+
+    def begin_chunk(self, key, idxs, rng=None):
+        if self.in_flight is not None:
+            raise RuntimeError(
+                f"begin_chunk({key}): previous chunk {self.in_flight['key']} "
+                "still in flight — call commit_chunk or reconcile first."
+            )
+        idx_set = set(int(i) for i in idxs)
+        q = self.queues.get(key, [])
+        # fast path: callers dequeue the FRONT slice, so a full O(queue)
+        # filter is normally unnecessary (results-review nit)
+        if q[:len(idx_set)] and set(q[:len(idx_set)]) == idx_set:
+            self.queues[key] = q[len(idx_set):]
+        else:
+            self.queues[key] = [i for i in q if i not in idx_set]
+        self.in_flight = {'key': key, 'idxs': sorted(idx_set)}
+        self.capture_rng(rng)
+        self.save()
+
+    def commit_chunk(self, key, part_name, requeue_idxs=(), abandoned_idxs=(),
+                     counter_deltas=None, rng=None):
+        if self.in_flight is None or self.in_flight['key'] != key:
+            raise RuntimeError(f"commit_chunk({key}): no matching in-flight chunk")
+        if part_name:
+            self.manifest.setdefault(key, []).append(part_name)
+        if len(requeue_idxs):
+            self.queues[key] = self.queues.get(key, []) + [
+                int(i) for i in requeue_idxs]
+        if len(abandoned_idxs):
+            self.abandoned[key] = (
+                self.abandoned.get(key, 0) + len(abandoned_idxs))
+        for k, v in (counter_deltas or {}).items():
+            self.counters[k] = self.counters.get(k, 0) + v
+        self.in_flight = None
+        self.capture_rng(rng)
+        self.save()
+
+    # ---- resume reconciliation ----
+
+    def reconcile(self, results_dirs):
+        """Align state with the on-disk output parts after a restart.
+
+        ``results_dirs`` maps key -> results dir path. Any part file on disk
+        that the manifest does not know is an orphan from a crash between the
+        part write and the state commit: adopt it (count its rows accepted,
+        keep its indexes out of the queues). Then requeue whatever remains of
+        an in-flight chunk without charging attempts. Returns a summary dict.
+        """
+        summary = {'adopted_parts': [], 'adopted_rows': 0, 'requeued': 0}
+        adopted_idxs = {}
+        for key, dirpath in results_dirs.items():
+            if not os.path.isdir(dirpath):
+                continue
+            on_disk = sorted(
+                fn for fn in os.listdir(dirpath)
+                if fn.endswith('.parquet.gzip') and fn.startswith('part_')
+            )
+            known = set(self.manifest.get(key, []))
+            missing = known - set(on_disk)
+            if missing:
+                raise FileNotFoundError(
+                    f"reconcile({key}): manifest lists {sorted(missing)} but "
+                    f"they are not on disk — output dir and state disagree."
+                )
+            for fn in on_disk:
+                if fn in known:
+                    continue
+                part = pd.read_parquet(os.path.join(dirpath, fn))
+                if 'source_uid' in part.columns:
+                    idxs = [int(u.rsplit('#', 1)[1]) for u in part['source_uid']]
+                else:
+                    idxs = [int(i) for i in part.index]
+                adopted_idxs.setdefault(key, set()).update(idxs)
+                self.manifest.setdefault(key, []).append(fn)
+                # keep BOTH counter granularities consistent — the per-key one
+                # drives quota checks (undercounting it would let a quota'd key
+                # overshoot by the adopted rows)
+                self.counters['accepted'] = (
+                    self.counters.get('accepted', 0) + len(part))
+                self.counters[f'accepted:{key}'] = (
+                    self.counters.get(f'accepted:{key}', 0) + len(part))
+                summary['adopted_parts'].append(f"{key}/{fn}")
+                summary['adopted_rows'] += len(part)
+        for key, idxs in adopted_idxs.items():
+            self.queues[key] = [i for i in self.queues.get(key, [])
+                                if i not in idxs]
+        if self.in_flight is not None:
+            key = self.in_flight['key']
+            done = adopted_idxs.get(key, set())
+            requeue = [i for i in self.in_flight['idxs'] if i not in done]
+            self.queues[key] = self.queues.get(key, []) + requeue
+            summary['requeued'] = len(requeue)
+            self.in_flight = None
+        self.save()
+        return summary
+
+    # ---- accounting ----
+
+    def totals(self):
+        """Per-key accounting identity inputs for validation/progress:
+        queued + in_flight per key (accepted/abandoned come from manifest and
+        the abandoned lists)."""
+        out = {}
+        keys = set(self.queues) | set(self.manifest) | set(self.abandoned)
+        for key in keys:
+            out[key] = {
+                'queued': len(self.queues.get(key, [])),
+                'in_flight': len(self.in_flight['idxs'])
+                if self.in_flight and self.in_flight['key'] == key else 0,
+                'abandoned': self.abandoned.get(key, 0),
+                'parts': len(self.manifest.get(key, [])),
+            }
+        return out
+
 
 class PphGenerator:
     def __init__(
         self,
         style_df_path,
-        base_df_path,
-        results_path,
-        checkpoint_path,
+        base_df_path=None,
+        results_path=None,
+        checkpoint_path=None,
         long_texts=False,
         rows_at_once=30000,
         base_model_path = "ai-forever/rugpt3small_based_on_gpt2",
@@ -632,6 +1166,13 @@ class PphGenerator:
         # None because PphGenerator is used with both folder-14 (unit-norm)
         # and pre-folder-14 (~15 norm) checkpoints — the caller must pick the
         # value that matches the checkpoint they pass in.
+        #
+        # 2A.8.6 multi-domain: everything loaded here is domain-AGNOSTIC and
+        # loads once (models, scorers, encoded style pool). The per-domain
+        # context lives in set_domain(); passing base_df_path keeps the legacy
+        # single-domain behaviour (domain derived from the pool's first row).
+        if checkpoint_path is None:
+            raise ValueError("checkpoint_path is required")
         set_global_seed(seed)
         self.rng = np.random.default_rng(seed)
         self.perplexity_batch_size = perplexity_batch_size
@@ -640,9 +1181,7 @@ class PphGenerator:
         # source-norm rescale (target_norm=None).
         self.target_norm = 1.0 if assert_norm == 'normalized' else None
         tokenizer = AutoTokenizer.from_pretrained(base_model_path)
-        self.base_df = pd.read_parquet(base_df_path)
         self.style_df = pd.read_parquet(style_df_path)
-        self.results_path = results_path
         self.rows_at_once = rows_at_once
         # 2A.8.2: fresh-encode the target style pool from its text rather than
         # trusting a stored embedding column. style_sample_v2 ships text only
@@ -660,20 +1199,13 @@ class PphGenerator:
         # load onto tallin's ~8 GB card.
         gc.collect()
         torch.cuda.empty_cache()
-        current_domain = self.base_df.iloc[0].domain
-        in_domain = self.style_df[self.style_df.domain == current_domain]
-        # Per-source target-domain weights (2A.8.2): down-weight near-neighbor
-        # target registers. None for unknown domains -> uniform sampling.
-        self.domain_weights = compute_domain_target_weights(current_domain)
-        # 2A.8.1b: domain-only domains (news/wikipedia/taiga_magazines/Bible/
-        # political) get domain-only target styles; real-author domains also get
-        # author targets. Use the explicit DOMAIN_ONLY set — NOT in_domain.empty,
-        # which flips to author-targets once author-less domains carry
-        # author=<domain> rows in style_sample_v2.
-        has_author_targets = current_domain not in DOMAIN_ONLY
-        self.target_styles = get_target_styles(
-            current_domain, has_author_targets=has_author_targets)
-        self.in_domain_style_df = in_domain if has_author_targets else None
+        # Per-domain context — filled by set_domain().
+        self.base_df = None
+        self.results_path = None
+        self.current_domain = None
+        self.domain_weights = None
+        self.target_styles = None
+        self.in_domain_style_df = None
         if long_texts:
             max_length = 1024
             batch_size = 6
@@ -709,9 +1241,63 @@ class PphGenerator:
         )
         self.gender_scorer = GenderConsistencyScorer(device='cuda')
         self.entity_scorer = EntityConsistencyScorer(device='cuda')
+        # Legacy single-domain path: derive the domain from the base pool.
+        if base_df_path is not None:
+            base_df = pd.read_parquet(base_df_path)
+            self.set_domain(base_df.iloc[0].domain, base_df,
+                            results_path=results_path)
+
+    def set_domain(self, domain, base_df, results_path=None):
+        """Swap the cheap per-domain context; heavy models stay resident.
+
+        2A.8.6 multi-domain support: TinyStyler/TSTGenerator/the three scorers
+        and the encoded style pool are domain-agnostic and load once in
+        ``__init__``; this swaps everything that depends on the SOURCE domain:
+
+        - ``base_df``: the source slice to generate from. May carry a
+          ``source_uid`` column (orchestrator-provided stable row identity —
+          per-file integer indexes collide across the v2 pools); when present
+          it is persisted into every result row.
+        - ``domain_weights``: 2A.8.2 near-register penalty weights.
+        - ``target_styles`` / ``in_domain_style_df``: author targets only for
+          real-author domains (2A.8.1b DOMAIN_ONLY set).
+        - ``results_path``: per-(split,domain) output dir when given; keeping
+          it per-domain is what makes the part-counter collision-free.
+        """
+        if 'domain' in base_df.columns:
+            doms = set(base_df.domain.unique())
+            if doms != {domain}:
+                raise ValueError(
+                    f"set_domain({domain!r}): base_df carries domains {doms}"
+                )
+        self.base_df = base_df
+        if results_path is not None:
+            self.results_path = results_path
+        self.current_domain = domain
+        in_domain = self.style_df[self.style_df.domain == domain]
+        # Per-source target-domain weights (2A.8.2): down-weight near-neighbor
+        # target registers. None for unknown domains -> uniform sampling.
+        self.domain_weights = compute_domain_target_weights(domain)
+        # 2A.8.1b: domain-only domains get domain-only target styles; real-
+        # author domains also get author targets. Use the explicit DOMAIN_ONLY
+        # set — NOT in_domain.empty, which flips to author-targets once
+        # author-less domains carry author=<domain> rows in style_sample_v2.
+        has_author_targets = domain not in DOMAIN_ONLY
+        self.target_styles = get_target_styles(
+            domain, has_author_targets=has_author_targets)
+        self.in_domain_style_df = in_domain if has_author_targets else None
 
     def execute(self, max_attempts=3, prefetch=True):
         """Stream the base pool through generation+filtering.
+
+        LEGACY SINGLE-POOL PATH. The 2A.8.6 production path is
+        ``16 phase 2A infrastructure/gen_v2_orchestrator.py`` (multi-domain
+        round-robin, ``GenRunState`` chunk transactions, quotas, systemd).
+        ``execute()`` does NOT have those guarantees: its queue/attempts live
+        in memory, and its resume relies on ``join_generated_files`` index
+        matching — which assumes parts were written by THIS path against the
+        same base pool (parts with a foreign/reset index would not be skipped
+        correctly). Keep it for one-off single-pool experiments only.
 
         The queue is shuffled once; failures go to the back (FIFO) and are
         retried with a freshly sampled target style (a row that fails one target
@@ -721,7 +1307,19 @@ class PphGenerator:
         source-side features (perplexity/style/LaBSE) on the base pool **once**
         so requeued rows don't recompute them every attempt (B4; the per-attempt
         source recompute was ~55 ms/row × the retry redundancy).
+
+        2A.8.6 attempt accounting: an attempt is charged only when a generated
+        output actually failed (``quality_reject``/``empty_output``). Close
+        target draws are resolved inside ``add_target_style_emb`` and never
+        reach this loop; ``scorer_error`` rows are requeued WITHOUT charging an
+        attempt, on their own equally-capped counter so a deterministic scorer
+        failure cannot recirculate forever.
         """
+        if self.base_df is None or self.results_path is None:
+            raise RuntimeError(
+                "execute(): no domain context — call set_domain(domain, "
+                "base_df, results_path) first (or construct with base_df_path)."
+            )
         if prefetch:
             # Idempotent: text_style_emb already lives on the pools, so only
             # perplexity + LaBSE are computed here, once for the whole pool.
@@ -738,13 +1336,14 @@ class PphGenerator:
         # reproducible from `seed` alone, not the global numpy state.
         unprocessed_queue = list(self.rng.permutation(unprocessed_queue))
         attempts = {i: 0 for i in unprocessed_queue}
+        scorer_errors = {}
         n_abandoned = 0
         while unprocessed_queue:
             time_start = datetime.now()
             processing_ids = unprocessed_queue[:self.rows_at_once]
             unprocessed_queue = unprocessed_queue[self.rows_at_once:]
             current_df = self.base_df.loc[processing_ids]
-            tst_df = gen_paraphrases(
+            res = gen_paraphrases(
                 current_df, self.tst_generator,
                 self.style_df, self.in_domain_style_df,
                 self.target_styles,
@@ -754,13 +1353,28 @@ class PphGenerator:
                 rng=self.rng,
                 domain_weights=self.domain_weights,
             )
-            save_tst_results(tst_df, self.results_path)
-            completed_ids = set(tst_df.index)
+            timings = dict(res.attrs.get('timings', {}))
+            outcome_counts = res['outcome'].value_counts().to_dict()
+            accepted = res[res['outcome'] == 'accepted'].copy()
+            if len(accepted):
+                save_tst_results(accepted, self.results_path)
+            completed_ids = set(accepted.index)
             requeued_ids = []
             for i in processing_ids:
-                if i in completed_ids:
+                oc = res.at[i, 'outcome']
+                if oc == 'accepted':
                     continue
-                attempts[i] += 1
+                if oc == 'scorer_error':
+                    # Not the row's fault — requeue without charging an attempt,
+                    # but on its own cap so a deterministic scorer failure can't
+                    # recirculate forever.
+                    scorer_errors[i] = scorer_errors.get(i, 0) + 1
+                    if scorer_errors[i] < max_attempts:
+                        requeued_ids.append(i)
+                    else:
+                        n_abandoned += 1
+                    continue
+                attempts[i] += 1              # quality_reject / empty_output
                 if attempts[i] < max_attempts:
                     requeued_ids.append(i)   # rejects go to the back of the queue
                 else:
@@ -769,7 +1383,7 @@ class PphGenerator:
             # Release this chunk's cached GPU blocks before the next one — the
             # transient scoring models otherwise fragment the small (~8 GB) GPU
             # across the streaming requeue loop and OOM after a few chunks.
-            del tst_df, current_df
+            del res, accepted, current_df
             gc.collect()
             torch.cuda.empty_cache()
             time_end = datetime.now()
@@ -782,6 +1396,12 @@ class PphGenerator:
             print(
                 f"{n_succeeded} from {n_tried} ({success_p}) generated paraphrases passed during last step."
             )
+            print(f"Outcomes: {outcome_counts}")
+            if timings:
+                print(
+                    "Timings: target {target_s:.1f}s | source {source_s:.1f}s | "
+                    "gen {gen_s:.1f}s | score {score_s:.1f}s".format(**timings)
+                )
             print(f"Step time: {str(time_end-time_start)}")
             print(
                 f"Totally: {time_str} | queue {n_unprocessed} | abandoned {n_abandoned} "

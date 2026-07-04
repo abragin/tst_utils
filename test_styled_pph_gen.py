@@ -12,6 +12,8 @@ Covered:
   (folder-14), legacy source-norm, and custom target_norm.
 - ``save_tst_results``: the required-column assertion.
 """
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -19,6 +21,8 @@ import pytest
 from tst_utils.styled_pph_gen import (
     phase1_keep_mask,
     _rescale_targets_to_source_norms,
+    _rotate_target_away_from_source,
+    sim_measure_to_angle,
     produce_target_style,
     produce_target_style_other_domain,
     produce_target_style_2_other_domains,
@@ -30,9 +34,14 @@ from tst_utils.styled_pph_gen import (
     DOMAIN_CENTROID_SIM,
     TARGET_WEIGHT_FLOOR,
     TARGET_WEIGHT_TAU,
+    MAX_TARGET_REDRAWS,
+    ROTATE_SIM_CAP,
+    ROTATE_SIM_FALLBACK,
+    SIM_MEASURE_TARGET_STYLE_UB,
     CHRF_UB, BI_SCORE_UB, CL_SCORE_UB, GENDER_SCORE_LB,
     ENTITY_SCORE_LB, MEANING_SCORE_LB, SIM_MEASURE_UB, NAT_V2_LB,
 )
+from tst_utils.eval.metrics.style import sim_measure
 from tst_utils.eval.metrics.composite import (
     AUTHOR_CE, DOMAIN_CE, _lookup_target_ce,
 )
@@ -368,7 +377,9 @@ def test_2domain_mixes_stay_uniform_wiring():
     weights = compute_domain_target_weights('news')
 
     def fake(df_sub, *a, **k):
-        embs = [np.zeros(4) for _ in range(len(df_sub))]
+        # orthogonal to the ones() source embs: sim = 0.75 < UB, so the 2A.8.6
+        # close-target loop stays quiet and each producer is called exactly once
+        embs = [np.array([1.0, -1.0, 1.0, -1.0]) for _ in range(len(df_sub))]
         # add_target_style_emb calls producers with return_keys=True and unpacks
         # (embs, keys); mirror that contract so the routing assertions still run.
         if k.get('return_keys'):
@@ -415,6 +426,8 @@ def _minimal_valid_tst_df(with_keys=True):
         'bi_score': 0.1, 'cl_score': 0.1, 'gender_score': 0.9,
         'gender_activated': False, 'entity_score': 1.0, 'chrf': 0.2,
         'nat_v2': 0.5, 'naturality_score': 0.0, 'style_score': 0.0, 'score': 0.0,
+        # 2A.8.6 target-adjustment provenance (REQUIRED_PERSIST_COLS):
+        'target_adjusted': False, 'target_adjustment': 'none', 'target_redraws': 0,
     }
     r1 = dict(row); r1['target_keys'] = ['Bible']
     r2 = dict(row, target_style_desc='2_domains_weighted_avg')
@@ -564,3 +577,425 @@ def test_add_target_style_emb_writes_keys_every_branch():
             assert all(k in {'Chekhov', 'Dostoevsky'} for k in keys)
         else:
             assert all(k in {'news', 'Bible', 'wikipedia'} for k in keys)
+
+
+# ---------------- 2A.8.6: sim inversion + rotation geometry ----------------
+
+def test_sim_measure_to_angle_matches_ub_36_degrees():
+    # SIM_MEASURE_TARGET_STYLE_UB = 0.9 ⇔ θ = 36° (sim = 1 − θ/(2π))
+    assert np.isclose(np.degrees(sim_measure_to_angle(SIM_MEASURE_TARGET_STYLE_UB)), 36.0)
+    assert np.isclose(np.degrees(sim_measure_to_angle(1.0)), 0.0)
+    assert np.isclose(np.degrees(sim_measure_to_angle(0.5)), 180.0)
+
+
+@pytest.mark.parametrize("sim_target", [0.89, 0.85, 0.70, 0.55])
+def test_rotation_lands_exactly_on_requested_sim(sim_target):
+    rng = np.random.default_rng(0)
+    src = rng.normal(size=16)
+    tgt = rng.normal(size=16)
+    new = _rotate_target_away_from_source(src, tgt, sim_target)
+    assert np.isclose(sim_measure(src, new), sim_target, atol=1e-9)
+
+
+def test_rotation_preserves_target_norm():
+    # The target_norm invariant: rotation happens after the rescale and must not
+    # change the vector's norm (unit for folder-14, ~15 legacy).
+    rng = np.random.default_rng(1)
+    src = rng.normal(size=16)
+    for norm in [1.0, 15.0]:
+        tgt = rng.normal(size=16)
+        tgt = tgt / np.linalg.norm(tgt) * norm
+        new = _rotate_target_away_from_source(src, tgt, 0.8)
+        assert np.isclose(np.linalg.norm(new), norm)
+
+
+def test_rotation_stays_in_src_tgt_plane():
+    rng = np.random.default_rng(2)
+    src = rng.normal(size=16)
+    tgt = rng.normal(size=16)
+    new = _rotate_target_away_from_source(src, tgt, 0.75)
+    # new must be a linear combination of src and tgt: residual after projecting
+    # onto span{src, tgt} is ~0.
+    basis = np.linalg.qr(np.stack([src, tgt], axis=1))[0]
+    residual = new - basis @ (basis.T @ new)
+    assert np.linalg.norm(residual) < 1e-9
+
+
+def test_rotation_parallel_target_deterministic_fallback():
+    # tgt (anti)parallel to src: no unique plane — must still land exactly on
+    # the requested sim, deterministically.
+    src = np.zeros(8); src[0] = 3.0
+    for tgt in [src * 2.0, -src]:
+        a = _rotate_target_away_from_source(src, tgt, 0.8)
+        b = _rotate_target_away_from_source(src, tgt, 0.8)
+        assert np.allclose(a, b)                       # deterministic
+        assert np.isclose(sim_measure(src, a), 0.8, atol=1e-9)
+        assert np.isclose(np.linalg.norm(a), np.linalg.norm(tgt))
+
+
+# ---------------- 2A.8.6: close-target resample→rotate in add_target_style_emb ----------------
+
+def _vec_at_angle(theta_deg, norm=7.0, dim=8):
+    """A vector at exactly theta_deg from the e0 axis (in the e0-e1 plane)."""
+    v = np.zeros(dim)
+    th = np.radians(theta_deg)
+    v[0], v[1] = np.cos(th), np.sin(th)
+    return v * norm
+
+
+def _close_target_frame(n_rows=100):
+    """Sources on e0; single candidate domain 'cand' whose pool is 70% close
+    (20° < 36° ⇒ sim ≈ 0.944 ≥ UB) and 30% far (90° ⇒ sim = 0.75 < UB)."""
+    rng = np.random.default_rng(0)
+    pool_rows = []
+    for k in range(70):
+        pool_rows.append({"author": "cand", "domain": "cand",
+                          "text_style_emb": _vec_at_angle(20 + rng.uniform(-5, 5))})
+    for k in range(30):
+        pool_rows.append({"author": "cand", "domain": "cand",
+                          "text_style_emb": _vec_at_angle(90 + rng.uniform(-5, 5))})
+    pool = pd.DataFrame(pool_rows)
+    df = pd.DataFrame({
+        "domain": ["src"] * n_rows,
+        "text_style_emb": [_vec_at_angle(0.0) for _ in range(n_rows)],
+        "target_style_desc": ["other_domain"] * n_rows,
+    })
+    return df, pool
+
+
+def test_close_targets_resampled_and_rotated_never_dropped():
+    df, pool = _close_target_frame()
+    n_before = len(df)
+    add_target_style_emb(df, pool, target_norm=1.0, rng=np.random.default_rng(3))
+    # acceptance criterion: no code path drops a pre-generation row
+    assert len(df) == n_before
+    assert df["target_style_emb"].notna().all()
+    # every final target clears the UB
+    assert (df["target_style_sim_measure"] < SIM_MEASURE_TARGET_STYLE_UB).all()
+    # with a 70%-close pool both paths express: some resampled, some rotated
+    counts = df["target_adjustment"].value_counts()
+    assert counts.get("resampled", 0) > 0
+    assert counts.get("rotated", 0) > 0
+    # redraw accounting: bounded; rotated rows exhausted the redraw budget
+    assert (df["target_redraws"] <= MAX_TARGET_REDRAWS).all()
+    rotated = df[df["target_adjustment"] == "rotated"]
+    assert (rotated["target_redraws"] == MAX_TARGET_REDRAWS).all()
+    assert df["target_adjusted"].equals(df["target_adjustment"] != "none")
+
+
+def test_rotation_margin_is_batch_median_capped():
+    df, pool = _close_target_frame()
+    add_target_style_emb(df, pool, target_norm=1.0, rng=np.random.default_rng(3))
+    rotated = df[df["target_adjustment"] == "rotated"]
+    ok = df[df["target_adjustment"] != "rotated"]["target_style_sim_measure"]
+    expected = min(float(np.median(ok)), ROTATE_SIM_CAP)
+    assert np.allclose(rotated["target_style_sim_measure"], expected, atol=1e-9)
+
+
+def test_all_close_pool_rotates_to_fallback():
+    # Every candidate is inside the UB angle: bounded redraws can never clear it,
+    # rotation must salvage every row at the fallback margin (no batch median).
+    rng = np.random.default_rng(0)
+    pool = pd.DataFrame([
+        {"author": "cand", "domain": "cand",
+         "text_style_emb": _vec_at_angle(10 + rng.uniform(-5, 5))}
+        for _ in range(30)
+    ])
+    df = pd.DataFrame({
+        "domain": ["src"] * 20,
+        "text_style_emb": [_vec_at_angle(0.0) for _ in range(20)],
+        "target_style_desc": ["other_domain"] * 20,
+    })
+    add_target_style_emb(df, pool, target_norm=1.0, rng=np.random.default_rng(4))
+    assert (df["target_adjustment"] == "rotated").all()
+    assert (df["target_redraws"] == MAX_TARGET_REDRAWS).all()
+    assert np.allclose(df["target_style_sim_measure"], ROTATE_SIM_FALLBACK, atol=1e-9)
+    # rotated targets keep the requested norm
+    assert all(np.isclose(np.linalg.norm(v), 1.0) for v in df["target_style_emb"])
+
+
+def test_clean_batch_marks_no_adjustment():
+    # All candidates far from the source: first draw always clears the UB.
+    rng = np.random.default_rng(0)
+    pool = pd.DataFrame([
+        {"author": "cand", "domain": "cand",
+         "text_style_emb": _vec_at_angle(90 + rng.uniform(-10, 10))}
+        for _ in range(30)
+    ])
+    df = pd.DataFrame({
+        "domain": ["src"] * 10,
+        "text_style_emb": [_vec_at_angle(0.0) for _ in range(10)],
+        "target_style_desc": ["other_domain"] * 10,
+    })
+    add_target_style_emb(df, pool, target_norm=1.0, rng=np.random.default_rng(5))
+    assert (df["target_adjustment"] == "none").all()
+    assert (~df["target_adjusted"]).all()
+    assert (df["target_redraws"] == 0).all()
+
+
+def test_resampled_rows_keep_honest_target_keys():
+    # A resampled row's target_keys must describe its FINAL draw (on-manifold,
+    # honest provenance); only rotated rows carry keys that no longer match.
+    df, pool = _close_target_frame()
+    add_target_style_emb(df, pool, target_norm=1.0, rng=np.random.default_rng(6))
+    resampled = df[df["target_adjustment"] == "resampled"]
+    assert len(resampled) > 0
+    for _, row in resampled.iterrows():
+        # single candidate domain: keys are trivially right; the real check is
+        # that the embedding is an actual pool member direction (on-manifold),
+        # i.e. its sim to SOME pool vector is ~1 (angle ~0 up to rescale).
+        sims = [sim_measure(row.target_style_emb, p) for p in pool.text_style_emb]
+        assert np.isclose(max(sims), 1.0, atol=1e-6)
+        assert list(row.target_keys) == ["cand"]
+
+
+# ---------------- 2A.8.6: multi-domain set_domain context ----------------
+
+def _bare_generator():
+    """PphGenerator without __init__ (no models, no GPU): set_domain only needs
+    style_df + the per-domain attributes, so context logic is CPU-testable."""
+    from tst_utils.styled_pph_gen import PphGenerator
+    gen = PphGenerator.__new__(PphGenerator)
+    rng = np.random.default_rng(0)
+    rows = []
+    for dom in ALL_DOMAINS:
+        authors = ['a1', 'a2', 'a3'] if dom == 'writers' else [dom]
+        for a in authors:
+            for _ in range(2):
+                rows.append({'author': a, 'domain': dom,
+                             'text_style_emb': rng.normal(size=8)})
+    gen.style_df = pd.DataFrame(rows)
+    gen.base_df = None
+    gen.results_path = None
+    return gen
+
+
+def test_set_domain_swaps_context_domain_only_vs_author():
+    gen = _bare_generator()
+    base = pd.DataFrame({'domain': ['news'] * 3, 'text': list('abc')})
+    gen.set_domain('news', base, results_path='/tmp/x/')
+    assert gen.current_domain == 'news'
+    assert gen.in_domain_style_df is None                  # DOMAIN_ONLY
+    assert not any('author' in t for t in gen.target_styles)
+    assert gen.domain_weights == compute_domain_target_weights('news')
+    assert gen.results_path == '/tmp/x/'
+    # switch to writers: author targets appear, weights/in-domain pool swap
+    base_w = pd.DataFrame({'domain': ['writers'] * 3, 'text': list('abc')})
+    gen.set_domain('writers', base_w)
+    assert gen.current_domain == 'writers'
+    assert gen.in_domain_style_df is not None
+    assert set(gen.in_domain_style_df.domain) == {'writers'}
+    assert any(t.startswith('other_author') for t in gen.target_styles)
+    assert gen.domain_weights == compute_domain_target_weights('writers')
+    assert gen.results_path == '/tmp/x/'                   # sticky when omitted
+    assert gen.base_df is base_w
+
+
+def test_set_domain_rejects_mismatched_base_df():
+    gen = _bare_generator()
+    base = pd.DataFrame({'domain': ['news', 'pikabu'], 'text': ['a', 'b']})
+    with pytest.raises(ValueError, match='carries domains'):
+        gen.set_domain('news', base)
+
+
+def test_execute_without_domain_context_raises():
+    gen = _bare_generator()
+    with pytest.raises(RuntimeError, match='no domain context'):
+        gen.execute()
+
+
+def test_save_tst_results_persists_source_uid_and_split(tmp_path):
+    df = _minimal_valid_tst_df(with_keys=True)
+    df['source_uid'] = ['train/news#0', 'train/news#1']
+    df['split'] = 'train'
+    save_tst_results(df, str(tmp_path) + "/")
+    back = pd.read_parquet(str(tmp_path) + "/part_00001.parquet.gzip")
+    assert list(back['source_uid']) == ['train/news#0', 'train/news#1']
+    assert set(back['split']) == {'train'}
+    # provenance columns persisted alongside (REQUIRED_PERSIST_COLS)
+    for col in ['target_adjusted', 'target_adjustment', 'target_redraws']:
+        assert col in back.columns
+
+
+# ---------------- 2A.8.6: GenRunState chunk-transaction protocol ----------------
+
+from tst_utils.styled_pph_gen import (
+    GenRunState, compute_config_hash, join_generated_files, STATE_VERSION,
+)
+
+
+_CFG = {"seed": 1991, "max_attempts": 3, "checkpoint": "ckpt.safetensors"}
+
+
+def _fresh_state(tmp_path, queues=None):
+    return GenRunState(
+        str(tmp_path / "state.json"), _CFG,
+        queues=queues if queues is not None else {"train/news": [1, 2, 3, 4, 5]},
+    )
+
+
+def _accepted_frame(uids):
+    rows = []
+    for u in uids:
+        rows.append({
+            'source_uid': u, 'split': 'train', 'text': 'src', 'author': 'x',
+            'domain': 'news', 'target_style_desc': 'other_domain',
+            'target_keys': ['Bible'], 'target_style_sim_measure': 0.6,
+            'target_adjusted': False, 'target_adjustment': 'none',
+            'target_redraws': 0, 'styled_text': 'out',
+            'styled_text_style_emb': np.ones(4, dtype=np.float32),
+            'meaning_score': 0.9, 'tst_result_style_sim': 0.3, 'bi_score': 0.1,
+            'cl_score': 0.05, 'gender_score': 0.9, 'gender_activated': False,
+            'entity_score': 1.0, 'chrf': 0.2, 'nat_v2': 0.8,
+        })
+    df = pd.DataFrame(rows)
+    df.index = [int(u.rsplit('#', 1)[1]) for u in uids]
+    return df
+
+
+def test_state_round_trip_restores_everything(tmp_path):
+    st = _fresh_state(tmp_path)
+    rng = np.random.default_rng(7)
+    rng.random(13)                      # advance the stream
+    st.attempts = {"train/news#2": 1}
+    st.scorer_errors = {"train/news#3": 2}
+    st.abandoned = {"train/news": 1}
+    st.counters = {"accepted": 4, "gen_s": 12.5}
+    st.manifest = {"train/news": ["part_00001.parquet.gzip"]}
+    st.capture_rng(rng)
+    st.save()
+
+    back = GenRunState.load(str(tmp_path / "state.json"), _CFG)
+    assert back is not None
+    assert back.queues == {"train/news": [1, 2, 3, 4, 5]}
+    assert back.attempts == st.attempts
+    assert back.scorer_errors == st.scorer_errors
+    assert back.abandoned == st.abandoned
+    assert back.counters == st.counters
+    assert back.manifest == st.manifest
+    # pre-pruning state files stored abandoned as index lists — still loadable
+    import json as _json
+    raw = _json.load(open(str(tmp_path / "state.json")))
+    raw["abandoned"] = {"train/news": [9, 11]}
+    with open(str(tmp_path / "state.json"), "w") as f:
+        _json.dump(raw, f)
+    legacy = GenRunState.load(str(tmp_path / "state.json"), _CFG)
+    assert legacy.abandoned == {"train/news": 2}
+    # RNG stream continues identically after restore
+    rng2 = np.random.default_rng(0)
+    back.restore_rng(rng2)
+    assert rng2.random() == rng.random()
+
+
+def test_begin_commit_transaction_updates_queue_and_manifest(tmp_path):
+    st = _fresh_state(tmp_path)
+    rng = np.random.default_rng(1)
+    st.begin_chunk("train/news", [1, 2], rng)
+    assert st.queues["train/news"] == [3, 4, 5]
+    assert st.in_flight == {"key": "train/news", "idxs": [1, 2]}
+    st.commit_chunk("train/news", "part_00001.parquet.gzip",
+                    requeue_idxs=[2], counter_deltas={"accepted": 1}, rng=rng)
+    assert st.in_flight is None
+    assert st.queues["train/news"] == [3, 4, 5, 2]     # requeue at the back
+    assert st.manifest["train/news"] == ["part_00001.parquet.gzip"]
+    assert st.counters["accepted"] == 1
+    # double-begin without commit is a bug, not silently tolerated
+    st.begin_chunk("train/news", [3], rng)
+    with pytest.raises(RuntimeError, match="in flight"):
+        st.begin_chunk("train/news", [4], rng)
+
+
+def test_crash_before_part_write_requeues_without_charge(tmp_path):
+    outdir = tmp_path / "out" / "train_news"
+    outdir.mkdir(parents=True)
+    st = _fresh_state(tmp_path)
+    st.begin_chunk("train/news", [1, 2], np.random.default_rng(1))
+    # crash: reload from disk (commit never happened, no part file written)
+    back = GenRunState.load(str(tmp_path / "state.json"), _CFG)
+    assert back.in_flight is not None
+    summary = back.reconcile({"train/news": str(outdir)})
+    assert summary["adopted_parts"] == []
+    assert summary["requeued"] == 2
+    assert back.in_flight is None
+    assert sorted(back.queues["train/news"]) == [1, 2, 3, 4, 5]
+    assert back.attempts == {}                          # nothing charged
+
+
+def test_crash_after_part_write_adopts_orphan(tmp_path):
+    from tst_utils.styled_pph_gen import save_tst_results
+    outdir = tmp_path / "out" / "train_news"
+    outdir.mkdir(parents=True)
+    st = _fresh_state(tmp_path)
+    st.begin_chunk("train/news", [1, 2, 3], np.random.default_rng(1))
+    # the chunk accepted rows 1 and 3; part written, then crash before commit
+    part = save_tst_results(_accepted_frame(["train/news#1", "train/news#3"]),
+                            str(outdir) + os.sep)
+    assert part == "part_00001.parquet.gzip"
+    back = GenRunState.load(str(tmp_path / "state.json"), _CFG)
+    summary = back.reconcile({"train/news": str(outdir)})
+    assert summary["adopted_parts"] == ["train/news/part_00001.parquet.gzip"]
+    assert summary["adopted_rows"] == 2
+    assert back.counters["accepted"] == 2
+    # per-key counter too — it drives the orchestrator's quota checks
+    assert back.counters["accepted:train/news"] == 2
+    assert back.manifest["train/news"] == [part]
+    # accepted rows never re-enter the queue; the unfinished row goes to the back
+    assert back.queues["train/news"] == [4, 5, 2]
+    assert summary["requeued"] == 1
+    # a second reconcile is a no-op (idempotent resume)
+    summary2 = back.reconcile({"train/news": str(outdir)})
+    assert summary2["adopted_parts"] == [] and summary2["requeued"] == 0
+    assert back.queues["train/news"] == [4, 5, 2]
+
+
+def test_reconcile_raises_on_missing_manifest_part(tmp_path):
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    st = _fresh_state(tmp_path)
+    st.manifest = {"train/news": ["part_00001.parquet.gzip"]}   # not on disk
+    with pytest.raises(FileNotFoundError, match="not on disk"):
+        st.reconcile({"train/news": str(outdir)})
+
+
+def test_corrupt_state_moved_aside_and_returns_none(tmp_path):
+    p = tmp_path / "state.json"
+    p.write_text("{ not json !!!")
+    assert GenRunState.load(str(p), _CFG) is None
+    assert not p.exists()
+    assert (tmp_path / "state.json.corrupt").exists()
+
+
+def test_config_change_on_resume_is_refused(tmp_path):
+    st = _fresh_state(tmp_path)
+    st.save()
+    changed = dict(_CFG, max_attempts=1)
+    with pytest.raises(ValueError, match="config changed"):
+        GenRunState.load(str(tmp_path / "state.json"), changed)
+    # explicit override still loads (loud warning path)
+    back = GenRunState.load(str(tmp_path / "state.json"), changed,
+                            allow_config_change=True)
+    assert back is not None
+
+
+def test_state_file_is_replaced_atomically(tmp_path):
+    st = _fresh_state(tmp_path)
+    st.save()
+    st.counters["accepted"] = 42
+    st.save()
+    # no temp residue; file parses; latest content won
+    assert sorted(os.listdir(tmp_path)) == ["state.json"]
+    back = GenRunState.load(str(tmp_path / "state.json"), _CFG)
+    assert back.counters["accepted"] == 42
+
+
+def test_join_generated_files_dedupes_on_source_uid(tmp_path):
+    from tst_utils.styled_pph_gen import save_tst_results
+    d = str(tmp_path) + os.sep
+    save_tst_results(_accepted_frame(["train/news#1", "train/news#2"]), d)
+    save_tst_results(_accepted_frame(["train/news#2", "train/news#3"]), d)
+    df = join_generated_files(d)
+    assert len(df) == 3                                # dup #2 dropped
+    assert sorted(df.source_uid) == ["train/news#1", "train/news#2", "train/news#3"]
+    # read-only by default: both part files still on disk
+    parts = [f for f in os.listdir(d) if f.startswith("part_")]
+    assert len(parts) == 2
