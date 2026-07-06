@@ -28,6 +28,10 @@ Axes implemented here:
   register-relevant probe; clean slice excludes strategy-(d) rows.
 - ``a_informal`` / ``c`` — placeholders until their assets are constructed
   (Milestones 2/3 of the task).
+- ``d_geometry`` — geometry-coherence diagnostic (Step 1.A follow-on, not
+  in ``DEFAULT_AXES``): per-slice Spearman rho between style_distance and
+  chrF over the same frozen assets. Measurement-only; interpretation is
+  gated on the emitted chrF dispersion and source-length rows.
 """
 
 import datetime
@@ -164,6 +168,65 @@ def bootstrap_stat_ci(values, stat_fn, *, seed, n_boot, alpha=0.05):
     stats = np.empty(n_boot)
     for b in range(n_boot):
         stats[b] = stat_fn(rng.choice(values, size=len(values), replace=True))
+    return (
+        float(np.nanquantile(stats, alpha / 2)),
+        float(np.nanquantile(stats, 1 - alpha / 2)),
+    )
+
+
+def average_ranks(values):
+    """1-based ranks with ties assigned their average rank (as in SciPy)."""
+    values = np.asarray(values, dtype=np.float64)
+    order = np.argsort(values, kind='mergesort')
+    ranks = np.empty(len(values), dtype=np.float64)
+    ranks[order] = np.arange(1, len(values) + 1)
+    sorted_vals = values[order]
+    i = 0
+    while i < len(sorted_vals):
+        j = i
+        while j + 1 < len(sorted_vals) and sorted_vals[j + 1] == sorted_vals[i]:
+            j += 1
+        if j > i:
+            ranks[order[i:j + 1]] = ranks[order[i:j + 1]].mean()
+        i = j + 1
+    return ranks
+
+
+def spearman_rho(x, y):
+    """Spearman rank correlation = Pearson on average ranks (numpy only).
+
+    Returns ``nan`` for ``n < 3`` or when either input has zero rank
+    variance (e.g. a constant-chrF slice) — no divide warning is emitted.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if len(x) != len(y):
+        raise ValueError(f'length mismatch: {len(x)} vs {len(y)}')
+    if len(x) < 3:
+        return np.nan
+    rx, ry = average_ranks(x), average_ranks(y)
+    sx, sy = rx.std(), ry.std()
+    if sx == 0.0 or sy == 0.0:
+        return np.nan
+    return float(((rx - rx.mean()) * (ry - ry.mean())).mean() / (sx * sy))
+
+
+def bootstrap_corr_ci(x, y, *, seed, n_boot, alpha=0.05):
+    """Percentile bootstrap CI for ``spearman_rho``, resampling PAIRED rows.
+
+    ``bootstrap_stat_ci`` resamples a single 1-D array and cannot express a
+    two-vector paired statistic; this resamples pair *indices* and
+    recomputes rho on both aligned columns (degenerate draws -> nan,
+    excluded by the nan-quantiles).
+    """
+    rng = np.random.default_rng(seed)
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    n = len(x)
+    stats = np.empty(n_boot)
+    for b in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        stats[b] = spearman_rho(x[idx], y[idx])
     return (
         float(np.nanquantile(stats, alpha / 2)),
         float(np.nanquantile(stats, 1 - alpha / 2)),
@@ -598,12 +661,149 @@ def score_axis_c(embed_fn, assets, *, seed, n_boot, max_sil_chunks=2000):
     return rows
 
 
+# Pinned d_geometry bucket membership (task 2026-07-06): genuine transfers
+# + accepted + the paraphrase anchors. ``near_copy`` is EXCLUDED — near-
+# identical text gives chrf~1 and sim~1 trivially, manufacturing negative
+# rho that says nothing about interior coherence. The ub_formal validation
+# frame (0.92-0.97 window population, news-only) is excluded as well.
+D_GEOMETRY_FORMAL_BUCKETS = ('reject', 'accepted', 'rt_paraphrase')
+D_GEOMETRY_INFORMAL_BUCKETS = ('reject', 'accepted', 'llm_paraphrase')
+
+
+def d_geometry_slices(assets):
+    """Pinned per-slice pair populations for the d_geometry axis.
+
+    Returns a list of dicts (``slice``, ``df`` with aligned
+    ``pair_id/bucket/text/styled_text`` columns, ``source_asset``,
+    ``asset_version``, ``label_source``). Slices are reported per-asset
+    only — a naive pooled ``all`` would be dominated by between-domain
+    location shifts in chrF and sim, so none is emitted.
+    """
+    round1, _validation, f_versions = load_ub_formal(assets.ub_formal_dir)
+    informal, i_version = load_ub_informal(assets.ub_informal_dir)
+    paradetox, p_version = load_paradetox(assets.paradetox_path)
+    gold, g_version = load_formality_gold(assets.formality_gold_path)
+
+    def norm(df, *, pair_id=None, bucket=None):
+        out = pd.DataFrame({
+            'pair_id': (df[pair_id].astype('float64').values
+                        if pair_id else np.full(len(df), np.nan)),
+            'bucket': df[bucket].astype(str).values if bucket else None,
+            'text': df['text'].values,
+            'styled_text': df['styled_text'].values,
+        })
+        return out
+
+    slices = []
+    for source in ('news', 'wikipedia'):
+        sub = round1[(round1['source'] == source)
+                     & round1['bucket'].isin(D_GEOMETRY_FORMAL_BUCKETS)]
+        slices.append(dict(
+            slice=source, df=norm(sub, pair_id='pair_id', bucket='bucket'),
+            source_asset='ub_benchmark',
+            asset_version=f_versions['ub_round1'],
+            label_source='bucket_design'))
+    for source in ('ficbook', 'pikabu', 'taiga_proza'):
+        sub = informal[(informal['source'] == source)
+                       & informal['bucket'].isin(D_GEOMETRY_INFORMAL_BUCKETS)]
+        slices.append(dict(
+            slice=source, df=norm(sub, pair_id='pair_id', bucket='bucket'),
+            source_asset='ub_benchmark_informal', asset_version=i_version,
+            label_source='bucket_design'))
+    slices.append(dict(
+        slice='formality', df=norm(gold, bucket='strategy'),
+        source_asset='formality_gold_v1', asset_version=g_version,
+        label_source='formality_gold_v1(arbiter)'))
+    slices.append(dict(
+        slice='paradetox', df=norm(paradetox),
+        source_asset='ru_paradetox_pairs', asset_version=p_version,
+        label_source='paradetox_dataset'))
+    return slices
+
+
+def score_axis_d_geometry(embed_fn, assets, *, seed, n_boot,
+                          points_out=None, points_encoder_id=None):
+    """Axis (d): geometry-coherence diagnostic — Spearman rho between
+    ``style_distance`` (``1 - sim``) and chrF, per slice.
+
+    For a coherent embedding space rho is NEGATIVE (minor rewording ->
+    high chrF -> low style_distance). MEASUREMENT-ONLY: the directional
+    guard lives in the notebook interpretation, gated on the emitted
+    ``chrf_iqr`` (near-zero rho on a narrow-chrF slice is a power
+    artifact, not a verdict) and on ``src_len_median_words`` (chrF swings
+    wider per edit on short texts — the paradetox length confound). A
+    chrF-prediction training head is explicitly rejected (see the task):
+    this axis is never a loss.
+
+    Populations pinned in ``d_geometry_slices``. All paradetox pairs are
+    embedded (no subsample); each unique text is embedded once across all
+    slices. Slices with ``n < 3`` emit nan (``n`` still recorded); an
+    empty frozen slice raises. If ``points_out`` is given, a row-level
+    ``(slice, source_asset, pair_id, bucket, chrf, style_distance,
+    src_len_words, src_len_chars, encoder_id)`` parquet is written for
+    notebook scatters, outlier audits, and the length-control check
+    (length-matched / length-stratified rho re-estimates need per-row
+    source lengths).
+    """
+    from tst_utils.eval.metrics.copying import chrf_scores  # lazy: sacrebleu
+
+    slices = d_geometry_slices(assets)
+    all_texts = pd.unique(pd.concat(
+        [s['df'][col] for s in slices for col in ('text', 'styled_text')],
+        ignore_index=True))
+    emb = np.asarray(embed_fn(list(all_texts)), dtype=np.float64)
+    tidx = {t: i for i, t in enumerate(all_texts)}
+
+    rows, point_frames = [], []
+    for s in slices:
+        df = s['df']
+        if len(df) == 0:
+            raise ValueError(
+                f"d_geometry/{s['slice']}: frozen slice came back empty")
+        src = emb[[tidx[t] for t in df['text']]]
+        sty = emb[[tidx[t] for t in df['styled_text']]]
+        distance = 1 - rowwise_sim(src, sty)
+        chrf = chrf_scores(df['text'].tolist(), df['styled_text'].tolist())
+        n = len(df)
+        if n >= 3:
+            rho = spearman_rho(chrf, distance)
+            ci = bootstrap_corr_ci(chrf, distance, seed=seed, n_boot=n_boot)
+        else:
+            rho, ci = np.nan, None
+        q1, q3 = np.percentile(chrf, [25, 75])
+        words = np.array([len(str(t).split()) for t in df['text']])
+        chars = np.array([len(str(t)) for t in df['text']])
+        meta = dict(label_source=s['label_source'],
+                    asset_version=s['asset_version'])
+        rows += [
+            _row('d_geometry', s['slice'], 'spearman_rho', rho, n, ci,
+                 seed=seed, n_boot=n_boot, **meta),
+            _row('d_geometry', s['slice'], 'chrf_iqr', float(q3 - q1), n,
+                 None, **meta),
+            _row('d_geometry', s['slice'], 'src_len_median_words',
+                 float(np.median(words)), n, None, **meta),
+            _row('d_geometry', s['slice'], 'src_len_median_chars',
+                 float(np.median(chars)), n, None, **meta),
+        ]
+        if points_out is not None:
+            point_frames.append(pd.DataFrame({
+                'slice': s['slice'], 'source_asset': s['source_asset'],
+                'pair_id': df['pair_id'].values, 'bucket': df['bucket'],
+                'chrf': chrf, 'style_distance': distance,
+                'src_len_words': words, 'src_len_chars': chars,
+                'encoder_id': points_encoder_id}))
+    if points_out is not None:
+        pd.concat(point_frames, ignore_index=True).to_parquet(points_out)
+    return rows
+
+
 AXIS_SCORERS = {
     'a_formal': score_axis_a_formal,
     'b1': score_axis_b1,
     'b2': score_axis_b2,
     'a_informal': score_axis_a_informal,
     'c': score_axis_c,
+    'd_geometry': score_axis_d_geometry,
 }
 
 DEFAULT_AXES = ('a_formal', 'b1', 'b2')
@@ -636,6 +836,9 @@ def score_encoder(encoder, *, encoder_id, assets, axes=DEFAULT_AXES,
             kwargs['max_pairs'] = axis_kwargs['max_pairs']
         if axis == 'c' and 'max_sil_chunks' in axis_kwargs:
             kwargs['max_sil_chunks'] = axis_kwargs['max_sil_chunks']
+        if axis == 'd_geometry' and 'd_geometry_points_out' in axis_kwargs:
+            kwargs['points_out'] = axis_kwargs['d_geometry_points_out']
+            kwargs['points_encoder_id'] = encoder_id
         rows += AXIS_SCORERS[axis](embed_fn, assets, **kwargs)
     df = pd.DataFrame(rows)
     df['encoder_id'] = encoder_id

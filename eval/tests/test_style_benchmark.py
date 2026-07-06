@@ -9,9 +9,10 @@ import pandas as pd
 import pytest
 
 from tst_utils.eval.style_benchmark import (
-    BenchmarkAssets, SCORECARD_COLUMNS, bootstrap_auc_ci, fp_adjusted_auc,
-    rank_auc, read_scorecard, resolve_embed_fn, rowwise_sim, score_encoder,
-    silhouette_by_group, write_scorecard,
+    BenchmarkAssets, SCORECARD_COLUMNS, average_ranks, bootstrap_auc_ci,
+    bootstrap_corr_ci, fp_adjusted_auc, rank_auc, read_scorecard,
+    resolve_embed_fn, rowwise_sim, score_encoder, silhouette_by_group,
+    spearman_rho, write_scorecard,
 )
 
 DIM = 8
@@ -46,6 +47,47 @@ def test_fp_adjusted_auc():
     # auc_obs = (1-fp)*auc_true + fp*0.5: recover auc_true = 0.9 at fp = 0.2
     assert fp_adjusted_auc(0.9 * 0.8 + 0.5 * 0.2, 0.2) == pytest.approx(0.9)
     assert np.isnan(fp_adjusted_auc(0.8, 1.0))
+
+
+def test_average_ranks_ties():
+    np.testing.assert_allclose(average_ranks([10, 20, 30]), [1, 2, 3])
+    # ties get the average of the ranks they span
+    np.testing.assert_allclose(average_ranks([1, 2, 2, 3]),
+                               [1, 2.5, 2.5, 4])
+    np.testing.assert_allclose(average_ranks([5, 5, 5]), [2, 2, 2])
+
+
+def test_spearman_rho_known_values():
+    # perfect monotonic relations, invariant to nonlinear transforms
+    assert spearman_rho([1, 2, 3, 4], [10, 20, 30, 40]) == pytest.approx(1.0)
+    assert spearman_rho([1, 2, 3, 4], [0.1, 1, 100, 1e6]) == \
+        pytest.approx(1.0)
+    assert spearman_rho([1, 2, 3, 4], [4, 3, 2, 1]) == pytest.approx(-1.0)
+    # tie-heavy chrF: average ranks, not first-occurrence ranks
+    x = [1, 1, 1, 2, 2, 3]
+    y = [1, 2, 3, 4, 5, 6]
+    rx, ry = average_ranks(x), average_ranks(y)
+    want = np.corrcoef(rx, ry)[0, 1]
+    assert spearman_rho(x, y) == pytest.approx(want)
+    # degenerate inputs -> nan, no divide warning
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        assert np.isnan(spearman_rho([1, 1, 1, 1], [1, 2, 3, 4]))
+        assert np.isnan(spearman_rho([1, 2, 3, 4], [7, 7, 7, 7]))
+        assert np.isnan(spearman_rho([1, 2], [1, 2]))  # n < 3
+    with pytest.raises(ValueError):
+        spearman_rho([1, 2, 3], [1, 2])
+
+
+def test_bootstrap_corr_ci_deterministic_and_ordered():
+    x = RNG.normal(size=60)
+    y = -x + 0.3 * RNG.normal(size=60)
+    lo1, hi1 = bootstrap_corr_ci(x, y, seed=1, n_boot=200)
+    lo2, hi2 = bootstrap_corr_ci(x, y, seed=1, n_boot=200)
+    assert (lo1, hi1) == (lo2, hi2)
+    assert lo1 <= spearman_rho(x, y) <= hi1
+    assert hi1 < 0  # strongly negative relation -> CI excludes zero
 
 
 def test_bootstrap_auc_ci_deterministic_and_ordered():
@@ -346,6 +388,197 @@ def test_axis_a_informal_scoring(synthetic):
     assert (aucs == 1.0).all()  # fully separable synthetic geometry
     fps = card[card['metric'] == 'anchor_fp'].set_index('slice')['value']
     assert np.allclose(fps, 0.25)
+
+
+# ---------------------------------------------------------------------------
+# axis (d_geometry): chrF-graded synthetic assets
+# ---------------------------------------------------------------------------
+
+def _graded_pair(enc, name, k):
+    """Pair whose chrF falls and embedding distance grows with ``k``.
+
+    Source = 10 unique words; styled replaces the first ``k`` of them
+    (chrF ~ (10-k)/10); the styled vector is rotated away from the base
+    proportionally to ``k`` -> a coherent encoder shows strongly negative
+    spearman(chrf, style_distance).
+    """
+    words = [f'{name}w{i}' for i in range(10)]
+    src = ' '.join(words)
+    sty = ' '.join([f'{name}x{i}' if i < k else w
+                    for i, w in enumerate(words)])
+    base = _unit(RNG.normal(size=DIM))
+    r = RNG.normal(size=DIM)
+    orth = _unit(r - (r @ base) * base)
+    theta = 0.15 * k  # exact angle -> distance strictly monotone in k
+    styled_vec = np.cos(theta) * base + np.sin(theta) * orth
+    return enc.register(src, base), enc.register(sty, styled_vec)
+
+
+def _near_copy_text(enc, name):
+    text = ' '.join([f'{name}w{i}' for i in range(10)])
+    enc.register(text, _unit(RNG.normal(size=DIM)))
+    return text
+
+
+DGEO_KS = [1, 2, 3, 4, 5, 6, 7, 8, 2, 4, 6, 8]
+
+
+@pytest.fixture
+def dgeo_synthetic(tmp_path):
+    enc = FakeEncoder()
+
+    # --- ub formal: graded pairs + near_copy rows that must be excluded ---
+    ub_dir = tmp_path / 'ub_benchmark'
+    ub_dir.mkdir()
+    buckets = ['reject'] * 6 + ['accepted'] * 3 + ['rt_paraphrase'] * 3
+    ana, inp = [], []
+    pid = 0
+    for source in ('news', 'wikipedia'):
+        for i, (bucket, k) in enumerate(zip(buckets, DGEO_KS)):
+            pid += 1
+            text, styled = _graded_pair(enc, f'{source}{i}', k)
+            ana.append({'pair_id': pid, 'source': source, 'bucket': bucket,
+                        'majority4': 'transfer'})
+            inp.append({'pair_id': pid, 'text': text, 'styled_text': styled})
+        for i in range(2):  # near_copy: identical text, excluded by design
+            pid += 1
+            text = _near_copy_text(enc, f'{source}-nc{i}')
+            ana.append({'pair_id': pid, 'source': source,
+                        'bucket': 'near_copy', 'majority4': 'paraphrase'})
+            inp.append({'pair_id': pid, 'text': text, 'styled_text': text})
+    pd.DataFrame(ana).to_csv(ub_dir / 'ub_label_analysis.csv', index=False)
+    pd.DataFrame(inp).to_csv(ub_dir / 'ub_label_input.csv', index=False)
+
+    # minimal validation files (loaded but excluded from d_geometry)
+    vpid = 9000
+    text, styled = _graded_pair(enc, 'val0', 4)
+    pd.DataFrame([{'pair_id': vpid, 'text': text, 'styled_text': styled}]) \
+        .to_csv(ub_dir / 'ub_validation_input.csv', index=False)
+    pd.DataFrame([{'pair_id': vpid, 'bucket': 'window_reject'}]) \
+        .to_csv(ub_dir / 'ub_validation_bucket_map.csv', index=False)
+    for judge in ('sonnet_val', 'deepseek_val', 'mimo_val'):
+        pd.DataFrame([{'pair_id': vpid, 'label': 'transfer'}]) \
+            .to_csv(ub_dir / f'llm_review_{judge}.csv', index=False)
+
+    # --- ub informal ------------------------------------------------------
+    ubi_dir = tmp_path / 'ub_benchmark_informal'
+    ubi_dir.mkdir()
+    ibuckets = ['reject'] * 6 + ['accepted'] * 3 + ['llm_paraphrase'] * 3
+    ubi_ana, ubi_inp = [], []
+    ipid = 6000
+    for source in ('ficbook', 'pikabu', 'taiga_proza'):
+        for i, (bucket, k) in enumerate(zip(ibuckets, DGEO_KS)):
+            ipid += 1
+            text, styled = _graded_pair(enc, f'inf-{source}{i}', k)
+            ubi_ana.append({'pair_id': ipid, 'source': source,
+                            'bucket': bucket, 'majority_usable': 'transfer'})
+            ubi_inp.append({'pair_id': ipid, 'text': text,
+                            'styled_text': styled})
+        ipid += 1
+        text = _near_copy_text(enc, f'inf-{source}-nc')
+        ubi_ana.append({'pair_id': ipid, 'source': source,
+                        'bucket': 'near_copy',
+                        'majority_usable': 'paraphrase'})
+        ubi_inp.append({'pair_id': ipid, 'text': text, 'styled_text': text})
+    pd.DataFrame(ubi_ana).to_csv(ubi_dir / 'informal_label_analysis.csv',
+                                 index=False)
+    pd.DataFrame(ubi_inp).to_csv(ubi_dir / 'informal_label_input.csv',
+                                 index=False)
+
+    # --- paradetox: larger slice (noise-encoder test needs the n) ---------
+    pdx_rows = []
+    for i in range(200):
+        text, styled = _graded_pair(enc, f'pdx{i}', DGEO_KS[i % len(DGEO_KS)])
+        pdx_rows.append({'text': text, 'styled_text': styled})
+    pd.DataFrame(pdx_rows).to_parquet(tmp_path / 'paradetox.parquet')
+
+    # --- formality gold ----------------------------------------------------
+    gold_rows = []
+    for strategy in ('b_axis_informal', 'd_near_paradetox_neutral'):
+        for i, k in enumerate(DGEO_KS):
+            text, styled = _graded_pair(enc, f'{strategy}{i}', k)
+            gold_rows.append({'strategy': strategy, 'text': text,
+                              'formal_text': styled, 'gold_pass': True})
+    pd.DataFrame(gold_rows).to_parquet(tmp_path / 'formality_gold.parquet')
+
+    assets = BenchmarkAssets(
+        ub_formal_dir=str(ub_dir),
+        paradetox_path=str(tmp_path / 'paradetox.parquet'),
+        formality_gold_path=str(tmp_path / 'formality_gold.parquet'),
+        ub_informal_dir=str(ubi_dir))
+    return enc, assets
+
+
+DGEO_SLICES = ['ficbook', 'formality', 'news', 'paradetox', 'pikabu',
+               'taiga_proza', 'wikipedia']
+
+
+def test_axis_d_geometry_scoring(dgeo_synthetic):
+    enc, assets = dgeo_synthetic
+    card = score_encoder(enc, encoder_id='fake-v0', assets=assets,
+                         axes=('d_geometry',), n_boot=100)
+    assert list(card.columns) == SCORECARD_COLUMNS
+    assert sorted(card['slice'].unique()) == DGEO_SLICES
+    assert len(card) == 7 * 4  # rho + chrf_iqr + 2 length rows per slice
+
+    rho = card[card['metric'] == 'spearman_rho'].set_index('slice')
+    # coherent synthetic geometry -> strongly negative on every slice
+    assert (rho['value'] < -0.7).all()
+    assert (rho['ci_low'] <= rho['value']).all()
+    assert (rho['value'] <= rho['ci_high']).all()
+    # near_copy rows excluded from the pinned populations
+    assert rho.loc['news', 'n'] == 12
+    assert rho.loc['ficbook', 'n'] == 12
+    assert rho.loc['paradetox', 'n'] == 200
+    assert rho.loc['formality', 'n'] == 24
+
+    iqr = card[card['metric'] == 'chrf_iqr'].set_index('slice')['value']
+    assert (iqr > 0).all()
+    lens = card[card['metric'] == 'src_len_median_words'] \
+        .set_index('slice')['value']
+    assert (lens == 10).all()  # graded pairs are 10 words by construction
+
+
+def test_axis_d_geometry_points_artifact(dgeo_synthetic, tmp_path):
+    enc, assets = dgeo_synthetic
+    pts_path = tmp_path / 'dgeo_points.parquet'
+    card = score_encoder(enc, encoder_id='fake-v0', assets=assets,
+                         axes=('d_geometry',), n_boot=50,
+                         d_geometry_points_out=str(pts_path))
+    pts = pd.read_parquet(pts_path)
+    assert list(pts.columns) == ['slice', 'source_asset', 'pair_id',
+                                 'bucket', 'chrf', 'style_distance',
+                                 'src_len_words', 'src_len_chars',
+                                 'encoder_id']
+    assert (pts['src_len_words'] == 10).all()  # graded-pair construction
+    n_by_slice = card[card['metric'] == 'spearman_rho'] \
+        .set_index('slice')['n']
+    assert len(pts) == int(n_by_slice.sum())
+    assert (pts['encoder_id'] == 'fake-v0').all()
+    assert 'near_copy' not in set(pts['bucket'].dropna())
+    assert pts['pair_id'].notna().sum() > 0  # UB pair ids carried through
+
+
+def test_axis_d_geometry_uncorrelated_encoder(dgeo_synthetic):
+    """Degenerate encoder (distance independent of chrF) -> rho ~ 0."""
+    import zlib
+    _, assets = dgeo_synthetic
+
+    def noise_enc(texts):
+        return np.stack([
+            np.random.default_rng(zlib.crc32(t.encode())).normal(size=DIM)
+            for t in texts])
+
+    card = score_encoder(noise_enc, encoder_id='noise', assets=assets,
+                         axes=('d_geometry',), n_boot=50)
+    rho = card[card['metric'] == 'spearman_rho'].set_index('slice')['value']
+    assert abs(rho['paradetox']) < 0.25  # n=200: no spurious coherence
+
+
+def test_d_geometry_not_in_default_axes():
+    from tst_utils.eval.style_benchmark import AXIS_SCORERS, DEFAULT_AXES
+    assert 'd_geometry' in AXIS_SCORERS
+    assert 'd_geometry' not in DEFAULT_AXES  # Step 1.A is opt-in
 
 
 def test_unknown_axis_raises(synthetic):
