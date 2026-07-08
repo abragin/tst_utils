@@ -39,7 +39,7 @@ def labse_embeddings(texts, labse_model, labse_tokenizer, batch_size=16):
     with torch.no_grad():
         for batch in dataloader:
             # Move the batch to the same device as the model
-            batch = {k: v.to('cuda') for k, v in batch.items()}
+            batch = {k: v.to(labse_model.device) for k, v in batch.items()}
             # Perform inference
             outputs = labse_model(**batch)
             ems = F.normalize(outputs.pooler_output)
@@ -48,7 +48,8 @@ def labse_embeddings(texts, labse_model, labse_tokenizer, batch_size=16):
     return embeddings
 
 def calc_labse_embeddings(texts):
-    model = AutoModel.from_pretrained(LABSE_MODEL_NAME).cuda()
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = AutoModel.from_pretrained(LABSE_MODEL_NAME).to(device)
     tokenizer = AutoTokenizer.from_pretrained(LABSE_MODEL_NAME)
     model.eval()
     return labse_embeddings(texts, model, tokenizer)
