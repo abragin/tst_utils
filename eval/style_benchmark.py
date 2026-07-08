@@ -261,9 +261,14 @@ class BenchmarkAssets:
         phase17 = os.path.join(project_root, '17 phase style-v2')
         return cls(
             ub_formal_dir=os.path.join(infra, 'ub_benchmark'),
+            # VAL split only — the benchmark (b1 + paradetox d_geometry) must
+            # never see the train rows the Step-3 retrain consumes. Physical
+            # split materialised 2026-07-08 from the file's disjoint `split`
+            # column (train 6,702 / val 759); train file is
+            # ru_paradetox_pairs_train.parquet (training-only, never loaded here).
             paradetox_path=os.path.join(
                 project_root, 'data', 'sources_v2', 'pool',
-                'ru_paradetox_pairs.parquet'),
+                'ru_paradetox_pairs_val.parquet'),
             formality_gold_path=os.path.join(
                 infra, 'results', 'formality_gold_v1.parquet'),
             ub_informal_dir=os.path.join(phase17, 'ub_benchmark_informal'),
