@@ -269,8 +269,11 @@ class BenchmarkAssets:
             paradetox_path=os.path.join(
                 project_root, 'data', 'sources_v2', 'pool',
                 'ru_paradetox_pairs_val.parquet'),
+            # v2 (reserved-source, group-disjoint by construction) replaced
+            # v1 on 2026-07-10 — task 2026-07-08-pikabu-grouping-and-group-
+            # aware-val; v1 was ~fully inside the styled_pph_v2 source pool.
             formality_gold_path=os.path.join(
-                infra, 'results', 'formality_gold_v1.parquet'),
+                infra, 'results', 'formality_gold_v2.parquet'),
             ub_informal_dir=os.path.join(phase17, 'ub_benchmark_informal'),
             author_pairs_dir=os.path.join(phase17, 'author_pairs_benchmark'),
         )
@@ -343,8 +346,24 @@ def load_author_pairs(pairs_dir):
 
 
 def load_formality_gold(path):
-    df = pd.read_parquet(
-        path, columns=['strategy', 'text', 'formal_text', 'gold_pass'])
+    """Load the frozen formality-gold register asset — v1 or v2 schema.
+
+    v1 (``formality_gold_v1``, 2A.8.3 pilot chain): ``strategy/text/
+    formal_text/gold_pass`` — filter on ``gold_pass``; slice column is the
+    generation ``strategy``.
+    v2 (``formality_gold_v2``, reserved-source production chain, task
+    2026-07-08-pikabu-grouping): ``original_text/formal_text/generator`` —
+    every row is arbiter-accepted (no ``gold_pass``); slice column is the
+    ``generator``. The presence of ``generator`` without ``strategy`` in the
+    returned frame is what downstream axes branch on.
+    """
+    df = pd.read_parquet(path)
+    if 'original_text' in df.columns:  # v2 schema
+        df = df.rename(columns={'original_text': 'text',
+                                'formal_text': 'styled_text'})
+        df = df[['text', 'styled_text', 'generator']].reset_index(drop=True)
+        return df, file_version(path)
+    df = df[['strategy', 'text', 'formal_text', 'gold_pass']]
     df = df[df['gold_pass']].rename(
         columns={'formal_text': 'styled_text'}).reset_index(drop=True)
     return df, file_version(path)
@@ -511,11 +530,23 @@ def score_axis_b1(embed_fn, assets, *, seed, n_boot, max_pairs=None):
 def score_axis_b2(embed_fn, assets, *, seed, n_boot):
     """Axis (b2): formality-gold register axis (informal->formal, pikabu).
 
-    ``clean`` slice = strategy b_axis_informal only; ``strategy_d`` =
-    d_near_paradetox_neutral rows, reported separately because of the
-    documented contamination caveat (corpus-vs-register confound)."""
+    v1 asset: ``clean`` slice = strategy b_axis_informal only; ``strategy_d``
+    = d_near_paradetox_neutral rows, reported separately because of the
+    documented contamination caveat (corpus-vs-register confound).
+    v2 asset (single production chain, no strategies): one ``all`` slice +
+    per-generator slices."""
     df, version = load_formality_gold(assets.formality_gold_path)
     rows = []
+    if 'generator' in df.columns:  # v2 asset
+        slices = [('all', df)] + [
+            (gen, df[df['generator'] == gen].reset_index(drop=True))
+            for gen in sorted(df['generator'].unique())]
+        for slice_, sub in slices:
+            rows += _score_paired_axis(
+                sub, axis='b2_formality', slice_=slice_,
+                label_source='formality_gold_v2(arbiter)', embed_fn=embed_fn,
+                asset_version=version, seed=seed, n_boot=n_boot)
+        return rows
     for slice_, strategy in (('clean', 'b_axis_informal'),
                              ('strategy_d', 'd_near_paradetox_neutral')):
         sub = df[df['strategy'] == strategy].reset_index(drop=True)
@@ -715,10 +746,16 @@ def d_geometry_slices(assets):
             slice=source, df=norm(sub, pair_id='pair_id', bucket='bucket'),
             source_asset='ub_benchmark_informal', asset_version=i_version,
             label_source='bucket_design'))
-    slices.append(dict(
-        slice='formality', df=norm(gold, bucket='strategy'),
-        source_asset='formality_gold_v1', asset_version=g_version,
-        label_source='formality_gold_v1(arbiter)'))
+    if 'generator' in gold.columns:  # v2 asset
+        slices.append(dict(
+            slice='formality', df=norm(gold, bucket='generator'),
+            source_asset='formality_gold_v2', asset_version=g_version,
+            label_source='formality_gold_v2(arbiter)'))
+    else:
+        slices.append(dict(
+            slice='formality', df=norm(gold, bucket='strategy'),
+            source_asset='formality_gold_v1', asset_version=g_version,
+            label_source='formality_gold_v1(arbiter)'))
     slices.append(dict(
         slice='paradetox', df=norm(paradetox),
         source_asset='ru_paradetox_pairs', asset_version=p_version,
