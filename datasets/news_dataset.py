@@ -41,6 +41,12 @@ class NewsDataset(torch.utils.data.IterableDataset):
         self.style_emb = style_emb
         self.debug = debug
 
+    # BROKEN since commit 381cc06 (2025-10-23): BooksIterableDataset now requires
+    # `length_sampler` and rejects min_tok_len / avg_tok_len / max_tok_len, so
+    # iteration raises TypeError. To fix, pass
+    # length_sampler=GammaLengthSampler(mean_len=avg_tok_len, min_len=min_tok_len,
+    # max_len=max_tok_len) instead of the three kwargs. Only the superseded
+    # training code of folders 08 and 09 uses this class (checked 2026-09-24).
     def load_next_news_file(self, file):
         compr = 'gzip' if file.endswith('.gz') else None
         news_df = pd.read_csv(file, compression=compr)
