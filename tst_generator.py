@@ -166,9 +166,10 @@ class TSTGenerator:
         # from the last position, so right pads would sit between the prompt
         # and the continuation and degrade the output with no error. Do not
         # rely on the tokenizer default: rugpt3small ships 'left', but
-        # eval/metrics/naturality.py sets the same tokenizer to 'right' on
-        # purpose (batch-invariant CE). A per-call argument leaves the caller's
-        # tokenizer unmutated. See docs/issues/resolved/tstgenerator-gpt-padding-side.md.
+        # eval/metrics/naturality.py sets its own instance of the same base
+        # model's tokenizer to 'right' on purpose (batch-invariant CE). A
+        # per-call argument leaves the caller's tokenizer unmutated. See
+        # docs/issues/resolved/tstgenerator-gpt-padding-side.md.
         # T5 branches: an encoder-decoder attends to the whole input, so the
         # side does not matter there.
         if style_token is None:
