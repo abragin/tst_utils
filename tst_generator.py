@@ -162,13 +162,22 @@ class TSTGenerator:
         via the ``style=`` generate kwarg). ``style_token`` set -> author-tag
         path, where the tag is woven into the text itself.
         """
+        # GPT pads on the LEFT, passed per call. A decoder-only model continues
+        # from the last position, so right pads would sit between the prompt
+        # and the continuation and degrade the output with no error. Do not
+        # rely on the tokenizer default: rugpt3small ships 'left', but
+        # eval/metrics/naturality.py sets the same tokenizer to 'right' on
+        # purpose (batch-invariant CE). A per-call argument leaves the caller's
+        # tokenizer unmutated. See docs/issues/resolved/tstgenerator-gpt-padding-side.md.
+        # T5 branches: an encoder-decoder attends to the whole input, so the
+        # side does not matter there.
         if style_token is None:
             # Embeddings path: GPT gets a trailing eos; T5 takes the raw text.
             if self.model_type == "GPT":
                 ipt = self.tokenizer(
                     [t + self.tokenizer.eos_token for t in batch_texts],
                     return_tensors="pt", padding=True, truncation=True,
-                    max_length=self.max_input_length,
+                    max_length=self.max_input_length, padding_side="left",
                 )
             else:  # T5
                 ipt = self.tokenizer(
@@ -196,6 +205,7 @@ class TSTGenerator:
             ]
             ipt = self.tokenizer.pad(
                 {"input_ids": batch_input_ids}, padding=True, return_tensors="pt",
+                padding_side="left",
             )
         else:  # T5 — tag is at the front, simple truncation is safe
             inputs = [style_token + " " + txt for txt in batch_texts]

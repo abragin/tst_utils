@@ -9,7 +9,9 @@ input ids back as the "generated" sequence. That is enough to prove:
   decoder ``max_length=max_output_length`` (T5) — decoupled from the input,
 - the GPT author-tags path keeps the trailing style tag even when the input
   is longer than ``max_input_length`` (the bug this refactor fixes),
-- the old ``max_length`` / ``min_length`` kwargs hard-fail with ValueError.
+- the old ``max_length`` / ``min_length`` kwargs hard-fail with ValueError,
+- both GPT paths pad on the left even when the caller's tokenizer is set to
+  right padding, and the caller's tokenizer is not mutated.
 """
 import numpy as np
 import pytest
@@ -162,6 +164,42 @@ def test_nonactive_length_key_does_not_clash(gpt_tokenizer):
     gen.perform_tst(["слово"], target_style="News")  # must not raise
     assert model.last_call["kwargs"]["max_length"] == 50
     assert model.last_call["kwargs"]["max_new_tokens"] == 24
+
+
+@pytest.fixture
+def right_padded_gpt_tokenizer():
+    # A fresh instance: the module-scoped gpt_tokenizer must not be mutated.
+    # naturality.calculate_perplexity sets this same base tokenizer to right
+    # padding on purpose, so a right-padded GPT tokenizer is a real input.
+    tok = AutoTokenizer.from_pretrained(GPT_NAME)
+    tok.add_special_tokens({"additional_special_tokens": ["<news>"]})
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "right"
+    return tok
+
+
+@pytest.mark.parametrize("path", ["embeddings", "author_tags"])
+def test_gpt_pads_left_regardless_of_tokenizer_side(right_padded_gpt_tokenizer, path):
+    """A decoder-only model continues from the last position, so every GPT row
+    must end with a real token: the pads go on the left."""
+    tok = right_padded_gpt_tokenizer
+    model = FakeModel()
+    gen = TSTGenerator(
+        model, tok,
+        target_styles=["News"] if path == "author_tags" else None,
+        model_type="GPT",
+        style_emb_dict={"News": np.ones(8, dtype=np.float32)} if path == "embeddings" else None,
+        batch_size=4, generate_options={},
+        max_input_length=32, max_output_length=24, min_output_length=5,
+    )
+    gen.perform_tst(["слово", "слово " * 10], target_style="News")
+
+    mask = model.last_call["attention_mask"]
+    assert bool((mask[0] == 0).any()), "the short row must carry pads, or the test proves nothing"
+    assert bool((mask[:, -1] == 1).all()), "pads on the right: a row ends with a pad"
+    assert mask[0, 0] == 0, "the short row must start with its pads"
+    assert tok.padding_side == "right", "the caller's tokenizer was mutated"
 
 
 def test_old_max_length_kwarg_raises(gpt_tokenizer):
