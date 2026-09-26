@@ -477,6 +477,26 @@ def _score_paired_axis(df, *, axis, slice_, label_source, embed_fn,
       projects higher on the axis.
     - ``paired_step_median``: median within-pair style movement
       ``1 - sim(text, styled)``.
+
+    Two limits of this probe, before you read a high number as quality
+    (measured 2026-09-26 on the Style-v2 cards; see
+    ``docs/phases/phase-style-v2.md`` sections 1 and 4):
+
+    1. The axis is fitted IN-DISTRIBUTION: the direction comes from the
+       same asset it is then scored on, so ``axis_auc`` and
+       ``paired_axis_acc`` measure whether one scalar projection reads the
+       attribute WITHIN that asset. They do not measure transfer to other
+       data. On ``formality_gold_v2`` (axis b2) the probe SATURATES on
+       ``ruBert-style-base`` already: ``paired_axis_acc`` is exactly 1.0
+       on every slice and ``axis_auc`` is 0.9994, so that axis has no
+       headroom left for any encoder comparison. Axis b1 (paradetox) does
+       have headroom (base ``axis_auc`` 0.774).
+    2. ``paired_step_median`` is a MAGNITUDE, not a separability measure,
+       and it has no reference value, so a larger step is not better by
+       itself. It can track the distance scale of the encoder rather than
+       the attribute: on ``ruBert-style-base`` the b1 and b2 assets differ
+       by 2.1x (0.0543, 0.1141), and on style-encoder-v2 both converge to
+       0.187. Do not gate on it.
     """
     rng = np.random.default_rng(seed)
     idx = rng.permutation(len(df))
