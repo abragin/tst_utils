@@ -14,6 +14,7 @@ class BooksDataset(torch.utils.data.Dataset):
         *,
         max_side_length = None,  # per-side token limit (passed through to ChapterDataset)
         max_length = None,  # renamed -> max_side_length; sentinel for the old name
+        allow_tokenizer_mismatch = False,  # passed through to ChapterDataset
     ):
         if max_length is not None:
             raise ValueError(
@@ -35,7 +36,8 @@ class BooksDataset(torch.utils.data.Dataset):
                 model_type = model_type,
                 length_sampler = length_sampler,
                 max_side_length = max_side_length,
-                style_vector = style_dict[chapter_df.iloc[0].author] if style_dict else None
+                style_vector = style_dict[chapter_df.iloc[0].author] if style_dict else None,
+                allow_tokenizer_mismatch = allow_tokenizer_mismatch
             ))
         self.total_length = sum(len(dataset) for dataset in self.chapter_datasets)
         self.positions = []
@@ -79,6 +81,7 @@ class BooksIterableDataset(torch.utils.data.IterableDataset):
         *,
         max_side_length = None,  # per-side token limit (passed through to BooksDataset)
         max_length = None,  # renamed -> max_side_length; sentinel for the old name
+        allow_tokenizer_mismatch = False,  # passed through to BooksDataset
     ):
         if max_length is not None:
             raise ValueError(
@@ -99,7 +102,8 @@ class BooksIterableDataset(torch.utils.data.IterableDataset):
             target_col = target_col,
             length_sampler = length_sampler,
             max_side_length = max_side_length,
-            style_dict = style_dict
+            style_dict = style_dict,
+            allow_tokenizer_mismatch = allow_tokenizer_mismatch
         )
         self.index = list(range(self.books_dataset.total_length))
         np.random.shuffle(self.index)

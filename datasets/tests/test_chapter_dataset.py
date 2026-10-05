@@ -1,4 +1,7 @@
-from tst_utils.datasets import ChapterDataset, GammaLengthSampler
+from tst_utils.datasets import (
+    BooksDataset, BooksIterableDataset, ChapterDataset, GammaLengthSampler
+)
+from tst_utils.datasets.chapter_dataset import TOKENIZER_PROBE_SENTENCE
 import pandas as pd
 import numpy as np
 import pytest
@@ -250,3 +253,89 @@ def test_gpt_with_style_vector():
     assert (
         decoded == expected_input
     ), "Incorrect source input_ids values"
+
+
+# ---- tokenizer / model_type guard --------------------------------------
+# The two tokenizers used across the repository: ruT5 ends a sentence with EOS,
+# rugpt3small does not. Both have EOS id 2, so only the EOS tail tells them apart.
+chapter_kwargs = dict(
+    source_cols=['text_source_opt1'],
+    length_sampler=length_sampler,
+    max_side_length=max_side_length,
+)
+books_df = test_df.assign(title='Book', chapter_pos=0)
+
+
+def fresh_tokenizer(model_name):
+    # no author tags, unlike the module-level tokenizers
+    return AutoTokenizer.from_pretrained(model_name)
+
+
+def test_probe_sentence_ends_with_eos_only_for_the_t5_tokenizer():
+    for model_name, expected in [(model_name_t5, True), (model_name_gpt, False)]:
+        tok = fresh_tokenizer(model_name)
+        assert (tok.encode(TOKENIZER_PROBE_SENTENCE)[-1] == tok.eos_token_id) is expected
+        assert tok.eos_token_id == 2
+
+
+@pytest.mark.parametrize("with_tags", [True, False])
+@pytest.mark.parametrize("model_name, model_type", [
+    (model_name_t5, 'T5'), (model_name_gpt, 'GPT'),
+])
+def test_matching_pairs_pass_with_and_without_author_tags(model_name, model_type, with_tags):
+    tok = fresh_tokenizer(model_name)
+    if with_tags:
+        tok.add_special_tokens({'additional_special_tokens': author_tags})
+    ChapterDataset(test_df, tokenizer=tok, model_type=model_type, **chapter_kwargs)
+
+
+def test_gpt2_tokenizer_with_t5_model_type_raises():
+    with pytest.raises(ValueError) as exc:
+        ChapterDataset(test_df, tokenizer=tokenizer_gpt, model_type='T5', **chapter_kwargs)
+    message = str(exc.value)
+    assert model_name_gpt in message and "model_type='T5'" in message
+    assert "last real token" in message and "no separator" in message
+
+
+def test_t5_tokenizer_with_gpt_model_type_raises():
+    with pytest.raises(ValueError) as exc:
+        ChapterDataset(test_df, tokenizer=tokenizer, model_type='GPT', **chapter_kwargs)
+    message = str(exc.value)
+    assert model_name_t5 in message and "model_type='GPT'" in message
+    assert "EOS id stands inside the sequence" in message
+
+
+def test_keyword_restores_the_old_mismatched_behaviour():
+    # This is the build that the deliberate call sites reproduce: the last id of
+    # each sentence is cut and the sentences are joined with no separator.
+    dataset = ChapterDataset(
+        test_df, tokenizer=tokenizer_gpt, model_type='T5',
+        allow_tokenizer_mismatch=True, **chapter_kwargs
+    )
+    dataset.segment_ranges = [(0, 3)]
+    assert tokenizer_gpt.decode(dataset[0]['labels'], skip_special_tokens=True) == (
+        'Первый текст - оригиналВторой текст - оригиналТретий текст - оригинал'
+    )
+
+
+@pytest.mark.parametrize("allow_tokenizer_mismatch", [False, True])
+def test_tokenizer_without_eos_raises_even_with_the_keyword(allow_tokenizer_mismatch):
+    tok = fresh_tokenizer(model_name_gpt)  # a fresh one: the special-token map is shared by copies
+    tok.eos_token = None
+    assert tok.eos_token_id is None
+    with pytest.raises(ValueError, match="no `eos_token_id`"):
+        ChapterDataset(
+            test_df, tokenizer=tok, model_type='GPT',
+            allow_tokenizer_mismatch=allow_tokenizer_mismatch, **chapter_kwargs
+        )
+
+
+@pytest.mark.parametrize("cls", [BooksDataset, BooksIterableDataset])
+def test_books_wrappers_pass_the_keyword_through(cls):
+    kwargs = dict(
+        tokenizer=tokenizer_gpt, source_cols=['text_source_opt1'], model_type='T5',
+        length_sampler=length_sampler, max_side_length=max_side_length,
+    )
+    with pytest.raises(ValueError, match="does not end an encoded sentence"):
+        cls(books_df, **kwargs)
+    cls(books_df, allow_tokenizer_mismatch=True, **kwargs)
