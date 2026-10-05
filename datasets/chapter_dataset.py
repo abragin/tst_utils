@@ -14,6 +14,10 @@ def check_tokenizer_matches_model_type(tokenizer, model_type):
     The 'T5' path slices the last id of every sentence as if it were EOS, so
     the tokenizer must end a sentence with EOS. The 'GPT' path keeps every id
     and joins sentences with `encode(' ')[0]`, so the tokenizer must not.
+
+    The check reads the EOS tail only. It does not see a tokenizer that
+    prepends a BOS id (the 'GPT' joining id and every chunk would start with
+    it), and it does not check the joining id. No caller has such a tokenizer.
     """
     name = getattr(tokenizer, 'name_or_path', None) or type(tokenizer).__name__
     eos_id = tokenizer.eos_token_id
