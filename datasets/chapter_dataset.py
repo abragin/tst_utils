@@ -51,7 +51,7 @@ class ChapterDataset(torch.utils.data.Dataset):
         length_sampler,
         model_type,
         max_tok_len = None, # Disired max token length of source and target texts (not guaranteed)
-        target_col = 'text_ru',
+        target_col = 'text_ru', # FIXME: BooksDataset does not pass this; see docs/issues/booksdataset-drops-target-col.md
         style_vector = None,
         *,
         max_side_length = None, # per-side token limit (source and target each truncated to it; for GPT they are concatenated so the training sequence is ~2x this)

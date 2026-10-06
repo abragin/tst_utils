@@ -29,6 +29,8 @@ class BooksDataset(torch.utils.data.Dataset):
         grouped = books_df.groupby(['author', 'title', 'chapter_pos'])
         self.chapter_datasets = []
         for _, chapter_df in tqdm(grouped, disable=disable_tqdm):
+            # FIXME: target_col is not passed, so ChapterDataset always reads
+            # 'text_ru'. See docs/issues/booksdataset-drops-target-col.md.
             self.chapter_datasets.append(ChapterDataset(
                 chapter_df,
                 tokenizer = tokenizer,
@@ -99,6 +101,8 @@ class BooksIterableDataset(torch.utils.data.IterableDataset):
             tokenizer = tokenizer,
             source_cols = source_cols,
             model_type = model_type,
+            # FIXME: BooksDataset drops target_col; see
+            # docs/issues/booksdataset-drops-target-col.md.
             target_col = target_col,
             length_sampler = length_sampler,
             max_side_length = max_side_length,

@@ -57,6 +57,8 @@ class NewsDataset(torch.utils.data.IterableDataset):
             tokenizer = self.tokenizer,
             source_cols = self.source_cols,
             model_type = self.model_type,
+            # FIXME: BooksDataset drops target_col, so this value has no
+            # effect; see docs/issues/booksdataset-drops-target-col.md.
             target_col = self.target_col,
             min_tok_len = self.min_tok_len,
             avg_tok_len = self.avg_tok_len,
