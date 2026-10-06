@@ -13,6 +13,29 @@ Two scorers (same return contract):
                             BI/CL (zero drift, ~1.8×), mBERT for filtering/gender.
                             See the class docstring for the rationale.
 
+Model revisions — both SimAlign loads stay unpinned
+--------------------------------------------------
+SentenceAligner.__init__ takes model, token_type, distortion, matching_methods,
+device and layer. It takes no revision, so SimAlign names and loads the model, and
+neither call site here can pin one:
+
+  - AlignmentScorer builds its aligner in _make_aligner.
+  - BatchedAligner builds self._sa in its constructor. **This is the production path
+    and the path tst_utils/eval/tests/test_performance_golden.py uses.**
+
+Which models this reaches: the default model alias is "bert", which SimAlign maps to
+bert-base-multilingual-cased. The golden builds BatchedAligner with
+ai-forever/ruRoberta-large at layer 8 and a cointegrated/rubert-tiny2 fallback at
+layer 3. Measured in tallin's cache on 2026-10-06: ruRoberta-large holds two
+snapshots (5192d064..., cc30a74b...), rubert-tiny2 holds two (dad72b8f...,
+e8ed3b0c...), and bert-base-multilingual-cased holds one
+(3f076fdb1ab68d5b2880cb87a0886f315b8146f8). Two cached snapshots mean two candidate
+instruments under one name.
+
+Each class also re-loads the tokenizer when add_prefix_space is False, and those two
+calls are deliberately left unpinned: a tokenizer pin would not cover the weights,
+so it would suggest a guarantee the load does not give.
+
 Usage:
     scorer = AlignmentScorer()
     results = scorer.score_batch(sources, targets)

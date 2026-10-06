@@ -48,6 +48,11 @@ Three complementary approaches:
       - Graded score, no string-similarity threshold needed.
     Returned only when use_bert_score=True.
     Edge cases: no NE tokens on a side → that side's score = 1.0 (vacuous).
+    ⚠ The vacuous case is common, not rare. 13,376 of 29,969 texts over six
+    classes produced no active-type entity: 44.6 %, measured in task 4.2. So a
+    model revision that loses NER recall moves scores toward 1.0 and raises no
+    error. The module has no alarm for an empty NER result, by a host decision of
+    2026-10-06. A silent move toward 1.0 is the failure mode to expect here.
 
 Known blind spots:
   - Rivers, waterways, mountains, organizations (Gherman NER has no such types).
@@ -64,6 +69,20 @@ Validation (llm_analysis_combined.csv, n=451 after ground-truth filtering, 22.6%
   Binary threshold (combined_entity_score < 1.0): P=0.264 R=1.000 (zero FNs).
   See notebook 09 entity consistency analysis.ipynb for full results.
 
+Model provenance of the figures above
+-------------------------------------
+The NER load is pinned to NER_REVISION, fc6b2c5a2c5d7c82da7416f7fd9c055159bbb984.
+The figures predate that pin, so they are not attributed to a measured snapshot.
+What is measured: on 2026-10-06 the unpinned load resolved the same hash, that hash
+is the only snapshot in tallin's cache, and the snapshot symlink carries the date
+2026-04-08. That date shows the first download on that machine. It does not prove
+that these figures came from this snapshot.
+
+P=0.341 has no second source. R=0.848 is corroborated twice: by the v1.2 entry of
+2026-04-14 in docs/tasks/complete/2026-04-08-entity-substitution-metric/task.md,
+and by docs/evaluation.md § 6, which heads the same figures "Validation (v1.1
+scorer)".
+
 Dependencies: transformers (Gherman NER), difflib (stdlib), and optionally
   sentence_transformers (LaBSE), tst_utils.eval.bi_cl_cleaner (BiClEnsemble),
   transformers AutoModel (Approach D BERTScore).
@@ -74,6 +93,8 @@ from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
+from tst_utils.eval.model_names import LABSE_REVISION
 
 LOG = logging.getLogger(__name__)
 
@@ -86,6 +107,11 @@ ACTIVE_TYPES = PERSON_TYPES | LOCATION_TYPES
 # All person-name entity types including the merged "PERSON" type produced
 # when consecutive FIRST/MIDDLE/LAST tokens are joined into one span.
 _ALL_PERSON_TYPES = PERSON_TYPES | {"PERSON"}
+
+# The Hub commit that _load_ner pins. Measured on tallin on 2026-10-06: the only
+# snapshot in the cache, and the value the unpinned load already resolved. The
+# model name stays inline in _load_ner; it is not in tst_utils/eval/model_names.py.
+NER_REVISION = "fc6b2c5a2c5d7c82da7416f7fd9c055159bbb984"
 
 
 def _string_sim(a: str, b: str) -> float:
@@ -179,6 +205,7 @@ class EntityConsistencyScorer:
         return pipeline(
             "ner",
             model="Gherman/bert-base-NER-Russian",
+            revision=NER_REVISION,
             aggregation_strategy="simple",
             device=device_id,
         )
@@ -225,7 +252,11 @@ class EntityConsistencyScorer:
             from sentence_transformers import SentenceTransformer
         except ImportError:
             raise ImportError("sentence_transformers is required for use_labse=True.")
-        self._labse = SentenceTransformer("cointegrated/LaBSE-en-ru", device=self.device)
+        self._labse = SentenceTransformer(
+            "cointegrated/LaBSE-en-ru",
+            revision=LABSE_REVISION,
+            device=self.device,
+        )
         LOG.info("LaBSE loaded")
 
     def _ensure_bert_scorer(self):
@@ -244,6 +275,11 @@ class EntityConsistencyScorer:
             except ImportError:
                 raise ImportError("transformers is required for use_bert_score=True.")
             import torch
+            # Unpinned by a host decision of 2026-10-06. No call site in the
+            # repository passes a string to bert_score_model, so a revision
+            # argument here would be a path nothing exercises. The default
+            # bert_score_model=None path reuses the NER encoder above, and
+            # NER_REVISION therefore covers it.
             tokenizer = AutoTokenizer.from_pretrained(self.bert_score_model)
             model = AutoModel.from_pretrained(self.bert_score_model)
             model = model.to(self.device).eval()

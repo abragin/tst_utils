@@ -114,3 +114,39 @@ class TestNaturalityScore:
         score = naturality_score(src, src)
         # absolute penalty: 1/(8*(5-4)+1) = 1/9 ≈ 0.111; rel = 1 → score = sqrt(0.111) ≈ 0.333
         assert score == pytest.approx(np.sqrt(1 / 9), abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Model revision guard
+# ---------------------------------------------------------------------------
+
+class TestModelRevision:
+    """The perplexity load is unpinned, so this test watches the default branch.
+
+    calculate_perplexity builds its model inside the function and returns
+    (likelihoods, weights), so it exposes no config. This test therefore performs
+    its own load. That is one extra model load in the suite, and it is deliberate.
+
+    The expected value is refs/main as measured on tallin on 2026-10-06. A failure
+    here means the default branch of the Hub repository moved, not that the code
+    broke. Read docs/inbox/2026-10-06-unpinned-load-mixes-two-commits.md before you
+    change the expected value: the model loads its config and its weights from two
+    different commits, and this hash is the config's commit only.
+
+    The test needs the Hub to be reachable. With a warm cache and no network, the
+    load resolves the cached snapshot and the assertion passes without checking the
+    Hub.
+    """
+
+    EXPECTED_CONFIG_REVISION = 'a9307e696cd3c5b7f953ff4cb19d76a4d81821d5'
+
+    def test_perplexity_model_config_revision(self):
+        from transformers import AutoModelForCausalLM
+
+        from tst_utils.eval.model_names import PERPL_MODEL_NAME
+
+        model = AutoModelForCausalLM.from_pretrained(
+            PERPL_MODEL_NAME,
+            use_safetensors=True,
+        )
+        assert model.config._commit_hash == self.EXPECTED_CONFIG_REVISION

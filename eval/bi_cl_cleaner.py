@@ -1,6 +1,26 @@
 """
 BI/CL span removal using a soft ensemble of SimAlign density and a fine-tuned token classifier.
 
+Model provenance — the classifier path is ambiguous, the SimAlign load is unpinnable
+-----------------------------------------------------------------------------------
+BiClEnsemble loads its token classifier from a local directory, and a local path is
+weaker than a revision, because it is not content addressed. Two candidate
+directories exist and nothing records which one a past run loaded. Measured on
+2026-10-06:
+
+    15 metrics exploration/data/bi_cl_model/best
+    15 metrics exploration/data/bi_cl_model/continued/best
+
+Both hold the same seven file names, and model.safetensors is 116,393,320 bytes in
+both. Only training_args.bin differs: 5,432 bytes against 5,496. So the weights
+cannot be told apart by size, and the caller's path string is the whole record of
+which model ran. A host decision of 2026-10-06 leaves this as a docstring record,
+with no hash and no check.
+
+The SimAlign load in the constructor names cointegrated/rubert-tiny2 as a literal and
+cannot pin it: SentenceAligner takes no revision argument. Tallin's cache holds two
+snapshots of that model.
+
 Usage:
     from tst_utils.eval.bi_cl_cleaner import BiClEnsemble, remove_bi_span_greedy
 
@@ -494,6 +514,8 @@ class BiClEnsemble:
         self._AlignmentScorer = AlignmentScorer
 
         # SimAlign — rubert-tiny2, layer=3 (model has only 4 layers; default 8 crashes)
+        # Unpinnable: SentenceAligner takes no revision argument. See the module
+        # docstring. Tallin's cache holds two snapshots of this model.
         self._sa_aligner = SentenceAligner(
             model="cointegrated/rubert-tiny2",
             token_type="word",

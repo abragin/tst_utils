@@ -1,8 +1,30 @@
+"""
+Meaning preservation: LaBSE cosine similarity, BERTScore F1 and a length penalty.
+
+Model revisions
+---------------
+The LaBSE loads in calc_labse_embeddings pass revision=LABSE_REVISION, so they name
+their Hub commit at every run.
+
+The BERTScore path does not, and it cannot by argument. b_score calls
+bert_score.score(..., lang='ru'), and the library names and loads the model itself:
+lang2model is a defaultdict whose fallback is bert-base-multilingual-cased, so 'ru'
+resolves that model, and model2layers gives layer 9. bert_score.score takes no
+revision parameter. Tallin's cache holds one snapshot of that model,
+3f076fdb1ab68d5b2880cb87a0886f315b8146f8, measured on 2026-10-06.
+
+What pins the BERTScore path instead is the library version. It is recorded in
+docs/environment_pip.txt and checked by tools/check_tallin_drift.sh. Read that
+version with importlib.metadata.version('bert-score') and never with
+bert_score.__version__: on tallin the metadata reports 0.3.13 and the attribute
+reports 0.3.12, so the attribute lags the installed distribution.
+"""
+
 from datasets import Dataset
 import numpy as np
 import pandas as pd
 import bert_score
-from tst_utils.eval.model_names import LABSE_MODEL_NAME
+from tst_utils.eval.model_names import LABSE_MODEL_NAME, LABSE_REVISION
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -49,8 +71,8 @@ def labse_embeddings(texts, labse_model, labse_tokenizer, batch_size=16):
 
 def calc_labse_embeddings(texts):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = AutoModel.from_pretrained(LABSE_MODEL_NAME).to(device)
-    tokenizer = AutoTokenizer.from_pretrained(LABSE_MODEL_NAME)
+    model = AutoModel.from_pretrained(LABSE_MODEL_NAME, revision=LABSE_REVISION).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(LABSE_MODEL_NAME, revision=LABSE_REVISION)
     model.eval()
     return labse_embeddings(texts, model, tokenizer)
 

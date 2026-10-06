@@ -1,3 +1,42 @@
+"""
+Naturality: mean per-token cross-entropy loss from rugpt3small.
+
+Model revision — this load stays unpinned, and a test guards it
+---------------------------------------------------------------
+calculate_perplexity loads PERPL_MODEL_NAME with no revision, by a host decision of
+2026-10-06. The reason is that the model loads from two commits at once, so a pin
+would change which files the load reads:
+
+  - a9307e696cd3c5b7f953ff4cb19d76a4d81821d5 is refs/main. It holds the config, the
+    tokenizer files and pytorch_model.bin. It holds no safetensors file.
+  - 0dc3542988c6f6475797ce6d019dce7cb0081e86 holds a config and model.safetensors,
+    and no tokenizer file.
+
+With use_safetensors=True the unpinned load takes its config from the first commit
+and its weights from the second. Measured on tallin on 2026-10-06, by a patch on
+transformers.modeling_utils.load_state_dict, which named
+snapshots/0dc3542988.../model.safetensors as the file it opened. A load pinned to
+a9307e696c... raises OSError, because no safetensors file exists at that revision.
+
+Two consequences:
+
+  1. The obvious pin value, the hash the unpinned load reports, breaks the load. A
+     pin taken from refs/main or from config._commit_hash must be tested by loading
+     it.
+  2. config._commit_hash names the commit the config resolved at, and says nothing
+     about the weights. A test that asserts it proves which config was used, and
+     not which weights.
+
+So a pin here would move the config and the tokenizer to 0dc3542988..., which is the
+only behaviour change the pinning task would have made, against a golden that scores
+six texts in four configurations. Instead test_naturality.py asserts the config
+revision. A moved default branch then fails in the test rather than silently in a
+score. That assertion needs the Hub to be reachable: with a warm cache and no
+network, the load resolves the cached snapshot and the test passes.
+
+See docs/inbox/2026-10-06-unpinned-load-mixes-two-commits.md.
+"""
+
 from tst_utils.eval.model_names import PERPL_MODEL_NAME
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM

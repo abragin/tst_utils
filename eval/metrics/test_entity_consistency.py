@@ -304,3 +304,37 @@ class TestSpanMerging:
             "Пётр Петров пошёл домой.",
         )
         assert r["has_substitution"] is True
+
+
+# ---------------------------------------------------------------------------
+# Model revision guards
+#
+# What these two tests detect, and what they do not. Each load is pinned to its
+# constant, so config._commit_hash returns that constant by construction. The test
+# therefore catches the removal of the revision= argument, and it catches it only
+# after the Hub default branch has moved away from the pinned commit. It does not
+# fire when the default branch moves while the argument is in place: that is what
+# the pin is for. A host decision of 2026-10-06 chose this guard over a second,
+# unpinned load that would compare the two hashes.
+#
+# config._commit_hash names the commit the config resolved at. It says nothing
+# about which weights loaded. See docs/inbox/2026-10-06-unpinned-load-mixes-two-commits.md.
+# ---------------------------------------------------------------------------
+
+class TestModelRevisions:
+    def test_ner_loads_at_pinned_revision(self, scorer):
+        """_load_ner passes revision=NER_REVISION, so the config resolves there."""
+        from tst_utils.eval.metrics.entity_consistency import NER_REVISION
+
+        assert scorer._ner.model.config._commit_hash == NER_REVISION
+
+    def test_labse_loads_at_pinned_revision(self, scorer_labse):
+        """_ensure_labse passes revision=LABSE_REVISION.
+
+        LaBSE loads lazily, so the assertion follows a call that triggers the load.
+        """
+        from tst_utils.eval.model_names import LABSE_REVISION
+
+        scorer_labse.score_pair("Жилин пошёл домой.", "Жилин пошёл домой.")
+        assert scorer_labse._labse is not None
+        assert scorer_labse._labse[0].auto_model.config._commit_hash == LABSE_REVISION
