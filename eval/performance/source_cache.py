@@ -18,14 +18,15 @@ def ensure_source_caches(df, *, perplexity=False, style_emb=False, labse_emb=Fal
     the rugpt3 perplexity batch size (lower it to fit a small GPU — its per-batch
     logits tensor dominates VRAM; see styled_pph_gen's 8 GB path).
 
-    CAVEAT — a stored cache column is TRUSTED VERBATIM (compute-if-absent): if
-    ``df`` already carries e.g. ``text_style_emb``, it is used as-is and NOT
-    re-derived from ``df.text``, so a stale/desynced stored vector silently wins
-    over a fresh recompute. Some legacy pools ship a ``text_style_emb`` that does
-    not match their own ``text`` (see
-    the ficbook-text_style_emb-desync task in the main repo's docs/tasks/complete/). When feeding a
-    pool of uncertain provenance, DROP the cache column first so it is recomputed
-    fresh from ``text`` (``text`` is the ground truth)."""
+    Compute-if-absent stays: a present ``text_style_emb`` is used as-is and
+    NOT re-derived from ``df.text``. The entry guards
+    (``TstPerformanceMetrics.execute``, ``PphGenerator.execute``) have already
+    removed every untrusted stored column before this runs. Excluded sites,
+    each with its reason: ``gen_v2_orchestrator.py`` (``load_pool`` reads only
+    author, domain, text), ``confirm_b5.py:68`` (a micro-benchmark that drops
+    the cached columns itself), and the phase-2A scripts that call
+    ``scoring.add_perplexity_scores`` / ``add_style_scores`` directly (task
+    5.2 checks them before the pin moves)."""
     if perplexity and 'text_perplexity' not in df:
         df['text_perplexity'] = calculate_perplexity(
             df.text, batch_size=perplexity_batch_size)[0]

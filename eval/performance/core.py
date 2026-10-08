@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 from tst_utils.eval.metrics.meaning import meaning_score
 from tst_utils.eval.metrics.composite import base_score_v2, compute_nat_v2
+from tst_utils.eval.data.style_store import guard_inline_style_columns
 from tst_utils.eval.performance.constants import TARGET_STYLES, _SCORE_COLS, _QUALITY_COLS
 from tst_utils.eval.performance.reshape import expand_tst_output
 from tst_utils.eval.performance.source_cache import ensure_source_caches
@@ -324,7 +325,7 @@ class TstPerformanceMetrics:
 
         return add_chrf(df)
 
-    def execute(self) -> None:
+    def execute(self, source_style_path=None) -> None:
         """Run the score_v1 pipeline, in order:
 
             add_source_ppx_and_emb()   # cache source perplexity/style/labse on test_df
@@ -341,7 +342,19 @@ class TstPerformanceMetrics:
 
         The downstream methods guard this order explicitly (raising if a required
         column is absent).
+
+        Args:
+            source_style_path: optional parquet side file of source style
+                vectors. When given, the guard joins it onto the frame;
+                otherwise an unlabelled stored `text_style_emb` is dropped
+                and encoded fresh. A second execute() on one instance
+                re-encodes `text_style_emb` with a warning, because the
+                pipeline's own column carries no label.
         """
+        self.test_df = guard_inline_style_columns(
+            self.test_df, source_style_path=source_style_path,
+            entry_point="TstPerformanceMetrics.execute",
+        )
         self.add_source_ppx_and_emb()
         self.produce_tst_results()
         self.compute_scores()

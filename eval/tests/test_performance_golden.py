@@ -43,6 +43,7 @@ torch = pytest.importorskip("torch")
 
 from tst_utils.eval.performance import TstPerformanceMetrics
 from tst_utils.eval.data.load import load_author_styles
+from tst_utils.eval.data.style_store import StyleProvenanceWarning
 
 HAS_CUDA = torch.cuda.is_available()
 gpu_only = pytest.mark.skipif(
@@ -171,7 +172,14 @@ def _run_case(path, n_versions, author_styles, scorers):
         author_styles=ctor_author_styles,
         verbose=False,
     )
-    pm.execute()                                  # v1: produce + compute_scores + select_best
+    if path == "emb":
+        # The "emb" frame carries an unlabelled target_style_emb built from
+        # author_styles.npz, so the entry guard warns; the scores are the
+        # frozen golden values either way.
+        with pytest.warns(StyleProvenanceWarning, match="target_style_emb"):
+            pm.execute()                              # v1: produce + compute_scores + select_best
+    else:
+        pm.execute()                                  # v1: produce + compute_scores + select_best
     best_v1 = _best_selection(pm, "score")        # capture v1 selection
     pm.compute_quality_scores(align_scorer, gender_scorer, entity_scorer)
     pm.compute_composite_v2()                     # score_v2

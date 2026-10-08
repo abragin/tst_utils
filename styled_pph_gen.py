@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Optional, List
 
 from tst_utils.eval.performance import TstPerformanceMetrics
+from tst_utils.eval.data.style_store import guard_inline_style_columns
 from tst_utils.eval.performance.source_cache import ensure_source_caches
 from tst_utils.eval.metrics.style import sim_measure, calc_style_embeddings
 from tst_utils.eval.metrics.composite import compute_nat_v2
@@ -1320,9 +1321,13 @@ class PphGenerator:
                 "execute(): no domain context — call set_domain(domain, "
                 "base_df, results_path) first (or construct with base_df_path)."
             )
+        self.base_df = guard_inline_style_columns(
+            self.base_df, entry_point="PphGenerator.execute",
+        )
         if prefetch:
-            # Idempotent: text_style_emb already lives on the pools, so only
-            # perplexity + LaBSE are computed here, once for the whole pool.
+            # The guard above dropped any unlabelled stored text_style_emb,
+            # so this computes every absent source column (perplexity,
+            # LaBSE, text_style_emb) once for the whole pool.
             ensure_source_caches(
                 self.base_df, perplexity=True, style_emb=True, labse_emb=True,
                 perplexity_batch_size=self.perplexity_batch_size,
