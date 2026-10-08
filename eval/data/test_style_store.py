@@ -372,22 +372,29 @@ def test_read_style_label(tmp_path):
 
 def test_load_author_styles_labelled_copy_matches(tmp_path):
     import json
-    from tst_utils.eval.data.load import load_author_styles, load_centroids_npz
-    with pytest.warns(StyleProvenanceWarning):
+    import warnings
+
+    from tst_utils.eval.data.load import (
+        load_author_styles,
+        read_style_label,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         original = load_author_styles()
     assert len(original) == 5
     canonical = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "author_styles.npz")
+    label = read_style_label(canonical)
+    assert label["encoder_key"] == "base_v1"
+    assert label["file_sha256"] == get_encoder("base_v1")["file_sha256"]
     with np.load(canonical) as loaded:
         arrays = {key: loaded[key] for key in loaded.files}
-    label = {"encoder_key": "base_v1",
-             "file_sha256": get_encoder("base_v1")["file_sha256"]}
-    copy_path = str(tmp_path / "author_styles_copy.npz")
-    np.savez(copy_path, **arrays, __style_label__=json.dumps(label))
-    copied = load_centroids_npz(copy_path, renormalize=False)
-    assert set(copied) == set(original)
+    assert set(arrays) == set(original) | {"__style_label__"}
     for key in original:
-        assert np.array_equal(copied[key], original[key])
+        assert np.array_equal(arrays[key], original[key])
+    copy_path = str(tmp_path / "author_styles_copy.npz")
+    np.savez(copy_path, **arrays)
+    assert read_style_label(copy_path) == label
 
 
 def _inline_frame():
