@@ -804,6 +804,75 @@ def test_execute_without_domain_context_raises():
         gen.execute()
 
 
+# ---------------- review F1: execute() must recompute source style pre-sampling
+
+def _mock_execute_harness(monkeypatch, tmp_path):
+    """Drive ``PphGenerator.execute`` without models or GPU.
+
+    Fakes the shared source-cache helper (sentinel vectors) and
+    ``gen_paraphrases`` (captures the frame target sampling receives), so the
+    test can assert the non-prefetch branch recomputes the source style
+    embedding the entry guard dropped rather than sampling against its absence.
+    """
+    from tst_utils import styled_pph_gen as spg
+
+    recompute = np.full(8, 999.0, dtype=np.float32)
+    seen = {}
+    calls = {'style_emb': 0}
+
+    def fake_ensure(df, *, style_emb=False, perplexity=False,
+                    labse_emb=False, perplexity_batch_size=32):
+        if style_emb:
+            calls['style_emb'] += 1
+            df['text_style_emb'] = [recompute.copy() for _ in range(len(df))]
+
+    def fake_gen_paraphrases(current_df, *args, **kwargs):
+        seen['target_df'] = current_df.copy()
+        return pd.DataFrame({'outcome': ['accepted'] * len(current_df)},
+                            index=current_df.index)
+
+    monkeypatch.setattr(spg, 'ensure_source_caches', fake_ensure)
+    monkeypatch.setattr(spg, 'gen_paraphrases', fake_gen_paraphrases)
+    monkeypatch.setattr(spg, 'join_generated_files', lambda *a, **k: None)
+    monkeypatch.setattr(spg, 'save_tst_results', lambda *a, **k: None)
+
+    gen = spg.PphGenerator.__new__(spg.PphGenerator)
+    gen.style_df = pd.DataFrame(
+        {'author': ['a1'], 'domain': ['news'], 'text_style_emb': [np.ones(8)]})
+    gen.base_df = pd.DataFrame(
+        {'domain': ['news'] * 2, 'text': ['one', 'two'],
+         'text_style_emb': [np.arange(8, dtype=np.float32)] * 2})
+    gen.results_path = str(tmp_path / 'out')
+    gen.rng = np.random.default_rng(0)
+    gen.rows_at_once = 2
+    gen.perplexity_batch_size = 8
+    gen.domain_weights = None
+    gen.in_domain_style_df = None
+    gen.target_styles = ['other_domain']
+    gen.target_norm = None
+    gen.tst_generator = None
+    gen.alignment_scorer = gen.gender_scorer = gen.entity_scorer = None
+    return gen, seen, calls, recompute
+
+
+@pytest.mark.parametrize('prefetch', [True, False])
+def test_execute_recomputes_source_style_before_target_sampling(
+        monkeypatch, tmp_path, prefetch):
+    """F1: the guard drops an unlabelled stored text_style_emb; target sampling
+    must receive a recomputed vector, for both prefetch settings. Before the
+    fix, prefetch=False reached add_target_style_emb with no such column and
+    raised KeyError: 'text_style_emb'."""
+    from tst_utils.eval.data.style_store import StyleProvenanceWarning
+
+    gen, seen, calls, recompute = _mock_execute_harness(monkeypatch, tmp_path)
+    with pytest.warns(StyleProvenanceWarning, match='text_style_emb'):
+        gen.execute(prefetch=prefetch)
+
+    got = seen['target_df']['text_style_emb']
+    assert calls['style_emb'] >= 1
+    assert all(np.array_equal(np.asarray(v), recompute) for v in got)
+
+
 def test_save_tst_results_persists_source_uid_and_split(tmp_path):
     df = _minimal_valid_tst_df(with_keys=True)
     df['source_uid'] = ['train/news#0', 'train/news#1']

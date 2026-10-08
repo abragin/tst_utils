@@ -1348,6 +1348,18 @@ class PphGenerator:
             processing_ids = unprocessed_queue[:self.rows_at_once]
             unprocessed_queue = unprocessed_queue[self.rows_at_once:]
             current_df = self.base_df.loc[processing_ids]
+            if not prefetch:
+                # The guard above dropped every unlabelled stored text_style_emb
+                # and the pool prefetch did not run, so target sampling inside
+                # gen_paraphrases (add_target_style_emb reads the source style
+                # embedding for the source-target sim) would KeyError. Recompute
+                # the source style embedding for this chunk before sampling —
+                # the same discard-and-recompute policy, via the shared helper,
+                # no new encode path.
+                ensure_source_caches(
+                    current_df, style_emb=True,
+                    perplexity_batch_size=self.perplexity_batch_size,
+                )
             res = gen_paraphrases(
                 current_df, self.tst_generator,
                 self.style_df, self.in_domain_style_df,
