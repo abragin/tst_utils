@@ -4,6 +4,7 @@ No GPU / no model downloads: every fixture here is a small synthesized array.
 """
 
 import numpy as np
+import os
 import pandas as pd
 import pytest
 
@@ -82,15 +83,13 @@ def test_provenance_warning_is_future_warning():
 
 def _handmade_encoded(texts, key="base_v1", scale=15.0):
     from tst_utils.eval.metrics.style import EncodedStyle
-    embeddings = (
-        np.arange(len(texts) * 4, dtype=np.float32).reshape(len(texts), 4)
-        + scale
-    )
+    n = len(texts)
+    embeddings = scale + (np.arange(n * 4, dtype=np.float32).reshape(n, 4) % 7)
     label = {
         "encoder_key": key,
         "file_sha256": dict(get_encoder(key)["file_sha256"]),
         "dim": 4,
-        "n_rows": len(texts),
+        "n_rows": n,
     }
     label.update(measure_normalization(embeddings))
     return EncodedStyle(embeddings=embeddings, label=label)
@@ -213,3 +212,179 @@ def test_label_is_read_before_rows(tmp_path, monkeypatch):
     monkeypatch.setattr(pq_module, "read_table", _boom)
     with pytest.raises(StyleLabelError, match="base_v2"):
         load_style_embeddings(path, expect_encoder="base_v1")
+
+
+def _handmade_groups(n=6):
+    return ["anna", "anna", "bible", "bible", "bible", "news"][:n]
+
+
+def test_build_centroids_no_renormalize(tmp_path):
+    from tst_utils.eval.data.style_store import build_centroids
+    texts = ["t%d" % i for i in range(6)]
+    encoded = _handmade_encoded(texts)
+    path = str(tmp_path / "c.npz")
+    centroids, label = build_centroids(encoded, _handmade_groups(),
+                                      renormalize=False, path=path,
+                                      run_name="probe")
+    assert set(centroids) == {"anna", "bible", "news"}
+    assert all(v.dtype == np.float16 for v in centroids.values())
+    assert label["kind"] == "centroid"
+    assert label["encoder_key"] == "base_v1"
+    assert label["renormalized"] is False
+    assert label["n_rows_per_group"] == {"anna": 2, "bible": 3, "news": 1}
+    assert label["input_normalization"]["normalization"] == "none"
+    assert label["run_name"] == "probe"
+    assert 25.0 < label["centroid_norm_min"] <= label["centroid_norm_max"] < 40.0
+    for group, indices in (("anna", [0, 1]), ("bible", [2, 3, 4]),
+                           ("news", [5])):
+        want = encoded.embeddings[indices].astype(np.float64).mean(axis=0)
+        assert float(np.max(np.abs(
+            centroids[group].astype(np.float64) - want))) < 0.02
+
+
+def test_build_centroids_renormalize(tmp_path):
+    from tst_utils.eval.data.style_store import build_centroids
+    texts = ["t%d" % i for i in range(6)]
+    encoded = _handmade_encoded(texts)
+    path = str(tmp_path / "c.npz")
+    centroids, label = build_centroids(encoded, _handmade_groups(),
+                                      renormalize=True, path=path)
+    assert label["renormalized"] is True
+    for vector in centroids.values():
+        assert abs(float(np.linalg.norm(
+            vector.astype(np.float64))) - 1.0) < 1e-3
+
+
+def test_build_centroids_rejects_mixed_scale(tmp_path):
+    from tst_utils.eval.data.style_store import build_centroids
+    from tst_utils.eval.metrics.style import EncodedStyle
+    rows = np.vstack([np.ones((2, 4), dtype=np.float32),
+                      15.0 * np.ones((2, 4), dtype=np.float32)])
+    label = {"encoder_key": "base_v1",
+             "file_sha256": dict(get_encoder("base_v1")["file_sha256"]),
+             "dim": 4, "n_rows": 4, "normalization": "none",
+             "norm_min": 2.0, "norm_max": 30.0}
+    encoded = EncodedStyle(embeddings=rows, label=label)
+    with pytest.raises(ValueError, match="mixed-scale"):
+        build_centroids(encoded, ["a", "a", "b", "b"], renormalize=False,
+                        path=str(tmp_path / "c.npz"))
+
+
+def test_build_centroids_rejects_label_name(tmp_path):
+    from tst_utils.eval.data.style_store import build_centroids
+    texts = ["a", "b"]
+    with pytest.raises(ValueError, match="__style_label__"):
+        build_centroids(_handmade_encoded(texts), ["__style_label__", "b"],
+                        renormalize=False, path=str(tmp_path / "c.npz"))
+
+
+def test_centroid_round_trip(tmp_path):
+    import json
+    from tst_utils.eval.data.load import load_centroids_npz
+    from tst_utils.eval.data.style_store import build_centroids
+    texts = ["t%d" % i for i in range(6)]
+    encoded = _handmade_encoded(texts)
+    path = str(tmp_path / "c.npz")
+    centroids, _label = build_centroids(encoded, _handmade_groups(),
+                                        renormalize=False, path=path)
+    loaded = load_centroids_npz(path, renormalize=False)
+    assert "__style_label__" not in loaded
+    assert set(loaded) == set(centroids)
+    for group in centroids:
+        assert np.array_equal(loaded[group], centroids[group])
+    with np.load(path) as raw:
+        assert json.loads(str(raw["__style_label__"]))["kind"] == "centroid"
+
+
+def test_labelled_centroid_mismatch_raises(tmp_path):
+    import json
+    from tst_utils.eval.data.load import load_centroids_npz
+    vectors = {"k": np.ones(60, dtype=np.float32)}
+    good = {"encoder_key": "base_v1",
+            "file_sha256": get_encoder("base_v1")["file_sha256"]}
+    other = dict(good, encoder_key="base_v2")
+    bad_hash = dict(good, file_sha256={"model.safetensors": "0" * 64})
+    p_other = str(tmp_path / "other.npz")
+    p_bad = str(tmp_path / "bad.npz")
+    np.savez(p_other, **vectors, __style_label__=json.dumps(other))
+    np.savez(p_bad, **vectors, __style_label__=json.dumps(bad_hash))
+    with pytest.raises(StyleLabelError, match="base_v2"):
+        load_centroids_npz(p_other, renormalize=False)
+    with pytest.raises(StyleLabelError, match="file_sha256"):
+        load_centroids_npz(p_bad, renormalize=False)
+
+
+def _unlabelled_npz(path):
+    np.savez(path, k=np.ones(60, dtype=np.float32))
+    return path
+
+
+def test_unlabelled_warns_by_default(tmp_path):
+    from tst_utils.eval.data.load import load_centroids_npz
+    path = _unlabelled_npz(str(tmp_path / "u.npz"))
+    with pytest.warns(StyleProvenanceWarning):
+        loaded = load_centroids_npz(path, renormalize=False)
+    assert set(loaded) == {"k"}
+
+
+def test_unlabelled_warns_explicit_base_v1(tmp_path):
+    from tst_utils.eval.data.load import load_centroids_npz
+    path = _unlabelled_npz(str(tmp_path / "u.npz"))
+    with pytest.warns(StyleProvenanceWarning):
+        load_centroids_npz(path, renormalize=False, expect_encoder="base_v1")
+
+
+def test_unlabelled_raises_for_base_v2(tmp_path):
+    from tst_utils.eval.data.load import load_centroids_npz
+    path = _unlabelled_npz(str(tmp_path / "u.npz"))
+    with pytest.raises(StyleLabelError, match="base_v2"):
+        load_centroids_npz(path, renormalize=False, expect_encoder="base_v2")
+
+
+def test_unlabelled_default_follows_patched_pin(tmp_path, monkeypatch):
+    import tst_utils.eval.data.load as load_module
+    path = _unlabelled_npz(str(tmp_path / "u.npz"))
+    monkeypatch.setattr(load_module, "STYLE_ENCODER_KEY", "base_v2")
+    with pytest.raises(StyleLabelError, match="base_v2"):
+        load_module.load_centroids_npz(path, renormalize=False)
+    monkeypatch.setattr(load_module, "STYLE_ENCODER_KEY", "base_v1")
+    with pytest.warns(StyleProvenanceWarning):
+        load_module.load_centroids_npz(path, renormalize=False)
+
+
+def test_unlabelled_warning_asserts_second_emission(tmp_path):
+    from tst_utils.eval.data.load import load_centroids_npz
+    path = _unlabelled_npz(str(tmp_path / "u.npz"))
+    load_centroids_npz(path, renormalize=False)
+    with pytest.warns(StyleProvenanceWarning):
+        load_centroids_npz(path, renormalize=False)
+
+
+def test_read_style_label(tmp_path):
+    import json
+    from tst_utils.eval.data.load import read_style_label
+    labelled = str(tmp_path / "l.npz")
+    label = {"encoder_key": "base_v1"}
+    np.savez(labelled, k=np.ones(4), __style_label__=json.dumps(label))
+    assert read_style_label(labelled) == label
+    assert read_style_label(_unlabelled_npz(str(tmp_path / "u.npz"))) is None
+
+
+def test_load_author_styles_labelled_copy_matches(tmp_path):
+    import json
+    from tst_utils.eval.data.load import load_author_styles, load_centroids_npz
+    with pytest.warns(StyleProvenanceWarning):
+        original = load_author_styles()
+    assert len(original) == 5
+    canonical = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "author_styles.npz")
+    with np.load(canonical) as loaded:
+        arrays = {key: loaded[key] for key in loaded.files}
+    label = {"encoder_key": "base_v1",
+             "file_sha256": get_encoder("base_v1")["file_sha256"]}
+    copy_path = str(tmp_path / "author_styles_copy.npz")
+    np.savez(copy_path, **arrays, __style_label__=json.dumps(label))
+    copied = load_centroids_npz(copy_path, renormalize=False)
+    assert set(copied) == set(original)
+    for key in original:
+        assert np.array_equal(copied[key], original[key])

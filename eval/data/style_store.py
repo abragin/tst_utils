@@ -132,18 +132,19 @@ def save_style_embeddings(texts, encoded, path, **free_fields):
     for key in free_fields:
         if key not in _FREE_FIELDS:
             raise ValueError(f"unknown free field: {key}")
+    seen = set()
+    kept = []
     stored_keys = []
     stored_excerpts = []
-    stored_vectors = []
-    seen = set()
-    for text, vector in zip(texts, embeddings):
+    for index, text in enumerate(texts):
         key = style_text_key(text)
         if key in seen:
             continue
         seen.add(key)
+        kept.append(index)
         stored_keys.append(key)
         stored_excerpts.append(text[:80])
-        stored_vectors.append(np.asarray(vector, dtype=np.float16))
+    stacked = np.asarray(embeddings, dtype=np.float16)[kept]
     label = dict(encoder_label)
     label["n_rows"] = len(stored_keys)
     for key, value in free_fields.items():
@@ -154,7 +155,7 @@ def save_style_embeddings(texts, encoded, path, **free_fields):
         [
             pa.field("text_key", pa.string()),
             pa.field("text_excerpt", pa.string()),
-            pa.field("style_emb", pa.list_(pa.float16())),
+            pa.field("style_emb", pa.list_(pa.float16(), stacked.shape[1])),
         ],
         metadata={b"style_label": json.dumps(label).encode("utf-8")},
     )
@@ -162,9 +163,8 @@ def save_style_embeddings(texts, encoded, path, **free_fields):
         [
             pa.array(stored_keys, type=pa.string()),
             pa.array(stored_excerpts, type=pa.string()),
-            pa.array(
-                [list(vector) for vector in stored_vectors],
-                type=pa.list_(pa.float16()),
+            pa.FixedSizeListArray.from_arrays(
+                pa.array(stacked.reshape(-1)), stacked.shape[1]
             ),
         ],
         schema=schema,
@@ -207,15 +207,16 @@ def join_style_embeddings(df, path, text_col, out_col,
     if out_col in df.columns:
         raise ValueError(f"output column already exists: {out_col}")
     frame, _label = load_style_embeddings(path, expect_encoder)
-    by_key = {}
-    for _, row in frame.iterrows():
-        by_key[row["text_key"]] = np.asarray(
-            row["style_emb"], dtype=np.float32
-        ).reshape(-1)
+    key_to_row = {key: row for row, key in enumerate(frame["text_key"])}
+    stacked = (
+        np.stack(frame["style_emb"].to_numpy()).astype(np.float32)
+        if len(frame)
+        else np.zeros((0, 0), dtype=np.float32)
+    )
     keys = [style_text_key(text) for text in df[text_col]]
     missing = [
         str(text)[:80] for key, text in zip(keys, df[text_col])
-        if key not in by_key
+        if key not in key_to_row
     ]
     if missing:
         raise StyleLabelError(
@@ -223,5 +224,84 @@ def join_style_embeddings(df, path, text_col, out_col,
             f"first missing excerpt: {missing[0]!r}"
         )
     joined = df.copy()
-    joined[out_col] = [by_key[key] for key in keys]
+    joined[out_col] = [stacked[key_to_row[key]] for key in keys]
     return joined
+
+
+def _require_encoded_style(encoded):
+    embeddings = getattr(encoded, "embeddings", None)
+    encoder_label = getattr(encoded, "label", None)
+    if (
+        not isinstance(embeddings, np.ndarray)
+        or embeddings.ndim != 2
+        or not isinstance(encoder_label, dict)
+        or any(key not in encoder_label for key in _ENCODER_LABEL_FIELDS)
+    ):
+        raise TypeError(
+            "encoded must be an EncodedStyle, "
+            f"got {type(encoded).__name__}"
+        )
+    return np.asarray(embeddings), encoder_label
+
+
+def build_centroids(encoded, groups, *, renormalize, path, **free_fields):
+    """Build one centroid per group from fresh per-row vectors.
+
+    `encoded` must be an `EncodedStyle`, so the encoder key comes from the
+    encode call. `groups` holds one group name per row. The means are
+    computed in float64; with `renormalize` each mean is L2-normalized.
+    The centroids are written as fp16 with `np.savez`, one entry per
+    group, plus `__style_label__` (a JSON string). There is no writer
+    that accepts finished centroids with a free label.
+
+    Returns:
+        (dict, dict): the centroids (`{group: fp16 array}`) and the label.
+    """
+    embeddings, encoder_label = _require_encoded_style(encoded)
+    groups = list(groups)
+    if len(groups) != embeddings.shape[0]:
+        raise ValueError(
+            f"{len(groups)} groups for {embeddings.shape[0]} encoded rows"
+        )
+    if "__style_label__" in groups:
+        raise ValueError("a group may not be named __style_label__")
+    input_measurement = measure_normalization(embeddings)
+    in_float64 = np.asarray(embeddings, dtype=np.float64)
+    centroids = {}
+    n_rows_per_group = {}
+    order = []
+    for index, group in enumerate(groups):
+        if group not in n_rows_per_group:
+            n_rows_per_group[group] = []
+            order.append(group)
+        n_rows_per_group[group].append(index)
+    for group in order:
+        mean = in_float64[n_rows_per_group[group]].mean(axis=0)
+        if renormalize:
+            mean = mean / np.linalg.norm(mean)
+        centroids[group] = mean.astype(np.float16)
+    norms = np.linalg.norm(
+        np.stack([centroids[group] for group in order]).astype(np.float64),
+        axis=1,
+    )
+    label = {
+        "kind": "centroid",
+        "encoder_key": encoder_label["encoder_key"],
+        "file_sha256": dict(encoder_label["file_sha256"]),
+        "dim": int(centroids[order[0]].shape[0]),
+        "input_normalization": input_measurement,
+        "renormalized": bool(renormalize),
+        "n_rows_per_group": {
+            group: len(n_rows_per_group[group]) for group in order
+        },
+        "centroid_norm_min": float(np.min(norms)),
+        "centroid_norm_max": float(np.max(norms)),
+    }
+    for key in free_fields:
+        if key not in _FREE_FIELDS:
+            raise ValueError(f"unknown free field: {key}")
+        if key in label:
+            raise ValueError(f"free field overwrites a label field: {key}")
+    label.update(free_fields)
+    np.savez(path, **centroids, __style_label__=json.dumps(label))
+    return centroids, label

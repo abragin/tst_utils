@@ -13,6 +13,7 @@ import pytest
 from tst_utils.eval.data.load import (
     renormalize_centroid, load_centroids_npz,
 )
+from tst_utils.eval.data.style_store import StyleProvenanceWarning
 
 
 def test_renormalize_centroid_1d():
@@ -47,7 +48,9 @@ def test_load_centroids_npz_renormalize_true(tmp_path):
     meta = np.array(['Tolstoy', 'News'])
     np.savez_compressed(p, Tolstoy_centroid=a, News_centroid=b, authors=meta)
 
-    loaded = load_centroids_npz(p, renormalize=True)
+    loaded = None
+    with pytest.warns(StyleProvenanceWarning):
+        loaded = load_centroids_npz(p, renormalize=True)
     assert set(loaded.keys()) == {'Tolstoy_centroid', 'News_centroid', 'authors'}
     assert abs(float(np.linalg.norm(loaded['Tolstoy_centroid'])) - 1.0) < 1e-5
     assert abs(float(np.linalg.norm(loaded['News_centroid'])) - 1.0) < 1e-5
@@ -59,7 +62,8 @@ def test_load_centroids_npz_renormalize_false(tmp_path):
     p = tmp_path / 'c.npz'
     a = np.full(768, 0.5, dtype=np.float32)
     np.savez_compressed(p, c=a)
-    loaded = load_centroids_npz(p, renormalize=False)
+    with pytest.warns(StyleProvenanceWarning):
+        loaded = load_centroids_npz(p, renormalize=False)
     assert abs(float(np.linalg.norm(loaded['c'])) - float(np.linalg.norm(a))) < 1e-5
 
 
