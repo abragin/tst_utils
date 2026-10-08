@@ -135,6 +135,39 @@ def require_label_fields(label, required, *, where, kind):
         )
 
 
+def _check_text_keys(encoded, texts, entry_point):
+    """Raise `StyleLabelError` unless `texts` matches `encoded.text_keys`.
+
+    The text/vector association is enforced, not assumed (review F3): every
+    supplied text's `style_text_key` must equal the retained
+    ``encoded.text_keys`` at the same position. The writer never reorders
+    silently, so a changed order or a text edited after the encode raises,
+    naming the first differing position. A hand-built `EncodedStyle` without
+    retained keys is rejected, because the association cannot be checked.
+    """
+    retained_keys = tuple(getattr(encoded, "text_keys", ()) or ())
+    if not retained_keys:
+        raise StyleLabelError(
+            f"{entry_point}: encoded carries no text keys (it did "
+            "not come from encode_style), so the text/vector association "
+            "cannot be checked"
+        )
+    supplied_keys = [style_text_key(text) for text in texts]
+    if list(retained_keys) != supplied_keys:
+        position = min(len(retained_keys), len(supplied_keys))
+        for index, (retained, supplied) in enumerate(
+            zip(retained_keys, supplied_keys)
+        ):
+            if retained != supplied:
+                position = index
+                break
+        raise StyleLabelError(
+            f"{entry_point}: the supplied text at position "
+            f"{position} differs from the encoded input (the order changed, "
+            "or the text was edited after the encode)"
+        )
+
+
 def save_style_embeddings(texts, encoded, path, **free_fields):
     """Save per-row style vectors with their label as a parquet side file.
 
@@ -173,27 +206,7 @@ def save_style_embeddings(texts, encoded, path, **free_fields):
     for key in free_fields:
         if key not in _FREE_FIELDS:
             raise ValueError(f"unknown free field: {key}")
-    retained_keys = tuple(getattr(encoded, "text_keys", ()) or ())
-    if not retained_keys:
-        raise StyleLabelError(
-            "save_style_embeddings: encoded carries no text keys (it did "
-            "not come from encode_style), so the text/vector association "
-            "cannot be checked"
-        )
-    supplied_keys = [style_text_key(text) for text in texts]
-    if list(retained_keys) != supplied_keys:
-        position = min(len(retained_keys), len(supplied_keys))
-        for index, (retained, supplied) in enumerate(
-            zip(retained_keys, supplied_keys)
-        ):
-            if retained != supplied:
-                position = index
-                break
-        raise StyleLabelError(
-            "save_style_embeddings: the supplied text at position "
-            f"{position} differs from the encoded input (the order changed, "
-            "or the text was edited after the encode)"
-        )
+    _check_text_keys(encoded, texts, "save_style_embeddings")
     seen = set()
     kept = []
     stored_keys = []
@@ -356,7 +369,8 @@ def _require_encoded_style(encoded):
     return np.asarray(embeddings), encoder_label
 
 
-def build_centroids(encoded, groups, *, renormalize, path, **free_fields):
+def build_centroids(encoded, groups, *, renormalize, path, texts=None,
+                    **free_fields):
     """Build one centroid per group from fresh per-row vectors.
 
     `encoded` must be an `EncodedStyle`, so the encoder key comes from the
@@ -365,6 +379,11 @@ def build_centroids(encoded, groups, *, renormalize, path, **free_fields):
     The centroids are written as fp16 with `np.savez`, one entry per
     group, plus `__style_label__` (a JSON string). There is no writer
     that accepts finished centroids with a free label.
+
+    `texts`, when given, are the texts the encode saw, in row order; they
+    are checked against `encoded.text_keys` by the same rule the side-file
+    writer uses (review R2-5), so a reordered or filtered list cannot write
+    the wrong centroid under a correct label.
 
     Returns:
         (dict, dict): the centroids (`{group: fp16 array}`) and the label.
@@ -377,6 +396,8 @@ def build_centroids(encoded, groups, *, renormalize, path, **free_fields):
         )
     if "__style_label__" in groups:
         raise ValueError("a group may not be named __style_label__")
+    if texts is not None:
+        _check_text_keys(encoded, texts, "build_centroids")
     input_measurement = measure_normalization(embeddings)
     in_float64 = np.asarray(embeddings, dtype=np.float64)
     centroids = {}

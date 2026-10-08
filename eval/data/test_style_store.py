@@ -405,6 +405,32 @@ def test_build_centroids_rejects_label_name(tmp_path):
                         renormalize=False, path=str(tmp_path / "c.npz"))
 
 
+# ---------------- review R2-5: build_centroids binds texts by position -------
+
+def test_build_centroids_texts_mismatch_raises(tmp_path):
+    """R2-5: the same check the side-file writer uses, so a reordered text
+    list cannot write the wrong centroid under a correct label."""
+    from tst_utils.eval.data.style_store import build_centroids
+    texts = ["t%d" % i for i in range(6)]
+    encoded = _handmade_encoded(texts)
+    with pytest.raises(StyleLabelError, match="position 0"):
+        build_centroids(encoded, _handmade_groups(),
+                        texts=list(reversed(texts)),
+                        renormalize=False, path=str(tmp_path / "c.npz"))
+
+
+def test_build_centroids_matching_texts_writes(tmp_path):
+    from tst_utils.eval.data.style_store import build_centroids
+    texts = ["t%d" % i for i in range(6)]
+    encoded = _handmade_encoded(texts)
+    path = str(tmp_path / "c.npz")
+    centroids, label = build_centroids(encoded, _handmade_groups(),
+                                       texts=texts,
+                                       renormalize=False, path=path)
+    assert set(centroids) == {"anna", "bible", "news"}
+    assert label["n_rows_per_group"] == {"anna": 2, "bible": 3, "news": 1}
+
+
 def test_centroid_round_trip(tmp_path):
     import json
     from tst_utils.eval.data.load import load_centroids_npz
@@ -490,6 +516,66 @@ def test_centroid_input_normalization_unknown_allowed(tmp_path):
     np.savez(path, k=np.ones(60, dtype=np.float32),
              __style_label__=json.dumps(label))
     assert set(load_centroids_npz(path, renormalize=False)) == {"k"}
+
+
+# ---------------- review R2-4: kind and the vector/group key set -------------
+
+def test_centroid_wrong_kind_raises(tmp_path):
+    """R2-4a: `kind` is required but its value is now checked."""
+    import json
+    from tst_utils.eval.data.load import load_centroids_npz
+    label = _centroid_label(dim=60, kind="per_row")
+    path = str(tmp_path / "c.npz")
+    np.savez(path, k=np.ones(60, dtype=np.float32),
+             __style_label__=json.dumps(label))
+    with pytest.raises(StyleLabelError, match="kind is 'per_row'"):
+        load_centroids_npz(path, renormalize=False)
+
+
+def test_centroid_extra_group_raises(tmp_path):
+    """R2-4b: a file vector absent from n_rows_per_group loads silently
+    before the fix; now it is named as an extra key."""
+    import json
+    from tst_utils.eval.data.load import load_centroids_npz
+    label = _centroid_label(dim=60)          # n_rows_per_group == {"k": 4}
+    path = str(tmp_path / "c.npz")
+    np.savez(path, k=np.ones(60, dtype=np.float32),
+             extra=np.ones(60, dtype=np.float32),
+             __style_label__=json.dumps(label))
+    with pytest.raises(StyleLabelError, match=r"extra \['extra'\]"):
+        load_centroids_npz(path, renormalize=False)
+
+
+def test_centroid_missing_group_raises(tmp_path):
+    """R2-4b: a label group with no file vector is named as missing."""
+    import json
+    from tst_utils.eval.data.load import load_centroids_npz
+    label = _centroid_label(dim=60)
+    label["n_rows_per_group"] = {"k": 4, "gone": 2}
+    path = str(tmp_path / "c.npz")
+    np.savez(path, k=np.ones(60, dtype=np.float32),
+             __style_label__=json.dumps(label))
+    with pytest.raises(StyleLabelError, match=r"missing \['gone'\]"):
+        load_centroids_npz(path, renormalize=False)
+
+
+def test_centroid_small_float_array_is_metadata(tmp_path):
+    """R2-4c: a short float array beside the vectors is metadata in the label
+    check AND in the renormalizer. Before the fix the dim check raised
+    'has width 2, label says dim 60' on this file."""
+    import json
+    from tst_utils.eval.data.load import load_centroids_npz
+    label = _centroid_label(dim=60)          # n_rows_per_group == {"k": 4}
+    path = str(tmp_path / "c.npz")
+    np.savez(path, k=np.ones(60, dtype=np.float32),
+             meta=np.array([1.0, 2.0], dtype=np.float32),
+             __style_label__=json.dumps(label))
+    loaded = load_centroids_npz(path, renormalize=False)
+    assert set(loaded) == {"k", "meta"}
+    assert np.array_equal(loaded["meta"], np.array([1.0, 2.0], dtype=np.float32))
+    with_renorm = load_centroids_npz(path, renormalize=True)
+    assert np.array_equal(with_renorm["meta"],
+                          np.array([1.0, 2.0], dtype=np.float32))
 
 
 def _unlabelled_npz(path):

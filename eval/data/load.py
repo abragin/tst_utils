@@ -30,16 +30,42 @@ def read_style_label(path):
         return json.loads(str(loaded["__style_label__"]))
 
 
+# Minimum element count for a float array to count as a centroid vector.
+# Anything smaller is metadata (e.g. a short id/label array) and is neither
+# renormalized nor treated as a vector by the label check. 50 picks every
+# realistic embedding dim (`abragin/ruBert-style-base` is 768) while still
+# skipping incidental short float arrays.
+_MIN_RENORMALIZE_SIZE = 50
+
+
+def _is_centroid_vector(array):
+    """True when `array` is a centroid vector rather than metadata.
+
+    One rule, shared by the label check and `load_centroids_npz`, so a small
+    float array is metadata in both places (review R2-4).
+    """
+    return (
+        getattr(array, "dtype", None) is not None
+        and array.dtype.kind == "f"
+        and array.ndim >= 1
+        and array.size >= _MIN_RENORMALIZE_SIZE
+    )
+
+
 def _check_npz_label(path, label, expect_encoder, entry_point, vectors=None):
     """Check a centroid npz label, and (when given) the vectors against it.
 
-    `vectors` is the dict of loaded arrays; when given, every float array's
-    last axis must equal the label's `dim` (review F4). `input_normalization`
-    may be the literal "unknown" for a historical centroid whose input norms
-    were never measured; otherwise it must be the measured dict that
-    `build_centroids` writes. The historical input counts (the values of
-    `n_rows_per_group`) are required as a field but cannot be re-derived
-    from the stored means, so they are not re-checked.
+    `vectors` is the dict of loaded arrays; when given, the file's centroid
+    vectors must be exactly the keys of `n_rows_per_group`, and each vector's
+    last axis must equal the label's `dim` (reviews F4, R2-4). A key is a
+    vector when the label names it, or when it is a float array of at least
+    `_MIN_RENORMALIZE_SIZE` elements; a small unnamed float array is metadata
+    and is ignored, the same rule `load_centroids_npz` renormalizes by.
+    `input_normalization` may be the literal "unknown" for a historical
+    centroid whose input norms were never measured; otherwise it must be the
+    measured dict that `build_centroids` writes. The historical input counts
+    (the values of `n_rows_per_group`) are required as a field but cannot be
+    re-derived from the stored means, so they are not re-checked.
     """
     if label is None:
         if expect_encoder == "base_v1":
@@ -65,6 +91,11 @@ def _check_npz_label(path, label, expect_encoder, entry_point, vectors=None):
         )
     require_label_fields(label, CENTROID_LABEL_FIELDS,
                          where=f"{entry_point}: npz {path}", kind="centroid")
+    if label["kind"] != "centroid":
+        raise StyleLabelError(
+            f"{entry_point}: npz {path} label kind is {label['kind']!r}, "
+            "expected 'centroid'"
+        )
     input_normalization = label["input_normalization"]
     if input_normalization != "unknown" and not isinstance(
         input_normalization, dict
@@ -76,12 +107,31 @@ def _check_npz_label(path, label, expect_encoder, entry_point, vectors=None):
         )
     if vectors is not None:
         dim = label["dim"]
-        for key, array in vectors.items():
-            if getattr(array, "dtype", None) is not None and array.dtype.kind == "f" \
-                    and getattr(array, "ndim", 0) >= 1 and array.shape[-1] != dim:
+        group_keys = set(label["n_rows_per_group"])
+        float_keys = {
+            key for key, array in vectors.items()
+            if getattr(array, "dtype", None) is not None
+            and array.dtype.kind == "f" and array.ndim >= 1
+        }
+        # A file key is a vector when the label names it, or when it is a
+        # full-size float array; a small unnamed float array is metadata in
+        # both this check and the renormalizer (review R2-4c).
+        file_vector_keys = (group_keys & float_keys) | {
+            key for key in float_keys if _is_centroid_vector(vectors[key])
+        }
+        extra = sorted(file_vector_keys - group_keys)
+        missing = sorted(group_keys - file_vector_keys)
+        if extra or missing:
+            raise StyleLabelError(
+                f"{entry_point}: npz {path} vector keys do not match "
+                f"n_rows_per_group; extra {extra}, missing {missing}"
+            )
+        for key in file_vector_keys:
+            width = vectors[key].shape[-1]
+            if width != dim:
                 raise StyleLabelError(
                     f"{entry_point}: npz {path} vector {key!r} has width "
-                    f"{array.shape[-1]}, label says dim {dim}"
+                    f"{width}, label says dim {dim}"
                 )
 
 
@@ -123,13 +173,6 @@ def renormalize_centroid(arr):
     return arr / np.linalg.norm(arr, axis=-1, keepdims=True)
 
 
-# Minimum vector size for which `load_centroids_npz` will apply renormalize.
-# Anything smaller is treated as metadata (e.g. small ID/label arrays) and
-# returned untouched. 50 picks every realistic embedding dim (`abragin/ruBert-style-base`
-# is 768) while still skipping incidental short float arrays.
-_MIN_RENORMALIZE_SIZE = 50
-
-
 def load_centroids_npz(path, *, renormalize, expect_encoder=None):
     """Load centroid vectors from an `.npz` file.
 
@@ -159,9 +202,7 @@ def load_centroids_npz(path, *, renormalize, expect_encoder=None):
                      "load_centroids_npz", result)
     if renormalize:
         result = {
-            k: (renormalize_centroid(v)
-                if (v.dtype.kind == 'f' and v.ndim >= 1 and v.size >= _MIN_RENORMALIZE_SIZE)
-                else v)
+            k: (renormalize_centroid(v) if _is_centroid_vector(v) else v)
             for k, v in result.items()
         }
     return result
