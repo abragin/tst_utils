@@ -1,8 +1,10 @@
 import hashlib
 import os
+from dataclasses import dataclass, field
 
 from huggingface_hub import snapshot_download
 from sentence_transformers import SentenceTransformer
+from tst_utils.eval.data.style_store import measure_normalization
 from tst_utils.eval.model_names import STYLE_ENCODER_KEY
 from tst_utils.eval.style_encoder_registry import (
     get_encoder,
@@ -104,6 +106,55 @@ def load_style_encoder(key):
         snapshot_path, entry["file_sha256"], get_excluded_filenames()
     )
     return SentenceTransformer(snapshot_path)
+
+
+@dataclass(frozen=True)
+class EncodedStyle:
+    """Vectors fresh from an encoder, with the label that describes them."""
+
+    embeddings: np.ndarray
+    label: dict = field(default_factory=dict)
+
+
+def encode_style(texts, encoder_key, *, normalize):
+    """Encode `texts` and return the vectors together with their label.
+
+    The encoder key in the label always comes from the call that encoded,
+    never from a key the caller types: this is the only way to obtain a
+    label for new vectors.
+
+    There is no `max_seq_length` field: `encode_style` takes no such
+    argument, so it never differs from the model config.
+
+    Args:
+        texts: iterable of strings to encode.
+        encoder_key: the registry key to load through `load_style_encoder`.
+        normalize: REQUIRED keyword, same contract as
+            `calc_style_embeddings`.
+
+    Returns:
+        EncodedStyle: `embeddings` of shape (n, dim), and `label` with
+            `encoder_key`, `file_sha256` (copied from the registry entry),
+            `dim`, `n_rows`, and the `normalization`, `norm_min`,
+            `norm_max` measured on the embeddings.
+    """
+    entry = get_encoder(encoder_key)
+    model = load_style_encoder(encoder_key)
+    embeddings = np.asarray(
+        model.encode(
+            list(texts),
+            show_progress_bar=True,
+            normalize_embeddings=normalize,
+        )
+    )
+    label = {
+        "encoder_key": encoder_key,
+        "file_sha256": dict(entry["file_sha256"]),
+        "dim": int(embeddings.shape[1]),
+        "n_rows": int(embeddings.shape[0]),
+    }
+    label.update(measure_normalization(embeddings))
+    return EncodedStyle(embeddings=embeddings, label=label)
 
 
 def calc_style_embeddings(texts, *, normalize):

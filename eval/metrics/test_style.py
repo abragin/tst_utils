@@ -183,3 +183,42 @@ def test_local_only_entry_raises_naming_machine(monkeypatch):
                         lambda key: fixture_entry)
     with pytest.raises(NotImplementedError, match="tallin"):
         load_style_encoder("fixture")
+
+
+def test_encode_style_label_with_fake_model(monkeypatch):
+    import dataclasses
+    fixed = np.arange(24, dtype=np.float32).reshape(3, 8) + 100.0
+
+    class _FakeModel:
+        def encode(self, texts, show_progress_bar=True,
+                   normalize_embeddings=False):
+            assert list(texts) == ["a", "b", "c"]
+            return fixed
+
+    monkeypatch.setattr(style_module, "load_style_encoder",
+                        lambda key: _FakeModel())
+    encoded = style_module.encode_style(["a", "b", "c"], "base_v1",
+                                        normalize=False)
+    assert isinstance(encoded, style_module.EncodedStyle)
+    assert encoded.embeddings.shape == (3, 8)
+    assert encoded.label["encoder_key"] == "base_v1"
+    assert (encoded.label["file_sha256"]
+            == get_encoder("base_v1")["file_sha256"])
+    assert encoded.label["dim"] == 8
+    assert encoded.label["n_rows"] == 3
+    assert encoded.label["normalization"] == "none"
+    assert encoded.label["norm_min"] > 100.0
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        encoded.label = {}
+
+
+@gpu_only
+def test_encode_style_matches_calc_on_gpu():
+    texts = ["Привет мир.", "Это второе предложение."]
+    encoded = style_module.encode_style(texts, "base_v1", normalize=False)
+    fresh = calc_style_embeddings(texts, normalize=False)
+    assert np.max(np.abs(encoded.embeddings
+                         - np.asarray(fresh))) == 0.0
+    assert encoded.label["encoder_key"] == "base_v1"
+    assert encoded.label["normalization"] == "none"
+    assert 14 <= encoded.label["norm_min"] <= encoded.label["norm_max"] <= 17
