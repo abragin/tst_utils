@@ -12,6 +12,7 @@ import pytest
 
 import tst_utils.eval.metrics.style as style_module
 from tst_utils.eval.metrics.style import (
+    angular_sim_05_1,
     calc_style_embeddings,
     check_snapshot_hashes,
     load_style_encoder,
@@ -27,6 +28,17 @@ except Exception:
     HAS_CUDA = False
 gpu_only = pytest.mark.skipif(not HAS_CUDA,
                               reason="model-dependent test; run on tallin GPU")
+
+
+def test_sim_measure_is_angular_sim_05_1():
+    assert style_module.sim_measure is angular_sim_05_1
+
+
+def test_angular_sim_05_1_three_values():
+    u = np.array([2.0, 0.0, 0.0])
+    assert angular_sim_05_1(u, 3.0 * u) == pytest.approx(1.0)
+    assert angular_sim_05_1(u, np.array([0.0, 5.0, 0.0])) == pytest.approx(0.75)
+    assert angular_sim_05_1(u, -u) == pytest.approx(0.5)
 
 
 _TEXTS = ['Привет мир.', 'Это второе предложение.']

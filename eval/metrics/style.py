@@ -188,10 +188,29 @@ def calc_style_embeddings(texts, *, normalize):
         )
     ]
 
-def sim_measure(u,v):
+def angular_sim_05_1(u,v):
+    """Angular similarity on the [0.5, 1] scale.
+
+    The formula is ((1 - arccos(cos)/pi) + 1) / 2, where cos is the
+    cosine of the angle between `u` and `v`. The range is [0.5, 1]:
+    identical vectors give 1.0, orthogonal vectors 0.75, and opposite
+    vectors 0.5, so 0.75 means orthogonal.
+
+    AWAY, TOWARDS and `style_score` do not depend on this scale. On a
+    [0, 1] scale, `sim_c` and every difference of this measure double,
+    and `away` and `towards` are ratios of such terms, so the factor
+    cancels; `style_score` is `sqrt(away * towards)`
+    (`tst_utils/eval/performance/scoring.py:74`). Only a threshold on
+    the value itself depends on the scale, for example
+    `SIM_MEASURE_UB = 0.92` in `tst_utils/styled_pph_gen.py`. The measure
+    uses only the angle, so the norm of `u` and `v` does not matter.
+    """
     ac_inp = np.dot(u,v)/(np.linalg.norm(u) * np.linalg.norm(v))
     sim = 1 - np.arccos(np.clip(ac_inp, -1, 1))/np.pi
     return (sim + 1)/2
+
+# 30 code files import the old name; it stays the same object.
+sim_measure = angular_sim_05_1
 
 def sim_c(u, v):
     return (1 - sim_measure(u,v))
