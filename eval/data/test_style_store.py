@@ -92,7 +92,8 @@ def _handmade_encoded(texts, key="base_v1", scale=15.0):
         "n_rows": n,
     }
     label.update(measure_normalization(embeddings))
-    return EncodedStyle(embeddings=embeddings, label=label)
+    return EncodedStyle(embeddings=embeddings, label=label,
+                        text_keys=tuple(style_text_key(t) for t in texts))
 
 
 def test_round_trip_save_load_join(tmp_path):
@@ -212,6 +213,69 @@ def test_label_is_read_before_rows(tmp_path, monkeypatch):
     monkeypatch.setattr(pq_module, "read_table", _boom)
     with pytest.raises(StyleLabelError, match="base_v2"):
         load_style_embeddings(path, expect_encoder="base_v1")
+
+
+# ---------------- review F3: text key bound to the encoded text -------------
+
+class _FakeStyleModel:
+    """Deterministic stand-in: same row for every text, raw-scale (norm ~ 25)."""
+
+    def encode(self, texts, show_progress_bar=True, normalize_embeddings=False):
+        rows = np.tile(np.array([15.0, 14.0, 13.0, 12.0], dtype=np.float32),
+                       (len(list(texts)), 1))
+        if normalize_embeddings:
+            rows = rows / np.linalg.norm(rows, axis=1, keepdims=True)
+        return rows
+
+
+def _patch_fake_encoder(monkeypatch):
+    """Route the real encode_style through a fake encoder (no model, no GPU)."""
+    import tst_utils.eval.metrics.style as style_module
+    monkeypatch.setattr(style_module, "load_style_encoder",
+                        lambda key: _FakeStyleModel())
+
+
+def test_encode_style_retains_input_text_keys(monkeypatch):
+    _patch_fake_encoder(monkeypatch)
+    from tst_utils.eval.metrics.style import encode_style
+    encoded = encode_style(["alpha", "beta"], "base_v1", normalize=False)
+    assert list(encoded.text_keys) == [style_text_key("alpha"),
+                                       style_text_key("beta")]
+
+
+def test_save_rejects_reordered_texts(monkeypatch, tmp_path):
+    """The review's F3 case: saving ['beta','alpha'] for an encode of
+    ['alpha','beta'] must raise, naming position 0 (before the fix it wrote
+    silently and joined the vectors to the wrong texts)."""
+    _patch_fake_encoder(monkeypatch)
+    from tst_utils.eval.metrics.style import encode_style
+    encoded = encode_style(["alpha", "beta"], "base_v1", normalize=False)
+    path = str(tmp_path / "side.parquet")
+    with pytest.raises(StyleLabelError, match="position 0"):
+        save_style_embeddings(["beta", "alpha"], encoded, path)
+
+
+def test_save_rejects_text_edited_after_encode(monkeypatch, tmp_path):
+    _patch_fake_encoder(monkeypatch)
+    from tst_utils.eval.metrics.style import encode_style
+    encoded = encode_style(["  alpha  ", "beta"], "base_v1", normalize=False)
+    path = str(tmp_path / "side.parquet")
+    with pytest.raises(StyleLabelError, match="position 0"):
+        save_style_embeddings(["alpha", "beta"], encoded, path)
+
+
+def test_save_matching_texts_writes_and_joins(monkeypatch, tmp_path):
+    _patch_fake_encoder(monkeypatch)
+    from tst_utils.eval.metrics.style import encode_style
+    texts = ["alpha", "beta"]
+    encoded = encode_style(texts, "base_v1", normalize=False)
+    path = str(tmp_path / "side.parquet")
+    save_style_embeddings(texts, encoded, path)
+    joined = join_style_embeddings(pd.DataFrame({"text": texts}), path,
+                                   "text", "emb")
+    expected = encoded.embeddings.astype(np.float16).astype(np.float32)
+    for got, want in zip(joined["emb"], expected):
+        assert float(np.max(np.abs(got - want))) == 0.0
 
 
 def _handmade_groups(n=6):

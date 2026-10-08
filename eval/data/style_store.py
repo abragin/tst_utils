@@ -111,6 +111,15 @@ def save_style_embeddings(texts, encoded, path, **free_fields):
     once, keeping the first. The label goes into the parquet schema
     metadata under the key `style_label`, as JSON: the encoder label,
     with `n_rows` set to the number of STORED rows, plus the free fields.
+
+    The text/vector association is enforced, not assumed (review F3):
+    every supplied text's ``style_text_key`` must equal the retained
+    ``encoded.text_keys`` at the same position. The writer never reorders
+    silently, so a changed order or a text edited after the encode raises
+    `StyleLabelError` naming the first differing position. `encoded` is
+    expected to come from `encode_style`; a hand-built `EncodedStyle`
+    without retained keys is rejected, because the association cannot be
+    checked.
     """
     embeddings = getattr(encoded, "embeddings", None)
     encoder_label = getattr(encoded, "label", None)
@@ -132,6 +141,27 @@ def save_style_embeddings(texts, encoded, path, **free_fields):
     for key in free_fields:
         if key not in _FREE_FIELDS:
             raise ValueError(f"unknown free field: {key}")
+    retained_keys = tuple(getattr(encoded, "text_keys", ()) or ())
+    if not retained_keys:
+        raise StyleLabelError(
+            "save_style_embeddings: encoded carries no text keys (it did "
+            "not come from encode_style), so the text/vector association "
+            "cannot be checked"
+        )
+    supplied_keys = [style_text_key(text) for text in texts]
+    if list(retained_keys) != supplied_keys:
+        position = min(len(retained_keys), len(supplied_keys))
+        for index, (retained, supplied) in enumerate(
+            zip(retained_keys, supplied_keys)
+        ):
+            if retained != supplied:
+                position = index
+                break
+        raise StyleLabelError(
+            "save_style_embeddings: the supplied text at position "
+            f"{position} differs from the encoded input (the order changed, "
+            "or the text was edited after the encode)"
+        )
     seen = set()
     kept = []
     stored_keys = []

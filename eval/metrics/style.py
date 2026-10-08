@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 from huggingface_hub import snapshot_download
 from sentence_transformers import SentenceTransformer
-from tst_utils.eval.data.style_store import measure_normalization
+from tst_utils.eval.data.style_store import measure_normalization, style_text_key
 from tst_utils.eval.model_names import STYLE_ENCODER_KEY
 from tst_utils.eval.style_encoder_registry import (
     get_encoder,
@@ -110,10 +110,18 @@ def load_style_encoder(key):
 
 @dataclass(frozen=True)
 class EncodedStyle:
-    """Vectors fresh from an encoder, with the label that describes them."""
+    """Vectors fresh from an encoder, with the label that describes them.
+
+    ``text_keys`` holds one :func:`style_text_key` per input row, in input
+    order, computed from the exact strings the encoder received. A writer
+    can compare it against the texts it is handed, so the key stays bound
+    to the text that was actually encoded (review F3). It is a tuple so the
+    dataclass stays hashable and the ordering is explicit.
+    """
 
     embeddings: np.ndarray
     label: dict = field(default_factory=dict)
+    text_keys: tuple = ()
 
 
 def encode_style(texts, encoder_key, *, normalize):
@@ -133,16 +141,18 @@ def encode_style(texts, encoder_key, *, normalize):
             `calc_style_embeddings`.
 
     Returns:
-        EncodedStyle: `embeddings` of shape (n, dim), and `label` with
+        EncodedStyle: `embeddings` of shape (n, dim), `label` with
             `encoder_key`, `file_sha256` (copied from the registry entry),
             `dim`, `n_rows`, and the `normalization`, `norm_min`,
-            `norm_max` measured on the embeddings.
+            `norm_max` measured on the embeddings, and `text_keys`, one
+            `style_text_key(text)` per input row in input order.
     """
     entry = get_encoder(encoder_key)
     model = load_style_encoder(encoder_key)
+    texts = list(texts)
     embeddings = np.asarray(
         model.encode(
-            list(texts),
+            texts,
             show_progress_bar=True,
             normalize_embeddings=normalize,
         )
@@ -154,7 +164,9 @@ def encode_style(texts, encoder_key, *, normalize):
         "n_rows": int(embeddings.shape[0]),
     }
     label.update(measure_normalization(embeddings))
-    return EncodedStyle(embeddings=embeddings, label=label)
+    text_keys = tuple(style_text_key(text) for text in texts)
+    return EncodedStyle(embeddings=embeddings, label=label,
+                        text_keys=text_keys)
 
 
 def calc_style_embeddings(texts, *, normalize):

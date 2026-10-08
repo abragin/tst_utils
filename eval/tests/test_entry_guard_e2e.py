@@ -125,7 +125,7 @@ def test_inline_column_warns_and_reencodes(monkeypatch, n_versions):
 def test_side_file_zero_source_encodes(monkeypatch, tmp_path, n_versions):
     import warnings
     from tst_utils.eval.data.style_store import (
-        save_style_embeddings, measure_normalization,
+        save_style_embeddings, measure_normalization, style_text_key,
     )
     from tst_utils.eval.metrics.style import EncodedStyle
     from tst_utils.eval.style_encoder_registry import get_encoder
@@ -136,8 +136,9 @@ def test_side_file_zero_source_encodes(monkeypatch, tmp_path, n_versions):
              "dim": 8, "n_rows": len(SOURCES)}
     label.update(measure_normalization(embeddings))
     path = str(tmp_path / "side.parquet")
-    save_style_embeddings(SOURCES, EncodedStyle(embeddings=embeddings,
-                                                label=label), path)
+    save_style_embeddings(SOURCES, EncodedStyle(
+        embeddings=embeddings, label=label,
+        text_keys=tuple(style_text_key(t) for t in SOURCES)), path)
     with warnings.catch_warnings():
         warnings.simplefilter("error", StyleProvenanceWarning)
         _pm, counter = _run(_base_df(), monkeypatch, n_versions,
