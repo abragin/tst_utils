@@ -92,7 +92,13 @@ class StyleLabelError(ValueError):
 
 _FREE_FIELDS = ("run_name", "date", "notes", "provenance")
 
-_ENCODER_LABEL_FIELDS = (
+# The required label schema, in one place, mirroring exactly what the writers
+# write. `encode_style` -> `save_style_embeddings` writes the per-row side-file
+# label; `build_centroids` writes the centroid npz label. The readers require
+# these fields, so a truncated or hand-built label cannot pass as checked
+# (review F4). `input_normalization` may be the literal "unknown" for a
+# historical centroid whose input norms were never measured.
+SIDE_LABEL_FIELDS = (
     "encoder_key",
     "file_sha256",
     "dim",
@@ -101,6 +107,32 @@ _ENCODER_LABEL_FIELDS = (
     "norm_min",
     "norm_max",
 )
+
+CENTROID_LABEL_FIELDS = (
+    "kind",
+    "encoder_key",
+    "file_sha256",
+    "dim",
+    "input_normalization",
+    "renormalized",
+    "n_rows_per_group",
+    "centroid_norm_min",
+    "centroid_norm_max",
+)
+
+
+def _missing_label_fields(label, required):
+    """Return the required field names absent from `label`."""
+    return [field for field in required if field not in label]
+
+
+def require_label_fields(label, required, *, where, kind):
+    """Raise `StyleLabelError` if `label` lacks any required field."""
+    missing = _missing_label_fields(label, required)
+    if missing:
+        raise StyleLabelError(
+            f"{where}: {kind} label is missing required field(s): {missing}"
+        )
 
 
 def save_style_embeddings(texts, encoded, path, **free_fields):
@@ -127,7 +159,7 @@ def save_style_embeddings(texts, encoded, path, **free_fields):
         not isinstance(embeddings, np.ndarray)
         or embeddings.ndim != 2
         or not isinstance(encoder_label, dict)
-        or any(key not in encoder_label for key in _ENCODER_LABEL_FIELDS)
+        or any(key not in encoder_label for key in SIDE_LABEL_FIELDS)
     ):
         raise TypeError(
             "encoded must be an EncodedStyle, "
@@ -206,7 +238,10 @@ def load_style_embeddings(path, expect_encoder=STYLE_ENCODER_KEY):
     """Load a parquet side file after checking its label.
 
     The label is read with `pq.read_schema` BEFORE any row, so a file
-    whose label mismatches raises without touching the row data.
+    whose label mismatches raises without touching the row data. The
+    label must carry every field of `SIDE_LABEL_FIELDS` (review F4), and
+    the label is then checked against the file itself: `n_rows` equals
+    the stored row count and `dim` equals the `style_emb` vector width.
     """
     schema = pq.read_schema(path)
     raw = (schema.metadata or {}).get(b"style_label")
@@ -223,7 +258,22 @@ def load_style_embeddings(path, expect_encoder=STYLE_ENCODER_KEY):
             f"style file {path} names a file_sha256 that differs from "
             f"the registry entry of {expect_encoder!r}"
         )
-    return pq.read_table(path).to_pandas(), label
+    require_label_fields(label, SIDE_LABEL_FIELDS,
+                          where=f"style file {path}", kind="side-file")
+    table = pq.read_table(path)
+    n_rows = len(table)
+    if int(label["n_rows"]) != n_rows:
+        raise StyleLabelError(
+            f"style file {path} label says n_rows {label['n_rows']} but the "
+            f"file has {n_rows} rows"
+        )
+    width = getattr(table.schema.field("style_emb").type, "list_size", None)
+    if width is not None and int(label["dim"]) != int(width):
+        raise StyleLabelError(
+            f"style file {path} label says dim {label['dim']} but style_emb "
+            f"has width {width}"
+        )
+    return table.to_pandas(), label
 
 
 def join_style_embeddings(df, path, text_col, out_col,
@@ -297,7 +347,7 @@ def _require_encoded_style(encoded):
         not isinstance(embeddings, np.ndarray)
         or embeddings.ndim != 2
         or not isinstance(encoder_label, dict)
-        or any(key not in encoder_label for key in _ENCODER_LABEL_FIELDS)
+        or any(key not in encoder_label for key in SIDE_LABEL_FIELDS)
     ):
         raise TypeError(
             "encoded must be an EncodedStyle, "

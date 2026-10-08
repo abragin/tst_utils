@@ -4,7 +4,12 @@ import pandas as pd
 import numpy as np
 import os
 
-from tst_utils.eval.data.style_store import StyleLabelError, warn_provenance
+from tst_utils.eval.data.style_store import (
+    CENTROID_LABEL_FIELDS,
+    StyleLabelError,
+    require_label_fields,
+    warn_provenance,
+)
 from tst_utils.eval.model_names import STYLE_ENCODER_KEY
 from tst_utils.eval.style_encoder_registry import get_encoder
 
@@ -25,7 +30,17 @@ def read_style_label(path):
         return json.loads(str(loaded["__style_label__"]))
 
 
-def _check_npz_label(path, label, expect_encoder, entry_point):
+def _check_npz_label(path, label, expect_encoder, entry_point, vectors=None):
+    """Check a centroid npz label, and (when given) the vectors against it.
+
+    `vectors` is the dict of loaded arrays; when given, every float array's
+    last axis must equal the label's `dim` (review F4). `input_normalization`
+    may be the literal "unknown" for a historical centroid whose input norms
+    were never measured; otherwise it must be the measured dict that
+    `build_centroids` writes. The historical input counts (the values of
+    `n_rows_per_group`) are required as a field but cannot be re-derived
+    from the stored means, so they are not re-checked.
+    """
     if label is None:
         if expect_encoder == "base_v1":
             warn_provenance(
@@ -48,6 +63,26 @@ def _check_npz_label(path, label, expect_encoder, entry_point):
             f"{entry_point}: npz {path} names a file_sha256 that differs "
             f"from the registry entry of {expect_encoder!r}"
         )
+    require_label_fields(label, CENTROID_LABEL_FIELDS,
+                         where=f"{entry_point}: npz {path}", kind="centroid")
+    input_normalization = label["input_normalization"]
+    if input_normalization != "unknown" and not isinstance(
+        input_normalization, dict
+    ):
+        raise StyleLabelError(
+            f"{entry_point}: npz {path} input_normalization must be a "
+            "measured dict or the string 'unknown', "
+            f"got {type(input_normalization).__name__}"
+        )
+    if vectors is not None:
+        dim = label["dim"]
+        for key, array in vectors.items():
+            if getattr(array, "dtype", None) is not None and array.dtype.kind == "f" \
+                    and getattr(array, "ndim", 0) >= 1 and array.shape[-1] != dim:
+                raise StyleLabelError(
+                    f"{entry_point}: npz {path} vector {key!r} has width "
+                    f"{array.shape[-1]}, label says dim {dim}"
+                )
 
 
 def load_author_styles(expect_encoder=None):
@@ -65,10 +100,11 @@ def load_author_styles(expect_encoder=None):
     if expect_encoder is None:
         expect_encoder = STYLE_ENCODER_KEY
     file_path = os.path.join(os.path.dirname(__file__), "author_styles.npz")
-    _check_npz_label(file_path, read_style_label(file_path), expect_encoder,
-                     "load_author_styles")
     with np.load(file_path) as loaded:
-        author_styles = {key: loaded[key] for key in loaded if key != "__style_label__"}
+        author_styles = {key: loaded[key] for key in loaded
+                         if key != "__style_label__"}
+    _check_npz_label(file_path, read_style_label(file_path), expect_encoder,
+                     "load_author_styles", author_styles)
     return author_styles
 
 
@@ -117,10 +153,10 @@ def load_centroids_npz(path, *, renormalize, expect_encoder=None):
     """
     if expect_encoder is None:
         expect_encoder = STYLE_ENCODER_KEY
-    _check_npz_label(path, read_style_label(path), expect_encoder,
-                     "load_centroids_npz")
     with np.load(path) as loaded:
         result = {k: loaded[k] for k in loaded.files if k != "__style_label__"}
+    _check_npz_label(path, read_style_label(path), expect_encoder,
+                     "load_centroids_npz", result)
     if renormalize:
         result = {
             k: (renormalize_centroid(v)

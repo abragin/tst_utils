@@ -278,6 +278,69 @@ def test_save_matching_texts_writes_and_joins(monkeypatch, tmp_path):
         assert float(np.max(np.abs(got - want))) == 0.0
 
 
+# ---------------- review F4: a guarded reader needs a complete label --------
+
+def _valid_side_file(monkeypatch, tmp_path):
+    _patch_fake_encoder(monkeypatch)
+    from tst_utils.eval.metrics.style import encode_style
+    texts = ["alpha", "beta"]
+    encoded = encode_style(texts, "base_v1", normalize=False)
+    path = str(tmp_path / "side.parquet")
+    save_style_embeddings(texts, encoded, path)
+    return path
+
+
+def _rewrite_label(src, dst, label):
+    import json
+    import pyarrow.parquet as pq
+    table = pq.read_table(src)
+    metadata = dict(table.schema.metadata)
+    metadata[b"style_label"] = json.dumps(label).encode("utf-8")
+    pq.write_table(table.replace_schema_metadata(metadata), dst)
+
+
+def test_side_file_missing_required_field_raises(monkeypatch, tmp_path):
+    path = _valid_side_file(monkeypatch, tmp_path)
+    _frame, label = load_style_embeddings(path)
+    del label["normalization"]
+    bad = str(tmp_path / "missing.parquet")
+    _rewrite_label(path, bad, label)
+    with pytest.raises(StyleLabelError, match="missing required field"):
+        load_style_embeddings(bad)
+
+
+def test_side_file_wrong_n_rows_raises(monkeypatch, tmp_path):
+    path = _valid_side_file(monkeypatch, tmp_path)
+    _frame, label = load_style_embeddings(path)
+    label["n_rows"] = label["n_rows"] + 1
+    bad = str(tmp_path / "rows.parquet")
+    _rewrite_label(path, bad, label)
+    with pytest.raises(StyleLabelError, match="n_rows"):
+        load_style_embeddings(bad)
+
+
+def test_side_file_wrong_dim_raises(monkeypatch, tmp_path):
+    path = _valid_side_file(monkeypatch, tmp_path)
+    _frame, label = load_style_embeddings(path)
+    label["dim"] = label["dim"] + 1
+    bad = str(tmp_path / "dim.parquet")
+    _rewrite_label(path, bad, label)
+    with pytest.raises(StyleLabelError, match="width"):
+        load_style_embeddings(bad)
+
+
+def test_side_file_wrong_dim_still_reads_label_first(monkeypatch, tmp_path):
+    """The identity checks run before any row is read, so a tampered label
+    raises even when row reading is impossible (the existing guarantee)."""
+    path = _valid_side_file(monkeypatch, tmp_path)
+    _frame, label = load_style_embeddings(path)
+    label["file_sha256"] = {"model.safetensors": "0" * 64}
+    bad = str(tmp_path / "hash.parquet")
+    _rewrite_label(path, bad, label)
+    with pytest.raises(StyleLabelError, match="file_sha256"):
+        load_style_embeddings(bad)
+
+
 def _handmade_groups(n=6):
     return ["anna", "anna", "bible", "bible", "bible", "news"][:n]
 
@@ -360,12 +423,29 @@ def test_centroid_round_trip(tmp_path):
         assert json.loads(str(raw["__style_label__"]))["kind"] == "centroid"
 
 
+def _centroid_label(dim=60, **overrides):
+    """A complete centroid label, as build_centroids writes one."""
+    label = {
+        "kind": "centroid",
+        "encoder_key": "base_v1",
+        "file_sha256": dict(get_encoder("base_v1")["file_sha256"]),
+        "dim": dim,
+        "input_normalization": {"normalization": "none",
+                                "norm_min": 14.0, "norm_max": 16.0},
+        "renormalized": False,
+        "n_rows_per_group": {"k": 4},
+        "centroid_norm_min": 14.0,
+        "centroid_norm_max": 16.0,
+    }
+    label.update(overrides)
+    return label
+
+
 def test_labelled_centroid_mismatch_raises(tmp_path):
     import json
     from tst_utils.eval.data.load import load_centroids_npz
     vectors = {"k": np.ones(60, dtype=np.float32)}
-    good = {"encoder_key": "base_v1",
-            "file_sha256": get_encoder("base_v1")["file_sha256"]}
+    good = _centroid_label(dim=60)
     other = dict(good, encoder_key="base_v2")
     bad_hash = dict(good, file_sha256={"model.safetensors": "0" * 64})
     p_other = str(tmp_path / "other.npz")
@@ -376,6 +456,40 @@ def test_labelled_centroid_mismatch_raises(tmp_path):
         load_centroids_npz(p_other, renormalize=False)
     with pytest.raises(StyleLabelError, match="file_sha256"):
         load_centroids_npz(p_bad, renormalize=False)
+
+
+def test_centroid_missing_required_field_raises(tmp_path):
+    """F4: a label without input_normalization must not pass as checked."""
+    import json
+    from tst_utils.eval.data.load import load_centroids_npz
+    label = _centroid_label(dim=60)
+    del label["input_normalization"]
+    path = str(tmp_path / "c.npz")
+    np.savez(path, k=np.ones(60, dtype=np.float32),
+             __style_label__=json.dumps(label))
+    with pytest.raises(StyleLabelError, match="missing required field"):
+        load_centroids_npz(path, renormalize=False)
+
+
+def test_centroid_wrong_dim_raises(tmp_path):
+    import json
+    from tst_utils.eval.data.load import load_centroids_npz
+    label = _centroid_label(dim=61)          # vector is width 60
+    path = str(tmp_path / "c.npz")
+    np.savez(path, k=np.ones(60, dtype=np.float32),
+             __style_label__=json.dumps(label))
+    with pytest.raises(StyleLabelError, match="width 60"):
+        load_centroids_npz(path, renormalize=False)
+
+
+def test_centroid_input_normalization_unknown_allowed(tmp_path):
+    import json
+    from tst_utils.eval.data.load import load_centroids_npz
+    label = _centroid_label(dim=60, input_normalization="unknown")
+    path = str(tmp_path / "c.npz")
+    np.savez(path, k=np.ones(60, dtype=np.float32),
+             __style_label__=json.dumps(label))
+    assert set(load_centroids_npz(path, renormalize=False)) == {"k"}
 
 
 def _unlabelled_npz(path):
