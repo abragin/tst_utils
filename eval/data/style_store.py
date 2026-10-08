@@ -6,9 +6,16 @@ they return a vector.
 """
 
 import hashlib
+import json
 import warnings
 
 import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from tst_utils.eval.model_names import STYLE_ENCODER_KEY
+from tst_utils.eval.style_encoder_registry import get_encoder
 
 
 class StyleProvenanceWarning(FutureWarning):
@@ -77,3 +84,144 @@ def measure_normalization(embeddings):
 def warn_provenance(message):
     """Emit a `StyleProvenanceWarning` with stacklevel 2."""
     warnings.warn(message, StyleProvenanceWarning, stacklevel=2)
+
+
+class StyleLabelError(ValueError):
+    """A stored style file fails its label check."""
+
+
+_FREE_FIELDS = ("run_name", "date", "notes", "provenance")
+
+_ENCODER_LABEL_FIELDS = (
+    "encoder_key",
+    "file_sha256",
+    "dim",
+    "n_rows",
+    "normalization",
+    "norm_min",
+    "norm_max",
+)
+
+
+def save_style_embeddings(texts, encoded, path, **free_fields):
+    """Save per-row style vectors with their label as a parquet side file.
+
+    `encoded` must be an `EncodedStyle` (checked structurally, so this
+    module never imports `eval.metrics.style`). Repeated texts are stored
+    once, keeping the first. The label goes into the parquet schema
+    metadata under the key `style_label`, as JSON: the encoder label,
+    with `n_rows` set to the number of STORED rows, plus the free fields.
+    """
+    embeddings = getattr(encoded, "embeddings", None)
+    encoder_label = getattr(encoded, "label", None)
+    if (
+        not isinstance(embeddings, np.ndarray)
+        or embeddings.ndim != 2
+        or not isinstance(encoder_label, dict)
+        or any(key not in encoder_label for key in _ENCODER_LABEL_FIELDS)
+    ):
+        raise TypeError(
+            "encoded must be an EncodedStyle, "
+            f"got {type(encoded).__name__}"
+        )
+    texts = list(texts)
+    if len(texts) != encoder_label["n_rows"]:
+        raise ValueError(
+            f"{len(texts)} texts for {encoder_label['n_rows']} encoded rows"
+        )
+    for key in free_fields:
+        if key not in _FREE_FIELDS:
+            raise ValueError(f"unknown free field: {key}")
+    stored_keys = []
+    stored_excerpts = []
+    stored_vectors = []
+    seen = set()
+    for text, vector in zip(texts, embeddings):
+        key = style_text_key(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        stored_keys.append(key)
+        stored_excerpts.append(text[:80])
+        stored_vectors.append(np.asarray(vector, dtype=np.float16))
+    label = dict(encoder_label)
+    label["n_rows"] = len(stored_keys)
+    for key, value in free_fields.items():
+        if key in label:
+            raise ValueError(f"free field overwrites an encoder field: {key}")
+        label[key] = value
+    schema = pa.schema(
+        [
+            pa.field("text_key", pa.string()),
+            pa.field("text_excerpt", pa.string()),
+            pa.field("style_emb", pa.list_(pa.float16())),
+        ],
+        metadata={b"style_label": json.dumps(label).encode("utf-8")},
+    )
+    table = pa.Table.from_arrays(
+        [
+            pa.array(stored_keys, type=pa.string()),
+            pa.array(stored_excerpts, type=pa.string()),
+            pa.array(
+                [list(vector) for vector in stored_vectors],
+                type=pa.list_(pa.float16()),
+            ),
+        ],
+        schema=schema,
+    )
+    pq.write_table(table, path)
+
+
+def load_style_embeddings(path, expect_encoder=STYLE_ENCODER_KEY):
+    """Load a parquet side file after checking its label.
+
+    The label is read with `pq.read_schema` BEFORE any row, so a file
+    whose label mismatches raises without touching the row data.
+    """
+    schema = pq.read_schema(path)
+    raw = (schema.metadata or {}).get(b"style_label")
+    if raw is None:
+        raise StyleLabelError(f"no style label in {path}")
+    label = json.loads(bytes(raw).decode("utf-8"))
+    if label.get("encoder_key") != expect_encoder:
+        raise StyleLabelError(
+            f"style file {path} names encoder {label.get('encoder_key')!r}, "
+            f"expected {expect_encoder!r}"
+        )
+    if label.get("file_sha256") != get_encoder(expect_encoder)["file_sha256"]:
+        raise StyleLabelError(
+            f"style file {path} names a file_sha256 that differs from "
+            f"the registry entry of {expect_encoder!r}"
+        )
+    return pq.read_table(path).to_pandas(), label
+
+
+def join_style_embeddings(df, path, text_col, out_col,
+                          expect_encoder=STYLE_ENCODER_KEY):
+    """Join a side file onto `df` by exact-text key.
+
+    Returns a copy; `df` is not mutated and nothing is written to
+    `df.attrs`. `out_col` holds float32 1D np.ndarray per row, the same
+    form as the inline columns.
+    """
+    if out_col in df.columns:
+        raise ValueError(f"output column already exists: {out_col}")
+    frame, _label = load_style_embeddings(path, expect_encoder)
+    by_key = {}
+    for _, row in frame.iterrows():
+        by_key[row["text_key"]] = np.asarray(
+            row["style_emb"], dtype=np.float32
+        ).reshape(-1)
+    keys = [style_text_key(text) for text in df[text_col]]
+    missing = [
+        str(text)[:80] for key, text in zip(keys, df[text_col])
+        if key not in by_key
+    ]
+    if missing:
+        raise StyleLabelError(
+            f"{len(missing)} texts have no stored row, "
+            f"first missing excerpt: {missing[0]!r}"
+        )
+    joined = df.copy()
+    joined[out_col] = [by_key[key] for key in keys]
+    return joined
