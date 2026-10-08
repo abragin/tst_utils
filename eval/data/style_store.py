@@ -228,6 +228,38 @@ def join_style_embeddings(df, path, text_col, out_col,
     return joined
 
 
+def guard_inline_style_columns(df, *, source_style_path=None, entry_point):
+    """Drop or join unlabelled inline style columns at a pipeline entry.
+
+    `entry_point` (required keyword) names the caller in warning texts.
+    Returns a new frame; `df` is not mutated.
+    """
+    frame = df.copy()
+    if source_style_path is not None:
+        if "text_style_emb" in frame.columns:
+            frame = frame.drop(columns=["text_style_emb"])
+        frame = join_style_embeddings(frame, source_style_path, "text",
+                                      "text_style_emb")
+    elif "text_style_emb" in frame.columns:
+        warn_provenance(
+            f"{entry_point}: stored column text_style_emb has no label; "
+            "dropped, it is encoded fresh"
+        )
+        frame = frame.drop(columns=["text_style_emb"])
+    if "target_style_emb" in frame.columns:
+        if STYLE_ENCODER_KEY == "base_v1":
+            warn_provenance(
+                f"{entry_point}: stored column target_style_emb has no "
+                "label; an unlabelled file predates the label"
+            )
+        else:
+            raise StyleLabelError(
+                f"{entry_point}: stored column target_style_emb has no "
+                f"label, and the pin is {STYLE_ENCODER_KEY!r}"
+            )
+    return frame
+
+
 def _require_encoded_style(encoded):
     embeddings = getattr(encoded, "embeddings", None)
     encoder_label = getattr(encoded, "label", None)

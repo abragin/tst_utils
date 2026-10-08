@@ -388,3 +388,77 @@ def test_load_author_styles_labelled_copy_matches(tmp_path):
     assert set(copied) == set(original)
     for key in original:
         assert np.array_equal(copied[key], original[key])
+
+
+def _inline_frame():
+    return pd.DataFrame({
+        "text": ["alpha", "beta"],
+        "text_style_emb": [np.ones(4, dtype=np.float32),
+                           2 * np.ones(4, dtype=np.float32)],
+    })
+
+
+def test_guard_drops_inline_source_column():
+    import tst_utils.eval.data.style_store as store_module
+    df = _inline_frame()
+    with pytest.warns(StyleProvenanceWarning, match="text_style_emb"):
+        guarded = store_module.guard_inline_style_columns(df, entry_point="probe")
+    assert "text_style_emb" not in guarded.columns
+    assert list(guarded.columns) == ["text"]
+    pd.testing.assert_frame_equal(df, _inline_frame())
+
+
+def test_guard_joins_side_file(tmp_path):
+    import warnings
+    import tst_utils.eval.data.style_store as store_module
+    texts = ["alpha", "beta"]
+    path = str(tmp_path / "side.parquet")
+    save_style_embeddings(texts, _handmade_encoded(texts), path)
+    df = _inline_frame()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", StyleProvenanceWarning)
+        guarded = store_module.guard_inline_style_columns(
+            df, source_style_path=path, entry_point="probe")
+    assert guarded["text_style_emb"].iloc[0].dtype == np.float32
+    assert float(np.max(np.abs(
+        np.stack(guarded["text_style_emb"].to_numpy())
+        - _handmade_encoded(texts).embeddings.astype(np.float16).astype(np.float32)
+    ))) == 0.0
+
+
+def test_guard_side_file_missing_text_raises(tmp_path):
+    import tst_utils.eval.data.style_store as store_module
+    path = str(tmp_path / "side.parquet")
+    save_style_embeddings(["alpha"], _handmade_encoded(["alpha"]), path)
+    df = pd.DataFrame({"text": ["alpha", "gamma"]})
+    with pytest.raises(StyleLabelError, match="1 texts"):
+        store_module.guard_inline_style_columns(
+            df, source_style_path=path, entry_point="probe")
+
+
+def test_guard_target_warns_on_base_v1():
+    import tst_utils.eval.data.style_store as store_module
+    df = pd.DataFrame({"text": ["alpha"],
+                       "target_style_emb": [np.ones(4, dtype=np.float32)]})
+    with pytest.warns(StyleProvenanceWarning, match="target_style_emb"):
+        guarded = store_module.guard_inline_style_columns(df, entry_point="probe")
+    assert "target_style_emb" in guarded.columns
+
+
+def test_guard_target_raises_on_moved_pin(monkeypatch):
+    import tst_utils.eval.data.style_store as store_module
+    monkeypatch.setattr(store_module, "STYLE_ENCODER_KEY", "base_v2")
+    df = pd.DataFrame({"text": ["alpha"],
+                       "target_style_emb": [np.ones(4, dtype=np.float32)]})
+    with pytest.raises(StyleLabelError, match="target_style_emb"):
+        store_module.guard_inline_style_columns(df, entry_point="probe")
+
+
+def test_guard_quiet_frame_stays_quiet():
+    import warnings
+    import tst_utils.eval.data.style_store as store_module
+    df = pd.DataFrame({"text": ["alpha"]})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", StyleProvenanceWarning)
+        guarded = store_module.guard_inline_style_columns(df, entry_point="probe")
+    pd.testing.assert_frame_equal(guarded, df)
