@@ -1,0 +1,40 @@
+{
+  "exclude": [
+    "README.md",
+    ".gitattributes"
+  ],
+  "base_v1": {
+    "hub_id": "abragin/ruBert-style-base",
+    "revision": "cac972ca8a304086c4f15611a2ab923932b2cb85",
+    "file_sha256": {
+      "1_Pooling/config.json": "1c8bc7bd750c5c20d8707f1c5c578f5d69bb3d1d5ebcf4b2fde5128de154ec1c",
+      "config.json": "b439bbf9028e6bdff66a2c38fe08732e9fba8d4debc12bbbedc1891bb123b83a",
+      "config_sentence_transformers.json": "de73daed239fc85d1d02a4b8fab9399910e36ad3c7f9e4918da0429b43e8d883",
+      "model.safetensors": "69e300548b7bdf9dc44cac4aa334ff59f068d59072d7236aaaa4147e445480f2",
+      "modules.json": "8f4b264b80206c830bebbdcae377e137925650a433b689343a63bdc9b3145460",
+      "sentence_bert_config.json": "ec8e29d6dcb61b611b7d3fdd2982c4524e6ad985959fa7194eacfb655a8d0d51",
+      "special_tokens_map.json": "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a",
+      "tokenizer.json": "47a5b737c4d1dc0e58d2985f99a2bc65fde6950268dbefbccfbf7c8381e7177d",
+      "tokenizer_config.json": "9ca59277519f6e3692c8685e26b94d4afca2d5438deff66483db495e48735810",
+      "vocab.txt": "bbe5063cc3d7a314effd90e9c5099cf493b81f2b9552c155264e16eeab074237"
+    },
+    "description": "The first accepted style encoder, trained in the Phase 2 seed sweep. The HDD copy of this encoder differs from the Hub copy in 3 hashed metadata files (config.json, special_tokens_map.json, tokenizer_config.json), so a load from the HDD copy fails the check; this is correct."
+  },
+  "base_v2": {
+    "hub_id": "abragin/ruBert-style-v2",
+    "revision": "790d5b082e2b05e41d8a931b942dba1b23bcc679",
+    "file_sha256": {
+      "1_Pooling/config.json": "35bbd47d7fdf1e378db6130bcc668b09d1aa67a7bbf7c8f89a9c71f4cc8ebcc6",
+      "config.json": "6931e53577c17fe4fb512a463b74718b290eda4867d79f9d875e1c623e47e536",
+      "config_sentence_transformers.json": "70ae7911247e8fffc9e1d7cae4bb3978c58b681b4f6ce239b11c1179cd945d28",
+      "model.safetensors": "06ee83d8db592de0b16457c1f2b29d613f49d94eb4742346a5c90590277c1afc",
+      "modules.json": "8f4b264b80206c830bebbdcae377e137925650a433b689343a63bdc9b3145460",
+      "sentence_bert_config.json": "948201d8329907aae938fa62f9ceeed53f5694dacc2b87b9f3b78b37ee986529",
+      "special_tokens_map.json": "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a",
+      "tokenizer.json": "47a5b737c4d1dc0e58d2985f99a2bc65fde6950268dbefbccfbf7c8381e7177d",
+      "tokenizer_config.json": "479a5afc56069a77cc24c74a1943501275664e8d493e215f5716a81ebc0e86db",
+      "vocab.txt": "bbe5063cc3d7a314effd90e9c5099cf493b81f2b9552c155264e16eeab074237"
+    },
+    "description": "The accepted style-v2 encoder from run phase2_C_30k (D33). The Hub repo is private, so loading it needs a Hub token."
+  }
+}
