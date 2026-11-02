@@ -25,6 +25,18 @@ gender / entity). Run on tallin:
 
     pytest tst_utils/eval/tests/test_performance_golden.py
 
+Known limit: the golden is blind to the entity pillar (measured 2026-10-06,
+on tallin, task 2026-10-03-pin-scorer-model-revisions). The `entity_score`
+column is 1.0 in all 54 frozen rows, because no canned styled text carries a
+new entity. So a green golden is no evidence that the NER model or the entity
+scorer is unchanged, and `score_v2` cannot show an entity change through the
+golden either. The likely failure of a model revision change is a loss of NER
+recall, which moves `entity_score` toward 1.0, where it already is. The other
+9 columns have 3 to 24 distinct values. The fix: add one canned pair whose
+styled side carries a target-author person name that is absent from the
+source. It changes the baseline, so it needs its own task; no task owns it
+(host, 2026-10-06).
+
 Regenerate the frozen baseline (only when behaviour intentionally changes —
 NOT as part of the behaviour-preserving refactor):
 
