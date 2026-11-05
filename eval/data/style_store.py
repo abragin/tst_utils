@@ -374,7 +374,9 @@ def build_centroids(encoded, groups, *, renormalize, path, texts=None,
     """Build one centroid per group from fresh per-row vectors.
 
     `encoded` must be an `EncodedStyle`, so the encoder key comes from the
-    encode call. `groups` holds one group name per row. The means are
+    encode call. `groups` holds one group name per row, or a tuple of group
+    names for a row that belongs to several groups (a pooled group, such as
+    the step-4 `web_informal`, task 5.2). The means are
     computed in float64; with `renormalize` each mean is L2-normalized.
     The centroids are written as fp16 with `np.savez`, one entry per
     group, plus `__style_label__` (a JSON string). There is no writer
@@ -394,7 +396,15 @@ def build_centroids(encoded, groups, *, renormalize, path, texts=None,
         raise ValueError(
             f"{len(groups)} groups for {embeddings.shape[0]} encoded rows"
         )
-    if "__style_label__" in groups:
+    memberships = [
+        tuple(group) if isinstance(group, (tuple, list)) else (group,)
+        for group in groups
+    ]
+    if any(not names for names in memberships):
+        raise ValueError("every row needs at least one group")
+    if any(len(set(names)) != len(names) for names in memberships):
+        raise ValueError("a row names the same group twice")
+    if any("__style_label__" in names for names in memberships):
         raise ValueError("a group may not be named __style_label__")
     if texts is not None:
         _check_text_keys(encoded, texts, "build_centroids")
@@ -403,11 +413,12 @@ def build_centroids(encoded, groups, *, renormalize, path, texts=None,
     centroids = {}
     n_rows_per_group = {}
     order = []
-    for index, group in enumerate(groups):
-        if group not in n_rows_per_group:
-            n_rows_per_group[group] = []
-            order.append(group)
-        n_rows_per_group[group].append(index)
+    for index, names in enumerate(memberships):
+        for group in names:
+            if group not in n_rows_per_group:
+                n_rows_per_group[group] = []
+                order.append(group)
+            n_rows_per_group[group].append(index)
     for group in order:
         mean = in_float64[n_rows_per_group[group]].mean(axis=0)
         if renormalize:

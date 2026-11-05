@@ -431,6 +431,46 @@ def test_build_centroids_matching_texts_writes(tmp_path):
     assert label["n_rows_per_group"] == {"anna": 2, "bible": 3, "news": 1}
 
 
+# ---------------- task 5.2: a row may belong to several groups ---------------
+
+def test_build_centroids_pooled_group_matches_its_member_rows(tmp_path):
+    """A pooled group (the step-4 web_informal) is the float64 mean over the
+    rows that name it, and each member group keeps its own mean."""
+    from tst_utils.eval.data.style_store import build_centroids
+    texts = ["t%d" % i for i in range(5)]
+    encoded = _handmade_encoded(texts, scale=1.0)
+    groups = ["news", ("pikabu", "web"), ("pikabu", "web"), ("ficbook", "web"),
+              "news"]
+    centroids, label = build_centroids(encoded, groups, renormalize=True,
+                                       texts=texts,
+                                       path=str(tmp_path / "c.npz"))
+    assert label["n_rows_per_group"] == {"news": 2, "pikabu": 2, "web": 3,
+                                         "ficbook": 1}
+    rows = np.asarray(encoded.embeddings, dtype=np.float64)
+    expected = rows[[1, 2, 3]].mean(axis=0)
+    expected = (expected / np.linalg.norm(expected)).astype(np.float16)
+    assert np.array_equal(centroids["web"], expected)
+    expected_pikabu = rows[[1, 2]].mean(axis=0)
+    expected_pikabu = (expected_pikabu
+                       / np.linalg.norm(expected_pikabu)).astype(np.float16)
+    assert np.array_equal(centroids["pikabu"], expected_pikabu)
+    with np.load(str(tmp_path / "c.npz")) as stored:
+        assert set(stored.files) == {"news", "pikabu", "web", "ficbook",
+                                     "__style_label__"}
+
+
+@pytest.mark.parametrize("bad, match", [
+    ((), "at least one group"),
+    (("a", "a"), "same group twice"),
+    (("a", "__style_label__"), "__style_label__"),
+])
+def test_build_centroids_rejects_bad_membership(tmp_path, bad, match):
+    from tst_utils.eval.data.style_store import build_centroids
+    with pytest.raises(ValueError, match=match):
+        build_centroids(_handmade_encoded(["x", "y"]), ["a", bad],
+                        renormalize=False, path=str(tmp_path / "c.npz"))
+
+
 def test_centroid_round_trip(tmp_path):
     import json
     from tst_utils.eval.data.load import load_centroids_npz
