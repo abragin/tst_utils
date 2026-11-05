@@ -10,3 +10,14 @@ PERPL_MODEL_NAME = 'ai-forever/rugpt3small_based_on_gpt2'
 STYLE_MODEL = "abragin/ruBert-style-base"
 # The entry of style_encoders.json that STYLE_MODEL names.
 STYLE_ENCODER_KEY = "base_v1"
+
+
+def style_encoder_key():
+    """The pinned style encoder key, read at call time (task 5.2).
+
+    This is the one pin source. Readers call it whenever they need the
+    default encoder instead of copying `STYLE_ENCODER_KEY` at import or
+    definition time, so a patch of `model_names.STYLE_ENCODER_KEY` (a test,
+    or the pin commit) reaches every reader.
+    """
+    return STYLE_ENCODER_KEY

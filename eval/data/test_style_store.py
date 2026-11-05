@@ -647,11 +647,12 @@ def test_unlabelled_raises_for_base_v2(tmp_path):
 
 def test_unlabelled_default_follows_patched_pin(tmp_path, monkeypatch):
     import tst_utils.eval.data.load as load_module
+    from tst_utils.eval import model_names
     path = _unlabelled_npz(str(tmp_path / "u.npz"))
-    monkeypatch.setattr(load_module, "STYLE_ENCODER_KEY", "base_v2")
+    monkeypatch.setattr(model_names, "STYLE_ENCODER_KEY", "base_v2")
     with pytest.raises(StyleLabelError, match="base_v2"):
         load_module.load_centroids_npz(path, renormalize=False)
-    monkeypatch.setattr(load_module, "STYLE_ENCODER_KEY", "base_v1")
+    monkeypatch.setattr(model_names, "STYLE_ENCODER_KEY", "base_v1")
     with pytest.warns(StyleProvenanceWarning):
         load_module.load_centroids_npz(path, renormalize=False)
 
@@ -758,7 +759,8 @@ def test_guard_target_warns_on_base_v1():
 
 def test_guard_target_raises_on_moved_pin(monkeypatch):
     import tst_utils.eval.data.style_store as store_module
-    monkeypatch.setattr(store_module, "STYLE_ENCODER_KEY", "base_v2")
+    from tst_utils.eval import model_names
+    monkeypatch.setattr(model_names, "STYLE_ENCODER_KEY", "base_v2")
     df = pd.DataFrame({"text": ["alpha"],
                        "target_style_emb": [np.ones(4, dtype=np.float32)]})
     with pytest.raises(StyleLabelError, match="target_style_emb"):

@@ -14,7 +14,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from tst_utils.eval.model_names import STYLE_ENCODER_KEY
+from tst_utils.eval import model_names
 from tst_utils.eval.style_encoder_registry import get_encoder
 
 
@@ -247,7 +247,7 @@ def save_style_embeddings(texts, encoded, path, **free_fields):
     pq.write_table(table, path)
 
 
-def load_style_embeddings(path, expect_encoder=STYLE_ENCODER_KEY):
+def load_style_embeddings(path, expect_encoder=None):
     """Load a parquet side file after checking its label.
 
     The label is read with `pq.read_schema` BEFORE any row, so a file
@@ -255,7 +255,10 @@ def load_style_embeddings(path, expect_encoder=STYLE_ENCODER_KEY):
     label must carry every field of `SIDE_LABEL_FIELDS` (review F4), and
     the label is then checked against the file itself: `n_rows` equals
     the stored row count and `dim` equals the `style_emb` vector width.
+    `expect_encoder=None` means the pin, read at call time.
     """
+    if expect_encoder is None:
+        expect_encoder = model_names.style_encoder_key()
     schema = pq.read_schema(path)
     raw = (schema.metadata or {}).get(b"style_label")
     if raw is None:
@@ -290,7 +293,7 @@ def load_style_embeddings(path, expect_encoder=STYLE_ENCODER_KEY):
 
 
 def join_style_embeddings(df, path, text_col, out_col,
-                          expect_encoder=STYLE_ENCODER_KEY):
+                          expect_encoder=None):
     """Join a side file onto `df` by exact-text key.
 
     Returns a copy; `df` is not mutated and nothing is written to
@@ -340,7 +343,7 @@ def guard_inline_style_columns(df, *, source_style_path=None, entry_point):
         )
         frame = frame.drop(columns=["text_style_emb"])
     if "target_style_emb" in frame.columns:
-        if STYLE_ENCODER_KEY == "base_v1":
+        if model_names.style_encoder_key() == "base_v1":
             warn_provenance(
                 f"{entry_point}: stored column target_style_emb has no "
                 "label; an unlabelled file predates the label"
@@ -348,7 +351,7 @@ def guard_inline_style_columns(df, *, source_style_path=None, entry_point):
         else:
             raise StyleLabelError(
                 f"{entry_point}: stored column target_style_emb has no "
-                f"label, and the pin is {STYLE_ENCODER_KEY!r}"
+                f"label, and the pin is {model_names.style_encoder_key()!r}"
             )
     return frame
 
@@ -449,3 +452,265 @@ def build_centroids(encoded, groups, *, renormalize, path, texts=None,
     label.update(free_fields)
     np.savez(path, **centroids, __style_label__=json.dumps(label))
     return centroids, label
+
+
+# ---------------- task 5.2: labelled style vectors (requirement 4) ----------
+
+PROVENANCES = ("loader", "build", "encode", "declare")
+
+
+def _frozen_matrix(vectors, keys):
+    """A private, write-protected float copy of `vectors`, one row per key."""
+    rows = [np.array(vector, copy=True) for vector in vectors]
+    if not rows:
+        raise ValueError("labelled style vectors need at least one vector")
+    matrix = np.stack(rows)
+    if matrix.ndim != 2:
+        raise ValueError(
+            f"each style vector must be 1D, got shape {matrix.shape[1:]}"
+        )
+    if matrix.dtype.kind != "f":
+        raise ValueError(f"style vectors must be float, got {matrix.dtype}")
+    if len(keys) != matrix.shape[0]:
+        raise ValueError(f"{len(keys)} keys for {matrix.shape[0]} vectors")
+    matrix.setflags(write=False)
+    return matrix
+
+
+def _freeze_label(label):
+    """A deep JSON copy of `label`, so a caller's dict cannot change it."""
+    return json.loads(json.dumps(label))
+
+
+class LabelledStyleVectors:
+    """Style vectors bound to their encoder label by ownership (task 5.2).
+
+    One vector per key. The object holds a private write-protected copy of
+    every vector, an immutable tuple of unique keys and a frozen label, so
+    nothing a caller does to its own arrays, dicts or key lists after
+    construction changes what the pipeline reads. It is built only by:
+
+    - the checked loader `load_labelled_centroids` (provenance "loader");
+    - `from_build`, from the return value of `build_centroids` ("build");
+    - `from_encoded`, an explicit conversion of `encode_style` output
+      ("encode"); the caller gives one key per encoded row;
+    - `declare`, an operator assertion that `vectors` came from
+      `encoder_key` ("declare"); it is reported as a declaration.
+
+    Values are stored as supplied: no normalization. A consumer that needs
+    a unit view derives it from `vector`/`matrix` and never writes it back.
+    The guard catches accidental mismatch, not a caller who builds or
+    declares a wrong object on purpose.
+    """
+
+    __slots__ = ("_keys", "_index", "_matrix", "_encoder_key", "_provenance",
+                 "_source", "_label")
+
+    def __init__(self, *, keys, vectors, encoder_key, provenance, source,
+                 label, _token=None):
+        if _token is not _CONSTRUCT:
+            raise TypeError(
+                "build LabelledStyleVectors through load_labelled_centroids, "
+                "from_build, from_encoded or declare"
+            )
+        if provenance not in PROVENANCES:
+            raise ValueError(f"unknown provenance: {provenance!r}")
+        get_encoder(encoder_key)  # an unregistered key raises here
+        keys = tuple(keys)
+        if any(not isinstance(key, str) for key in keys):
+            raise TypeError("style vector keys must be strings")
+        if len(set(keys)) != len(keys):
+            raise ValueError("style vector keys must be unique")
+        if any(key.startswith("__") for key in keys):
+            raise ValueError("a style vector key may not start with '__'")
+        object.__setattr__(self, "_keys", keys)
+        object.__setattr__(self, "_index",
+                           {key: row for row, key in enumerate(keys)})
+        object.__setattr__(self, "_matrix", _frozen_matrix(vectors, keys))
+        object.__setattr__(self, "_encoder_key", encoder_key)
+        object.__setattr__(self, "_provenance", provenance)
+        object.__setattr__(self, "_source", str(source))
+        object.__setattr__(self, "_label", _freeze_label(label))
+
+    def __setattr__(self, name, value):
+        raise AttributeError("LabelledStyleVectors is immutable")
+
+    def __delattr__(self, name):
+        raise AttributeError("LabelledStyleVectors is immutable")
+
+    # -- constructors -------------------------------------------------------
+
+    @classmethod
+    def _make(cls, **kwargs):
+        return cls(_token=_CONSTRUCT, **kwargs)
+
+    @classmethod
+    def from_build(cls, built, *, source):
+        """From the `(centroids, label)` pair that `build_centroids` returns."""
+        centroids, label = built
+        keys = list(centroids)
+        return cls._make(keys=keys, vectors=[centroids[k] for k in keys],
+                         encoder_key=label["encoder_key"], provenance="build",
+                         source=source, label=label)
+
+    @classmethod
+    def from_encoded(cls, encoded, *, keys, source="encode_style"):
+        """An explicit conversion of `encode_style` output; `keys` is required.
+
+        `keys` gives one caller key per encoded row, in row order. The
+        encoder key comes from the encode call's label.
+        """
+        from tst_utils.eval.metrics.style import EncodedStyle
+        if not isinstance(encoded, EncodedStyle):
+            raise TypeError(
+                f"from_encoded needs an EncodedStyle, got "
+                f"{type(encoded).__name__}"
+            )
+        embeddings, label = _require_encoded_style(encoded)
+        keys = list(keys)
+        return cls._make(keys=keys, vectors=list(embeddings),
+                         encoder_key=label["encoder_key"], provenance="encode",
+                         source=source, label=label)
+
+    @classmethod
+    def declare(cls, vectors, encoder_key, source, *, keys):
+        """An operator assertion: `vectors` came from `encoder_key`.
+
+        `vectors` is a sequence (or 2D array) in the order of `keys`, or a
+        dict whose iteration order matches `keys`. Reported as a
+        declaration by `describe()` and in `provenance`.
+        """
+        keys = list(keys)
+        if isinstance(vectors, dict):
+            if list(vectors) != keys:
+                raise ValueError("declare: the dict keys must equal keys, "
+                                 "in the same order")
+            vectors = [vectors[key] for key in keys]
+        rows = [np.asarray(vector) for vector in vectors]
+        label = {"encoder_key": encoder_key, "declared": True,
+                 "source": str(source)}
+        return cls._make(keys=keys, vectors=rows, encoder_key=encoder_key,
+                         provenance="declare", source=source, label=label)
+
+    # -- reading ------------------------------------------------------------
+
+    @property
+    def keys(self):
+        return self._keys
+
+    @property
+    def encoder_key(self):
+        return self._encoder_key
+
+    @property
+    def provenance(self):
+        return self._provenance
+
+    @property
+    def source(self):
+        return self._source
+
+    @property
+    def is_declared(self):
+        return self._provenance == "declare"
+
+    @property
+    def label(self):
+        """A copy of the frozen label."""
+        return _freeze_label(self._label)
+
+    @property
+    def dim(self):
+        return int(self._matrix.shape[1])
+
+    def __len__(self):
+        return len(self._keys)
+
+    def __contains__(self, key):
+        return key in self._index
+
+    def vector(self, key):
+        """The stored vector of `key`: a read-only view of the private copy."""
+        if key not in self._index:
+            raise KeyError(f"unknown style key {key!r}; known: "
+                           f"{list(self._keys)}")
+        return self._matrix[self._index[key]]
+
+    def matrix(self):
+        """All stored vectors, one row per key, read-only."""
+        return self._matrix
+
+    def norms(self):
+        return np.linalg.norm(np.asarray(self._matrix, dtype=np.float64),
+                              axis=1)
+
+    def describe(self):
+        """A short record for logs and persisted results."""
+        record = {"encoder_key": self._encoder_key,
+                  "provenance": self._provenance, "source": self._source,
+                  "n_keys": len(self._keys)}
+        if self.is_declared:
+            record["declared"] = True
+        return record
+
+    def select(self, row_keys):
+        """A selection: this source and an ordered sequence of row keys."""
+        return StyleSelection(self, row_keys)
+
+    def __repr__(self):
+        return (f"LabelledStyleVectors({self._encoder_key!r}, "
+                f"{self._provenance!r}, keys={list(self._keys)!r})")
+
+
+_CONSTRUCT = object()
+
+
+class StyleSelection:
+    """A labelled source with an ordered, immutable sequence of row keys.
+
+    Keys may repeat and come in any order; each must exist in the source.
+    The keys are copied into a tuple at validation, so a later change to
+    the caller's list changes nothing. `vectors()` gathers the rows from the
+    source's private copies with no new label, no deduplication and no
+    reordering.
+    """
+
+    __slots__ = ("_source", "_row_keys")
+
+    def __init__(self, source, row_keys):
+        if not isinstance(source, LabelledStyleVectors):
+            raise TypeError(
+                f"a selection needs LabelledStyleVectors, got "
+                f"{type(source).__name__}"
+            )
+        if isinstance(row_keys, str):
+            raise TypeError("row_keys must be a sequence of keys, not a str")
+        row_keys = tuple(row_keys)
+        unknown = sorted({key for key in row_keys if key not in source})
+        if unknown:
+            raise KeyError(f"unknown style keys {unknown}; known: "
+                           f"{list(source.keys)}")
+        object.__setattr__(self, "_source", source)
+        object.__setattr__(self, "_row_keys", row_keys)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("StyleSelection is immutable")
+
+    @property
+    def source(self):
+        return self._source
+
+    @property
+    def row_keys(self):
+        return self._row_keys
+
+    @property
+    def encoder_key(self):
+        return self._source.encoder_key
+
+    def __len__(self):
+        return len(self._row_keys)
+
+    def vectors(self):
+        """One row per row key, gathered from the source; a fresh array."""
+        return np.stack([self._source.vector(key) for key in self._row_keys])

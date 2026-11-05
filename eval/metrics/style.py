@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from huggingface_hub import snapshot_download
 from sentence_transformers import SentenceTransformer
 from tst_utils.eval.data.style_store import measure_normalization, style_text_key
-from tst_utils.eval.model_names import STYLE_ENCODER_KEY
+from tst_utils.eval import model_names
 from tst_utils.eval.style_encoder_registry import (
     get_encoder,
     get_excluded_filenames,
@@ -105,7 +105,12 @@ def load_style_encoder(key):
     check_snapshot_hashes(
         snapshot_path, entry["file_sha256"], get_excluded_filenames()
     )
-    return SentenceTransformer(snapshot_path)
+    # An explicit False removes the spurious Mistral-regex warning that
+    # transformers 4.57.3 prints for a config written by 4.57.3 (base_v2),
+    # and applies no correction; never True
+    # (docs/issues/spurious-mistral-regex-warning.md, task 5.2).
+    return SentenceTransformer(snapshot_path,
+                               tokenizer_kwargs={"fix_mistral_regex": False})
 
 
 @dataclass(frozen=True)
@@ -191,7 +196,7 @@ def calc_style_embeddings(texts, *, normalize):
           are scale-invariant (angular), so `normalize=False` is correct for
           evaluation pipelines that consume `author_styles.npz` (unnormalized).
     """
-    model = load_style_encoder(STYLE_ENCODER_KEY)
+    model = load_style_encoder(model_names.style_encoder_key())
     return [
         e for e in model.encode(
             list(texts),

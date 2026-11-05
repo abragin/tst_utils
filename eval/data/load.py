@@ -10,7 +10,7 @@ from tst_utils.eval.data.style_store import (
     require_label_fields,
     warn_provenance,
 )
-from tst_utils.eval.model_names import STYLE_ENCODER_KEY
+from tst_utils.eval import model_names
 from tst_utils.eval.style_encoder_registry import get_encoder
 
 
@@ -148,7 +148,7 @@ def load_author_styles(expect_encoder=None):
     A filename is never a label.
     """
     if expect_encoder is None:
-        expect_encoder = STYLE_ENCODER_KEY
+        expect_encoder = model_names.style_encoder_key()
     file_path = os.path.join(os.path.dirname(__file__), "author_styles.npz")
     with np.load(file_path) as loaded:
         author_styles = {key: loaded[key] for key in loaded
@@ -156,6 +156,55 @@ def load_author_styles(expect_encoder=None):
     _check_npz_label(file_path, read_style_label(file_path), expect_encoder,
                      "load_author_styles", author_styles)
     return author_styles
+
+
+AUTHOR_STYLES_PATH = os.path.join(os.path.dirname(__file__),
+                                  "author_styles.npz")
+# The 5.1-verified base_v1 author centroids, byte-identical to the canonical
+# file before the pin move (task 5.2): the supported named-conditioning
+# source of the base_v1 TinyStyler checkpoints.
+AUTHOR_STYLES_BASE_V1_PATH = os.path.join(os.path.dirname(__file__),
+                                          "author_styles_base_v1.npz")
+
+
+def load_labelled_centroids(path, *, expect_encoder=None):
+    """The checked loader: a labelled centroid npz as `LabelledStyleVectors`.
+
+    The file must carry a `__style_label__` that names `expect_encoder`
+    (default: the pin, read at call time) with that entry's registry
+    hashes, every centroid label field, and vectors matching
+    `n_rows_per_group`. An unlabelled file raises, whatever the pin. The
+    vectors are returned as stored (no renormalization); the return holds
+    private write-protected copies.
+    """
+    from tst_utils.eval.data.style_store import LabelledStyleVectors
+    if expect_encoder is None:
+        expect_encoder = model_names.style_encoder_key()
+    label = read_style_label(path)
+    if label is None:
+        raise StyleLabelError(
+            f"load_labelled_centroids: unlabelled npz {os.path.realpath(path)}"
+        )
+    with np.load(path) as loaded:
+        vectors = {k: loaded[k] for k in loaded.files if k != "__style_label__"}
+    _check_npz_label(path, label, expect_encoder, "load_labelled_centroids",
+                     vectors)
+    keys = list(label["n_rows_per_group"])
+    return LabelledStyleVectors._make(
+        keys=keys, vectors=[vectors[key] for key in keys],
+        encoder_key=label["encoder_key"], provenance="loader",
+        source=os.path.realpath(path), label=label)
+
+
+def load_labelled_author_styles(expect_encoder=None, *, path=None):
+    """The author centroids as `LabelledStyleVectors`, checked on load.
+
+    `path` defaults to the canonical `author_styles.npz`; pass
+    `AUTHOR_STYLES_BASE_V1_PATH` with `expect_encoder="base_v1"` for the
+    named-conditioning source of a base_v1 checkpoint.
+    """
+    return load_labelled_centroids(path or AUTHOR_STYLES_PATH,
+                                   expect_encoder=expect_encoder)
 
 
 def renormalize_centroid(arr):
@@ -195,7 +244,7 @@ def load_centroids_npz(path, *, renormalize, expect_encoder=None):
     A filename is never a label.
     """
     if expect_encoder is None:
-        expect_encoder = STYLE_ENCODER_KEY
+        expect_encoder = model_names.style_encoder_key()
     with np.load(path) as loaded:
         result = {k: loaded[k] for k in loaded.files if k != "__style_label__"}
     _check_npz_label(path, read_style_label(path), expect_encoder,
