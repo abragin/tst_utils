@@ -255,10 +255,15 @@ from tst_utils import tinystyler as ts_mod
 from tst_utils.eval.data.style_store import LabelledStyleVectors
 
 
+def _tiny_config():
+    from transformers import GPT2Config
+    return GPT2Config(n_layer=1, n_embd=D_MODEL, n_head=2, vocab_size=50,
+                      n_positions=64)
+
+
 def _tiny_base_factory():
-    from transformers import GPT2Config, GPT2LMHeadModel
-    config = GPT2Config(n_layer=1, n_embd=D_MODEL, n_head=2, vocab_size=50,
-                        n_positions=64)
+    from transformers import GPT2LMHeadModel
+    config = _tiny_config()
 
     def from_pretrained(name, use_safetensors=True):
         torch.manual_seed(0)
@@ -274,6 +279,8 @@ def tiny_registry(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(ts_mod.AutoModelForCausalLM, "from_pretrained",
                         _tiny_base_factory())
+    monkeypatch.setattr(ts_mod.AutoConfig, "from_pretrained",
+                        lambda name: _tiny_config())
     registry_path = tmp_path / "registry.json"
     registry = {"description": "test", "checkpoints": {}}
     registry_path.write_text(_json.dumps(registry))
@@ -502,3 +509,23 @@ def test_author_tag_model_is_exempt():
     ts.model.get_input_embeddings = lambda: nn.Embedding(10, D_MODEL)
     ts.model.generate = lambda **kw: "ok"
     assert ts.generate(IDS, MASK) == "ok"
+
+
+def test_registered_load_builds_from_config_without_base_weights(tiny_registry,
+                                                                 monkeypatch):
+    """A registered checkpoint never asks for the base weights, and its loaded
+    state equals the file (J3: the base repos have no offline safetensors)."""
+    from safetensors.torch import load_file
+    path = tiny_registry("unit")
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("base weights requested for a registered load")
+    monkeypatch.setattr(ts_mod.AutoModelForCausalLM, "from_pretrained", refuse)
+    ts, _ = _load(path)
+    assert ts.verified_identity is not None
+    stored = load_file(path)
+    state = ts.state_dict()
+    for key, value in stored.items():
+        assert torch.equal(state[key], value), key
+    assert torch.equal(state["model.transformer.wte.weight"],
+                       stored["model.lm_head.weight"])

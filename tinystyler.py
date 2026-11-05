@@ -7,7 +7,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
-from transformers import T5ForConditionalGeneration, AutoModelForCausalLM
+from transformers import (AutoConfig, AutoModelForCausalLM,
+                          T5ForConditionalGeneration)
 
 
 _VALID_ASSERT_NORM = {"normalized", "unnormalized", None}
@@ -127,7 +128,19 @@ class TinyStyler(torch.nn.Module):
                     auto_normalize_input=auto_normalize_input)
                 # assert_norm=None still enforces the registered scale.
                 self.assert_norm = SCALE_TO_ASSERT_NORM[entry["trained_scale"]]
-        if model_type == 'T5':
+        if entry is not None:
+            # A registered checkpoint holds every learned value (J1: only
+            # tied aliases are absent, and they are checked after the load),
+            # so the base is built from its config with no base weights.
+            # This also loads offline: the base repos keep safetensors only
+            # in a Hub conversion snapshot that transformers looks up online
+            # (task 5.2, J3; host, 2026-11-05).
+            config = AutoConfig.from_pretrained(model_name)
+            if model_type == 'T5':
+                self.model = T5ForConditionalGeneration(config)
+            else:
+                self.model = AutoModelForCausalLM.from_config(config)
+        elif model_type == 'T5':
             self.model = T5ForConditionalGeneration.from_pretrained(
                 model_name,
                 use_safetensors=True
