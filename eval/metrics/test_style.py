@@ -250,3 +250,20 @@ def test_encode_style_matches_calc_on_gpu(monkeypatch, key):
         assert 14 <= encoded.label["norm_min"] <= encoded.label["norm_max"] <= 17
     else:
         assert encoded.label["norm_min"] > 10
+
+
+@gpu_only
+def test_default_encoder_is_base_v2_on_gpu():
+    """The pin at its committed value, not patched (task 5.2): the default
+    reader encodes with base_v2, and STYLE_MODEL names base_v2's repo."""
+    import warnings
+    from tst_utils.eval import model_names
+    assert model_names.style_encoder_key() == "base_v2"
+    assert model_names.STYLE_MODEL == get_encoder("base_v2")["hub_id"]
+    texts = ["Привет мир.", "Это второе предложение."]
+    encoded = style_module.encode_style(texts, "base_v2", normalize=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fresh = calc_style_embeddings(texts, normalize=False)
+    assert np.max(np.abs(encoded.embeddings - np.asarray(fresh))) == 0.0
+    assert encoded.label["encoder_key"] == "base_v2"

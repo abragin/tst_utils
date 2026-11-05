@@ -7,9 +7,9 @@ LABSE_MODEL_NAME = "cointegrated/LaBSE-en-ru"
 # snapshot in the cache, and the value the unpinned load already resolved.
 LABSE_REVISION = "cf0714e606d4af551e14ad69a7929cd6b0da7f7e"
 PERPL_MODEL_NAME = 'ai-forever/rugpt3small_based_on_gpt2'
-STYLE_MODEL = "abragin/ruBert-style-base"
+STYLE_MODEL = "abragin/ruBert-style-v2"
 # The entry of style_encoders.json that STYLE_MODEL names.
-STYLE_ENCODER_KEY = "base_v1"
+STYLE_ENCODER_KEY = "base_v2"
 
 
 def style_encoder_key():

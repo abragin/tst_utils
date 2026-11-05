@@ -1,7 +1,8 @@
 {
   "meta": {
-    "created": "2026-07-01 14:52:43",
-    "task": "2A.5 performance.py refactor",
+    "created": "2026-11-05 16:23:42",
+    "task": "2A.5 performance.py refactor; task 5.2 re-record",
+    "evaluation_encoder": "base_v2",
     "tst_func": "canned-deterministic",
     "frozen_cols": [
       "style_score",
@@ -25,61 +26,61 @@
           "example_number": 0,
           "style": "Dostoevsky",
           "version_number": 0,
-          "style_score": 0.14249157905578613,
+          "style_score": 0.16712066531181335,
           "meaning_score": 0.7339492717565307,
           "naturality_score": 1.0,
-          "score": 0.47114192028948676,
+          "score": 0.49685774800732957,
           "meaning_nolen": 0.737383285613587,
           "nat_v2": 1.0,
           "bi_cl": 1.0,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.5486868183152181
+          "score_v2": 0.574258797610587
         },
         {
           "example_number": 0,
           "style": "Tolstoy",
           "version_number": 0,
-          "style_score": 0.0,
+          "style_score": 0.15638317167758942,
           "meaning_score": 0.7339492717565307,
           "naturality_score": 1.0,
-          "score": 0.0,
+          "score": 0.48598032481969855,
           "meaning_nolen": 0.737383285613587,
           "nat_v2": 1.0,
           "bi_cl": 1.0,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.0
+          "score_v2": 0.563465872991649
         },
         {
           "example_number": 1,
           "style": "Dostoevsky",
           "version_number": 0,
-          "style_score": 0.39163005352020264,
+          "style_score": 0.4454219341278076,
           "meaning_score": 0.7233609951107363,
           "naturality_score": 0.05366785001203531,
-          "score": 0.2477318041530859,
+          "score": 0.2585911323888512,
           "meaning_nolen": 0.7430785359496433,
           "nat_v2": 0.5404127491339731,
           "bi_cl": 0.5,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.35890255470564403
+          "score_v2": 0.3723460212800294
         },
         {
           "example_number": 1,
           "style": "Tolstoy",
           "version_number": 0,
-          "style_score": 0.3894774913787842,
+          "style_score": 0.28557008504867554,
           "meaning_score": 0.7233609951107363,
           "naturality_score": 0.05366785001203531,
-          "score": 0.2472770909227853,
+          "score": 0.22297730656239476,
           "meaning_nolen": 0.7430785359496433,
           "nat_v2": 0.5384982139691462,
           "bi_cl": 0.5,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.3570683291974423
+          "score_v2": 0.32677266211835987
         },
         {
           "example_number": 2,
@@ -115,16 +116,16 @@
           "example_number": 3,
           "style": "Dostoevsky",
           "version_number": 0,
-          "style_score": 0.1343267560005188,
+          "style_score": 0.0,
           "meaning_score": 0.8905437386056514,
           "naturality_score": 1.0,
-          "score": 0.492726507655649,
+          "score": 0.0,
           "meaning_nolen": 0.8905437386056514,
           "nat_v2": 1.0,
           "bi_cl": 1.0,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.554257364724446
+          "score_v2": 0.0
         },
         {
           "example_number": 3,
@@ -145,16 +146,16 @@
           "example_number": 4,
           "style": "Dostoevsky",
           "version_number": 0,
-          "style_score": 0.11434751749038696,
+          "style_score": 0.2715110778808594,
           "meaning_score": 0.9298132195872901,
           "naturality_score": 0.2794429186704053,
-          "score": 0.30972185749030456,
+          "score": 0.4131985539805103,
           "meaning_nolen": 0.9298132195872901,
           "nat_v2": 1.0,
           "bi_cl": 1.0,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.5326071939577545
+          "score_v2": 0.6818833996547821
         },
         {
           "example_number": 4,
@@ -175,16 +176,16 @@
           "example_number": 5,
           "style": "Dostoevsky",
           "version_number": 0,
-          "style_score": 0.0,
+          "style_score": 0.05049289017915726,
           "meaning_score": 0.8655153103918771,
           "naturality_score": 1.0,
-          "score": 0.0,
+          "score": 0.3522370173132719,
           "meaning_nolen": 0.8739112905924697,
           "nat_v2": 1.0,
           "bi_cl": 1.0,
           "gender_score": 0.9,
           "entity_score": 1.0,
-          "score_v2": 0.0
+          "score_v2": 0.4068460323594424
         },
         {
           "example_number": 5,
@@ -237,16 +238,16 @@
           "example_number": 0,
           "style": "Dostoevsky",
           "version_number": 0,
-          "style_score": 0.14249157905578613,
+          "style_score": 0.16712066531181335,
           "meaning_score": 0.7339493379963844,
           "naturality_score": 1.0,
-          "score": 0.4711419344632052,
+          "score": 0.4968577629546767,
           "meaning_nolen": 0.7373833521633649,
           "nat_v2": 1.0,
           "bi_cl": 1.0,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.5486868253894582
+          "score_v2": 0.5742588050145275
         },
         {
           "example_number": 0,
@@ -267,16 +268,16 @@
           "example_number": 0,
           "style": "Tolstoy",
           "version_number": 0,
-          "style_score": 0.0,
+          "style_score": 0.15638317167758942,
           "meaning_score": 0.7339493379963844,
           "naturality_score": 1.0,
-          "score": 0.0,
+          "score": 0.4859803394398119,
           "meaning_nolen": 0.7373833521633649,
           "nat_v2": 1.0,
           "bi_cl": 1.0,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.0
+          "score_v2": 0.5634658802564358
         },
         {
           "example_number": 0,
@@ -297,16 +298,16 @@
           "example_number": 1,
           "style": "Dostoevsky",
           "version_number": 0,
-          "style_score": 0.3916304111480713,
+          "style_score": 0.4454219341278076,
           "meaning_score": 0.7233609951107363,
           "naturality_score": 0.0536677978781626,
-          "score": 0.24773179934376136,
+          "score": 0.2585910486555326,
           "meaning_nolen": 0.7430785359496433,
           "nat_v2": 0.5404123313592286,
           "bi_cl": 0.5,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.35890237089069077
+          "score_v2": 0.37234573343196486
         },
         {
           "example_number": 1,
@@ -327,16 +328,16 @@
           "example_number": 1,
           "style": "Tolstoy",
           "version_number": 0,
-          "style_score": 0.3894774913787842,
+          "style_score": 0.28557008504867554,
           "meaning_score": 0.7233609951107363,
           "naturality_score": 0.0536677978781626,
-          "score": 0.24727701085301942,
+          "score": 0.22297723436104094,
           "meaning_nolen": 0.7430785359496433,
           "nat_v2": 0.5384977991492813,
           "bi_cl": 0.5,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.3570680541379672
+          "score_v2": 0.32677241039646365
         },
         {
           "example_number": 1,
@@ -417,16 +418,16 @@
           "example_number": 3,
           "style": "Dostoevsky",
           "version_number": 0,
-          "style_score": 0.1343267560005188,
+          "style_score": 0.0,
           "meaning_score": 0.8905436058813931,
           "naturality_score": 1.0,
-          "score": 0.49272648317743395,
+          "score": 0.0,
           "meaning_nolen": 0.8905436058813931,
           "nat_v2": 1.0,
           "bi_cl": 1.0,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.5542573529237258
+          "score_v2": 0.0
         },
         {
           "example_number": 3,
@@ -477,16 +478,16 @@
           "example_number": 4,
           "style": "Dostoevsky",
           "version_number": 0,
-          "style_score": 0.11434751749038696,
+          "style_score": 0.2715110778808594,
           "meaning_score": 0.9298131218730369,
           "naturality_score": 0.27944339378586897,
-          "score": 0.3097220221727657,
+          "score": 0.41319877368265,
           "meaning_nolen": 0.9298131218730369,
           "nat_v2": 1.0,
           "bi_cl": 1.0,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.5326071859617835
+          "score_v2": 0.6818833894177444
         },
         {
           "example_number": 4,
@@ -522,31 +523,31 @@
           "example_number": 4,
           "style": "Tolstoy",
           "version_number": 1,
-          "style_score": 0.0,
+          "style_score": 0.052600789815187454,
           "meaning_score": 0.7662010039821722,
           "naturality_score": 1.0,
-          "score": 0.0,
+          "score": 0.342855926273474,
           "meaning_nolen": 0.7705039502393966,
           "nat_v2": 1.0,
           "bi_cl": 0.75,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.0
+          "score_v2": 0.39860781496457165
         },
         {
           "example_number": 5,
           "style": "Dostoevsky",
           "version_number": 0,
-          "style_score": 0.0,
+          "style_score": 0.05049289017915726,
           "meaning_score": 0.8655152751360292,
           "naturality_score": 1.0,
-          "score": 0.0,
+          "score": 0.35223701253060474,
           "meaning_nolen": 0.8739112549946205,
           "nat_v2": 1.0,
           "bi_cl": 1.0,
           "gender_score": 0.9,
           "entity_score": 1.0,
-          "score_v2": 0.0
+          "score_v2": 0.40684602999195074
         },
         {
           "example_number": 5,
@@ -604,7 +605,7 @@
         "3|Dostoevsky": 0,
         "3|Tolstoy": 0,
         "4|Dostoevsky": 0,
-        "4|Tolstoy": 0,
+        "4|Tolstoy": 1,
         "5|Dostoevsky": 0,
         "5|Tolstoy": 0
       },
@@ -618,7 +619,7 @@
         "3|Dostoevsky": 0,
         "3|Tolstoy": 0,
         "4|Dostoevsky": 0,
-        "4|Tolstoy": 0,
+        "4|Tolstoy": 1,
         "5|Dostoevsky": 0,
         "5|Tolstoy": 0
       }
@@ -629,31 +630,31 @@
           "example_number": 0,
           "style": "Tolstoy",
           "version_number": 0,
-          "style_score": 0.0,
+          "style_score": 0.15638317167758942,
           "meaning_score": 0.7339492717565307,
           "naturality_score": 1.0,
-          "score": 0.0,
+          "score": 0.48598032481969855,
           "meaning_nolen": 0.737383285613587,
           "nat_v2": 1.0,
           "bi_cl": 1.0,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.0
+          "score_v2": 0.563465872991649
         },
         {
           "example_number": 1,
           "style": "Tolstoy",
           "version_number": 0,
-          "style_score": 0.3894774913787842,
+          "style_score": 0.2855706810951233,
           "meaning_score": 0.7233609951107363,
           "naturality_score": 0.05366785001203531,
-          "score": 0.2472770909227853,
+          "score": 0.22297746169622004,
           "meaning_nolen": 0.7430785359496433,
           "nat_v2": 0.5384982139691462,
           "bi_cl": 0.5,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.3570683291974423
+          "score_v2": 0.3267728569882505
         },
         {
           "example_number": 2,
@@ -739,16 +740,16 @@
           "example_number": 0,
           "style": "Tolstoy",
           "version_number": 0,
-          "style_score": 0.0,
+          "style_score": 0.15638317167758942,
           "meaning_score": 0.7339493712061935,
           "naturality_score": 1.0,
-          "score": 0.0,
+          "score": 0.4859803467697066,
           "meaning_nolen": 0.7373833855285566,
           "nat_v2": 1.0,
           "bi_cl": 1.0,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.0
+          "score_v2": 0.5634658838986869
         },
         {
           "example_number": 0,
@@ -769,16 +770,16 @@
           "example_number": 1,
           "style": "Tolstoy",
           "version_number": 0,
-          "style_score": 0.3894774913787842,
+          "style_score": 0.28557008504867554,
           "meaning_score": 0.72336102746121,
           "naturality_score": 0.05366785001203531,
-          "score": 0.24727709460906408,
+          "score": 0.22297730988642497,
           "meaning_nolen": 0.7430785691819337,
           "nat_v2": 0.5384982139691462,
           "bi_cl": 0.5,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.35706833147872363
+          "score_v2": 0.32677266420608453
         },
         {
           "example_number": 1,
@@ -874,16 +875,16 @@
           "example_number": 4,
           "style": "Tolstoy",
           "version_number": 1,
-          "style_score": 0.0,
+          "style_score": 0.05260081589221954,
           "meaning_score": 0.7662010039821722,
           "naturality_score": 1.0,
-          "score": 0.0,
+          "score": 0.3428559829308204,
           "meaning_nolen": 0.7705039502393966,
           "nat_v2": 1.0,
           "bi_cl": 0.75,
           "gender_score": 1.0,
           "entity_score": 1.0,
-          "score_v2": 0.0
+          "score_v2": 0.398607871424924
         },
         {
           "example_number": 5,
@@ -921,7 +922,7 @@
         "1|Tolstoy": 0,
         "2|Tolstoy": 0,
         "3|Tolstoy": 0,
-        "4|Tolstoy": 0,
+        "4|Tolstoy": 1,
         "5|Tolstoy": 0
       },
       "best_v2": {
@@ -929,7 +930,7 @@
         "1|Tolstoy": 0,
         "2|Tolstoy": 0,
         "3|Tolstoy": 0,
-        "4|Tolstoy": 0,
+        "4|Tolstoy": 1,
         "5|Tolstoy": 0
       }
     }

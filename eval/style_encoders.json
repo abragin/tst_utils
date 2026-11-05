@@ -35,6 +35,6 @@
       "tokenizer_config.json": "479a5afc56069a77cc24c74a1943501275664e8d493e215f5716a81ebc0e86db",
       "vocab.txt": "bbe5063cc3d7a314effd90e9c5099cf493b81f2b9552c155264e16eeab074237"
     },
-    "description": "The accepted style-v2 encoder from run phase2_C_30k (D33). The Hub repo is private, so loading it needs a Hub token."
+    "description": "The accepted style-v2 encoder from run phase2_C_30k (D33). Fetching an uncached snapshot of this private repo needs a Hub token."
   }
 }
