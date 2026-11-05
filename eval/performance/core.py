@@ -40,6 +40,20 @@ def _same_vector(cell, stored):
     return array.shape == stored.shape and np.array_equal(array, stored)
 
 
+# The score_v2 stage's outputs. They depend on style_score, and
+# compute_scores does not recompute them, so it drops them (F2 of the results
+# review of task 5.2); compute_composite_v2 recomputes them.
+_STYLE_DERIVED_COLS = ["meaning_nolen", "nat_v2", "score_v2"]
+
+
+def _is_null(value):
+    """True for a missing scalar cell (None or NaN)."""
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
 class TstPerformanceMetrics:
     """
     Class to evaluate TST models using style transfer, meaning, and naturality metrics.
@@ -107,10 +121,10 @@ class TstPerformanceMetrics:
         self.target_styles = target_styles
         self.tst_model = tst_model
         self.verbose = verbose
-        self.author_styles = self._intake_targets(author_styles,
-                                                  "author_styles")
-        self.target_style_source = self._intake_targets(
-            target_style_source, "target_style_source")
+        # Both setters run the constructor's intake, so a later assignment
+        # is checked as strictly as the constructor argument.
+        self.author_styles = author_styles
+        self.target_style_source = target_style_source
         self._inline_target_source = None
         self.source_style_path = source_style_path
         self._source_store = {}
@@ -132,6 +146,25 @@ class TstPerformanceMetrics:
     def evaluation_encoder(self):
         """The registry key of this run's evaluation encoder (read-only)."""
         return self._evaluation_encoder
+
+    @property
+    def author_styles(self):
+        """The labelled target source of the text path (named targets)."""
+        return self._author_styles
+
+    @author_styles.setter
+    def author_styles(self, targets):
+        self._author_styles = self._intake_targets(targets, "author_styles")
+
+    @property
+    def target_style_source(self):
+        """The labelled target source of the emb path (key-selected)."""
+        return self._target_style_source
+
+    @target_style_source.setter
+    def target_style_source(self, targets):
+        self._target_style_source = self._intake_targets(
+            targets, "target_style_source")
 
     # ---- intake and validation (task 5.2) ---------------------------------
 
@@ -229,11 +262,30 @@ class TstPerformanceMetrics:
     def _emb_targets(self):
         return self.target_style_source or self._inline_target_source
 
-    def _validate_targets(self, frame, entry_point):
-        """Check the target supply of `frame` before any encode or TST call."""
+    def _scoring_targets(self):
+        """The labelled target source that scores this instance's mode."""
+        return self._emb_targets() if self._emb_mode() else self.author_styles
+
+    def _check_target_encoder(self, targets, entry_point):
+        """Re-check a target source against the evaluation encoder at use."""
+        if targets is not None and targets.encoder_key != self._evaluation_encoder:
+            raise StyleLabelError(
+                f"{entry_point}: the target source holds "
+                f"{targets.encoder_key!r} vectors; the evaluation encoder is "
+                f"{self._evaluation_encoder!r}")
+
+    def _validate_targets(self, frame, entry_point, require_desc=True):
+        """Check the target supply of `frame` before any encode or TST call.
+
+        On the emb path the frame must carry `target_style_key` (after the
+        legacy inline conversion), and a `test_df` entry also
+        `target_style_desc`; `compute_scores` passes `require_desc=False`,
+        because scoring an external result frame needs no description.
+        """
         if not self._emb_mode():
             if "target_style_emb" in frame.columns:
                 self._reject_or_warn_inline(entry_point)
+            self._check_target_encoder(self.author_styles, entry_point)
             return frame
         frame = frame.copy()
         if "target_style_emb" in frame.columns:
@@ -249,12 +301,21 @@ class TstPerformanceMetrics:
                         f"inline target_style_emb at {entry_point} "
                         "(legacy, pin base_v1)", keys=keys)
                     frame["target_style_key"] = keys
+        missing = [c for c in ("target_style_key", "target_style_desc")
+                   if c not in frame.columns
+                   and (require_desc or c == "target_style_key")]
+        if missing:
+            raise ValueError(
+                f"{entry_point}: the emb path (no target_styles) needs the "
+                f"column(s) {missing}; target_style_key selects each row's "
+                "target from target_style_source")
         if "target_style_key" in frame.columns:
             source = self._emb_targets()
             if source is None:
                 raise ValueError(
                     f"{entry_point}: target_style_key needs "
                     "target_style_source (LabelledStyleVectors)")
+            self._check_target_encoder(source, entry_point)
             keys = frame["target_style_key"].tolist()
             bad = [k for k in keys if not isinstance(k, str)]
             if bad:
@@ -278,24 +339,45 @@ class TstPerformanceMetrics:
             f"{entry_point}: stored column target_style_emb has no label; "
             "an unlabelled file predates the label")
 
-    def _validate_frame(self, frame, entry_point):
+    def _validate_frame(self, frame, entry_point, require_desc=True):
         """The shared validation of every public entry (requirement 11)."""
         if "text" not in frame.columns:
             raise ValueError(f"{entry_point}: the frame has no text column")
-        frame = self._validate_targets(frame, entry_point)
+        frame = self._validate_targets(frame, entry_point, require_desc)
         frame, source_vectors = self._validate_source_style(frame,
                                                             entry_point)
         return frame, source_vectors
 
     def _target_record(self):
         """The result columns that record this run's targets and encoder."""
-        source = self._emb_targets() if self._emb_mode() else self.author_styles
+        source = self._scoring_targets()
         record = {"evaluation_encoder": self._evaluation_encoder}
         if source is not None:
             record.update({"target_provenance": source.provenance,
                            "target_declared": bool(source.is_declared),
                            "target_source": source.source})
         return record
+
+    def _stamp_target_record(self, frame, entry_point):
+        """Write this instance's record onto every row of `frame`.
+
+        The record describes the scoring this instance does. A non-null
+        value that differs (for example a frame scored earlier by another
+        instance) is replaced, with a provenance warning naming both values;
+        an absent column or a null cell is filled silently.
+        """
+        frame = frame.copy()
+        for column, value in self._target_record().items():
+            if column in frame.columns:
+                old = sorted({str(v) for v in frame[column].tolist()
+                              if not _is_null(v) and v != value})
+                if old:
+                    warn_provenance(
+                        f"{entry_point}: tst_results column {column} held "
+                        f"{old}; replaced by {value!r}, the record of this "
+                        "instance's scoring")
+            frame[column] = [value] * len(frame)
+        return frame
 
     def _log(self, msg, *args) -> None:
         """Verbose-gated progress logging (replaces the old `if self.verbose: print`)."""
@@ -418,31 +500,46 @@ class TstPerformanceMetrics:
         if self.tst_results is None:
             raise Exception("TST results are absent.")
         entry = "TstPerformanceMetrics.compute_scores"
-        if self._emb_mode():
-            targets, key_column = self._emb_targets(), "target_style_key"
-        else:
-            targets, key_column = self.author_styles, "target_style"
-        if targets is None:
-            raise ValueError(
-                f"{entry}: no labelled target source "
-                f"({'target_style_source' if self._emb_mode() else 'author_styles'})")
+        targets = self._require_scoring_targets(entry)
+        key_column = "target_style_key" if self._emb_mode() else "target_style"
         if key_column not in self.tst_results.columns:
             raise ValueError(f"{entry}: tst_results has no {key_column} column")
         unknown = sorted({str(k) for k in self.tst_results[key_column]
                           if k not in targets})
         if unknown:
             raise KeyError(f"{entry}: unknown {key_column} values {unknown}")
-        self.tst_results, source_vectors = self._validate_frame(
-            self.tst_results, entry)
+        # Score a candidate frame and publish it only on success: a scorer
+        # that raises leaves tst_results as it was, old scores with their
+        # old record, never old scores under this instance's record.
+        candidate, source_vectors = self._validate_frame(
+            self.tst_results, entry, require_desc=False)
+        # Columns that depend on the style scores and that this method does
+        # not recompute (the score_v2 stage) are dropped, so a pre-scored
+        # frame cannot carry a stale composite under the new record.
+        stale = [c for c in _STYLE_DERIVED_COLS if c in candidate.columns]
+        candidate = candidate.drop(columns=stale)
         scoring.add_perplexity_scores(
-            self.tst_results, self._log, batch_size=self.perplexity_batch_size)
-        scoring.add_bert_score(self.tst_results, self._log)
-        scoring.add_labse_score(self.tst_results, self._log)
+            candidate, self._log, batch_size=self.perplexity_batch_size)
+        scoring.add_bert_score(candidate, self._log)
+        scoring.add_labse_score(candidate, self._log)
         scoring.add_labelled_style_scores(
-            self.tst_results, targets, key_column=key_column,
+            candidate, targets, key_column=key_column,
             source_vectors=source_vectors,
             encoder_key=self._evaluation_encoder, log=self._log)
-        scoring.combine_scores(self.tst_results, self._log)
+        scoring.combine_scores(candidate, self._log)
+        self.tst_results = self._stamp_target_record(candidate, entry)
+        # a selection made from the earlier scores is no longer valid
+        self.best_tst_results = None
+
+    def _require_scoring_targets(self, entry_point):
+        """The labelled scoring target source, checked; raises if absent."""
+        targets = self._scoring_targets()
+        if targets is None:
+            raise ValueError(
+                f"{entry_point}: no labelled target source "
+                f"({'target_style_source' if self._emb_mode() else 'author_styles'})")
+        self._check_target_encoder(targets, entry_point)
+        return targets
 
     def select_best_tst_version(self, score_col: str = 'score') -> None:
         """For each (example_number, target_style) pair, select the row with the
@@ -483,6 +580,10 @@ class TstPerformanceMetrics:
         score_col : str
             Column to average. Use 'score' (default, v1) or 'score_v2'.
         """
+        if getattr(self, "best_tst_results", None) is None:
+            raise AttributeError(
+                "best_tst_results is missing. Run select_best_tst_version() "
+                "after compute_scores().")
         if self.target_styles:
             res = {}
             for fs_key in TARGET_STYLES:
@@ -630,8 +731,13 @@ class TstPerformanceMetrics:
         """
         if source_style_path is not None:
             self.source_style_path = source_style_path
-        self.test_df, _ = self._validate_frame(
-            self.test_df, "TstPerformanceMetrics.execute")
+        entry = "TstPerformanceMetrics.execute"
+        if not self._emb_mode():
+            # execute ends in compute_scores, so the text path's scoring
+            # source is required before any encode (the emb path's source
+            # is required by the shared validation)
+            self._require_scoring_targets(entry)
+        self.test_df, _ = self._validate_frame(self.test_df, entry)
         self.add_source_ppx_and_emb()
         self.produce_tst_results()
         self.compute_scores()

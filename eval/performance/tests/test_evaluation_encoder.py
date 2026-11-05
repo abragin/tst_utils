@@ -487,3 +487,279 @@ def test_calc_style_embeddings_warns_once_off_base_v1(pin, fake_encoder,
     assert len(pin_warnings) == 1
     assert "base_v2" in str(pin_warnings[0].message)
     assert fake_encoder.keys() == ["base_v1", "base_v1", "base_v2", "base_v2"]
+
+
+# ---- results review round 1 (review-results-sol.md F1-F3) --------------------
+
+def _emb_pm(targets=None, df=None, **kwargs):
+    if df is None:
+        df = pd.DataFrame({"text": SOURCES, "author": ["News"] * 3,
+                           "target_style_key": ["Tolstoy"] * 3,
+                           "target_style_desc": ["x"] * 3})
+    return TstPerformanceMetrics(
+        test_df=df, tst_func=kwargs.pop("tst_func", _emb_func()),
+        target_styles=None, tst_model="x", author_styles=None,
+        target_style_source=(targets if targets is not None
+                             else _author_targets("base_v2")), **kwargs)
+
+
+@pytest.mark.parametrize("mode", ["text", "emb"])
+def test_target_replacement_runs_the_constructor_intake(
+        pin, fake_encoder, stub_scorers, mode):
+    """F1: a public assignment after construction is checked like the
+    constructor argument, on a warm instance."""
+    pin("base_v2")
+    pm = _text_pm() if mode == "text" else _emb_pm()
+    attribute = "author_styles" if mode == "text" else "target_style_source"
+    pm.produce_tst_results()  # a warm store and a trusted instance
+    before = getattr(pm, attribute)
+    for value, error in ((_author_targets("base_v1"), StyleLabelError),
+                         ({"Tolstoy": np.ones(DIM, dtype=np.float32)},
+                          StyleLabelError),
+                         (np.ones((1, DIM), dtype=np.float32), TypeError)):
+        with pytest.raises(error):
+            setattr(pm, attribute, value)
+        assert getattr(pm, attribute) is before
+    # positive control: a valid source of the evaluation encoder is accepted,
+    # and the next scoring records it
+    replacement = _author_targets("base_v2", source="replacement v2 vectors")
+    setattr(pm, attribute, replacement)
+    assert getattr(pm, attribute) is replacement
+    fake_encoder.calls.clear()
+    with pytest.warns(StyleProvenanceWarning, match="column target_source held"):
+        pm.compute_scores()
+    assert set(fake_encoder.keys()) == {"base_v2"}
+    assert set(pm.tst_results["evaluation_encoder"]) == {"base_v2"}
+    assert set(pm.tst_results["target_source"]) == {"replacement v2 vectors"}
+    for _, row in pm.tst_results.iterrows():
+        key = row.target_style if mode == "text" else row.target_style_key
+        tgt = unit_view(replacement.vector(key))
+        assert row.away == pytest.approx(away(
+            fake_vector("base_v2", row.text),
+            fake_vector("base_v2", row.styled_text), tgt))
+
+
+@pytest.mark.parametrize("mode", ["text", "emb"])
+def test_a_bypassed_target_source_is_rejected_at_use(
+        pin, fake_encoder, stub_scorers, mode):
+    """F1, defence in depth: a v1 source placed past the setter (private
+    state) is rejected at every use before any encode or TST call."""
+    pin("base_v2")
+    pm = _text_pm() if mode == "text" else _emb_pm()
+    pm.produce_tst_results()
+    private = "_author_styles" if mode == "text" else "_target_style_source"
+    setattr(pm, private, _author_targets("base_v1"))
+    calls_before = len(pm.tst_func.calls)
+    fake_encoder.calls.clear()
+    for entry in ("compute_scores", "produce_tst_results", "execute"):
+        with pytest.raises(StyleLabelError, match="base_v1"):
+            getattr(pm, entry)()
+    assert fake_encoder.calls == []
+    assert len(pm.tst_func.calls) == calls_before
+
+
+def test_labelled_style_scores_reject_a_target_encoder_mismatch(fake_encoder):
+    from tst_utils.eval.performance import scoring
+    df = pd.DataFrame({"styled_text": ["a"], "target_style": ["Tolstoy"]})
+    with pytest.raises(StyleLabelError, match="base_v1"):
+        scoring.add_labelled_style_scores(
+            df, _author_targets("base_v1"), key_column="target_style",
+            source_vectors=[fake_vector("base_v2", "x")],
+            encoder_key="base_v2")
+    assert fake_encoder.calls == []
+
+
+def _external_results(mode, labelled):
+    """A result frame produced elsewhere, handed to a fresh instance."""
+    rows = []
+    for i, text in enumerate(SOURCES):
+        for version in range(2):
+            target = TEXT_TARGETS[i % 2]
+            row = {"example_number": i, "version_number": version,
+                   "text": text, "author": "News",
+                   "styled_text": _styled(text, version, target),
+                   "tst_model": "external"}
+            row["target_style" if mode == "text" else "target_style_key"] = target
+            rows.append(row)
+    frame = pd.DataFrame(rows)
+    if labelled:
+        frame["evaluation_encoder"] = "base_v1"
+        frame["target_provenance"] = "loader"
+        frame["target_declared"] = False
+        frame["target_source"] = "old author_styles.npz"
+    return frame
+
+
+@pytest.mark.parametrize("mode", ["text", "emb"])
+@pytest.mark.parametrize("labelled", [False, True])
+def test_cold_direct_scoring_stamps_the_scoring_record(
+        pin, fake_encoder, stub_scorers, tmp_path, mode, labelled):
+    """F2: compute_scores on a frame this instance did not produce records
+    this instance's encoder and declared targets on every row."""
+    import warnings
+    pin("base_v2")
+    targets = _author_targets("base_v2", source="operator v2 vectors")
+    pm = (_text_pm(author_styles=targets) if mode == "text"
+          else _emb_pm(targets=targets))
+    pm.tst_results = _external_results(mode, labelled)
+    if labelled:
+        with pytest.warns(StyleProvenanceWarning) as caught:
+            pm.compute_scores()
+        replaced = " ".join(str(w.message) for w in caught)
+        for column in ("evaluation_encoder", "target_provenance",
+                       "target_declared", "target_source"):
+            assert f"column {column} held" in replaced
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", StyleProvenanceWarning)
+            pm.compute_scores()
+    results = pm.tst_results
+    assert set(fake_encoder.keys()) == {"base_v2"}
+    assert list(results["evaluation_encoder"]) == ["base_v2"] * len(results)
+    assert set(results["target_provenance"]) == {"declare"}
+    assert set(results["target_declared"]) == {True}
+    assert set(results["target_source"]) == {"operator v2 vectors"}
+    record = ["evaluation_encoder", "target_provenance", "target_declared",
+              "target_source"]
+    path = str(tmp_path / "rescored.parquet")
+    results[record + ["style_score"]].to_parquet(path)
+    back = pd.read_parquet(path)
+    for column in record:
+        assert list(back[column]) == list(results[column])
+    pm.select_best_tst_version()
+    assert set(pm.best_tst_results["evaluation_encoder"]) == {"base_v2"}
+    assert set(pm.best_tst_results["target_declared"]) == {True}
+
+
+def test_own_production_rescoring_replaces_nothing(pin, fake_encoder,
+                                                   stub_scorers):
+    """F2 control: the instance's own results carry its record already, so
+    the stamp warns about nothing."""
+    import warnings
+    pin("base_v2")
+    pm = _text_pm()
+    pm.produce_tst_results()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", StyleProvenanceWarning)
+        pm.compute_scores()
+    assert set(pm.tst_results["target_provenance"]) == {"declare"}
+
+
+EMB_ENTRIES = ["execute", "add_source_ppx_and_emb", "produce_tst_results",
+               "produce_tst_results_with_target_style_emb"]
+
+
+@pytest.mark.parametrize("entry", EMB_ENTRIES)
+@pytest.mark.parametrize("absent", ["target_style_key", "target_style_desc"])
+def test_absent_emb_columns_raise_before_any_encode_or_tst_call(
+        pin, fake_encoder, stub_scorers, monkeypatch, entry, absent):
+    """F3: an emb-path frame without the whole key (or desc) column is
+    rejected before any source encode, source-cache scorer or TST call."""
+    from tst_utils.eval.performance import core
+    pin("base_v2")
+    from tst_utils.eval.performance import scoring
+    cache_calls, scorer_calls = [], []
+    monkeypatch.setattr(core, "ensure_source_caches",
+                        lambda *a, **k: cache_calls.append(1))
+    for name in ("add_perplexity_scores", "add_bert_score", "add_labse_score",
+                 "add_labelled_style_scores"):
+        monkeypatch.setattr(scoring, name,
+                            lambda *a, _n=name, **k: scorer_calls.append(_n))
+    df = pd.DataFrame({"text": SOURCES, "author": ["News"] * 3,
+                       "target_style_key": ["Tolstoy"] * 3,
+                       "target_style_desc": ["x"] * 3}).drop(columns=[absent])
+    tst_func = _emb_func()
+    pm = _emb_pm(df=df, tst_func=tst_func)
+    with pytest.raises(ValueError, match=absent if entry in (
+            "execute", "add_source_ppx_and_emb") else None):
+        getattr(pm, entry)()
+    assert fake_encoder.calls == [] and cache_calls == []
+    assert scorer_calls == [] and tst_func.calls == []
+
+
+def test_text_path_execute_without_author_styles_raises_before_any_encode(
+        pin, fake_encoder, stub_scorers, monkeypatch):
+    """F3 sibling: execute ends in compute_scores, so a text-path run with no
+    scoring source is rejected before the source encode and the TST call."""
+    from tst_utils.eval.performance import core
+    pin("base_v2")
+    cache_calls = []
+    monkeypatch.setattr(core, "ensure_source_caches",
+                        lambda *a, **k: cache_calls.append(1))
+    pm = TstPerformanceMetrics(
+        test_df=_text_df(), tst_func=_text_func(), target_styles=TEXT_TARGETS,
+        tst_model="x", author_styles=None)
+    with pytest.raises(ValueError, match="author_styles"):
+        pm.execute()
+    assert fake_encoder.calls == [] and cache_calls == []
+    assert pm.tst_func.calls == []
+
+
+PRE_SCORED = {"away": 0.111, "towards": 0.222, "style_score": 0.333,
+              "meaning_score": 0.444, "naturality_score": 0.555,
+              "score": 0.666, "meaning_nolen": 0.777, "nat_v2": 0.888,
+              "score_v2": 0.999, "bi_cl": 0.7, "gender_score": 1.0,
+              "entity_score": 1.0}
+
+
+def _pre_scored_v1_frame(mode):
+    frame = _external_results(mode, labelled=True)
+    for column, value in PRE_SCORED.items():
+        frame[column] = value
+    return frame
+
+
+@pytest.mark.parametrize("mode", ["text", "emb"])
+@pytest.mark.parametrize("failing", ["add_bert_score",
+                                     "add_labelled_style_scores",
+                                     "combine_scores"])
+def test_a_failed_rescore_publishes_nothing(pin, fake_encoder, stub_scorers,
+                                            monkeypatch, mode, failing):
+    """F2 (party condition a): a scorer that raises leaves tst_results as
+    it was, so no old score is presented under the new record."""
+    from tst_utils.eval.performance import scoring
+    pin("base_v2")
+    pm = _text_pm() if mode == "text" else _emb_pm()
+    frame = _pre_scored_v1_frame(mode)
+    pm.tst_results = frame
+    pm.best_tst_results = sentinel = frame.iloc[:1].copy()
+    before = frame.copy()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("scorer failed")
+    monkeypatch.setattr(scoring, failing, fail)
+    with pytest.raises(RuntimeError, match="scorer failed"):
+        pm.compute_scores()
+    assert pm.tst_results is frame
+    pd.testing.assert_frame_equal(pm.tst_results, before)
+    assert set(pm.tst_results["evaluation_encoder"]) == {"base_v1"}
+    assert pm.best_tst_results is sentinel
+
+
+@pytest.mark.parametrize("mode", ["text", "emb"])
+def test_a_successful_rescore_drops_the_stale_composite(
+        pin, fake_encoder, stub_scorers, mode):
+    """F2 (party condition b): a pre-scored v1 frame keeps no v1 score_v2
+    and no earlier best selection under the new v2 record; the score_v2
+    stage recomputes from the new style scores."""
+    pin("base_v2")
+    pm = _text_pm() if mode == "text" else _emb_pm()
+    pm.tst_results = _pre_scored_v1_frame(mode)
+    pm.best_tst_results = pm.tst_results.iloc[:1].copy()
+    with pytest.warns(StyleProvenanceWarning, match="evaluation_encoder"):
+        pm.compute_scores()
+    results = pm.tst_results
+    assert set(results["evaluation_encoder"]) == {"base_v2"}
+    for column in ("meaning_nolen", "nat_v2", "score_v2"):
+        assert column not in results.columns
+    for column in ("away", "towards", "style_score", "score"):
+        assert not (results[column] == PRE_SCORED[column]).any()
+    # the quality signals do not depend on the style encoder and are kept
+    assert set(results["bi_cl"]) == {PRE_SCORED["bi_cl"]}
+    assert pm.best_tst_results is None
+    with pytest.raises(AttributeError, match="best_tst_results"):
+        pm.final_performance()
+    pm.compute_composite_v2()
+    assert not (pm.tst_results["score_v2"] == PRE_SCORED["score_v2"]).any()
+    pm.select_best_tst_version()
+    assert set(pm.best_tst_results["evaluation_encoder"]) == {"base_v2"}

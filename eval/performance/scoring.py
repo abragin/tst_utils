@@ -16,6 +16,7 @@ from tst_utils.eval.metrics.meaning import (
     calc_labse_embeddings, length_penalty
 )
 from tst_utils.eval.metrics.style import calc_style_embeddings, add_away_towards
+from tst_utils.eval.data.style_store import StyleLabelError
 from tst_utils.eval.performance.source_cache import (
     encode_style_rows, ensure_source_caches)
 
@@ -83,6 +84,11 @@ def add_labelled_style_scores(df, targets, *, key_column, source_vectors,
     from the instance's store; each row's target is the unit view of
     `targets.vector(row[key_column])`.
     """
+    if targets.encoder_key != encoder_key:
+        raise StyleLabelError(
+            f"add_labelled_style_scores: the targets hold "
+            f"{targets.encoder_key!r} vectors; the styled texts would be "
+            f"encoded with {encoder_key!r}")
     log('Adding style embeddings')
     df['styled_text_style_emb'] = encode_style_rows(df.styled_text, encoder_key)
     add_away_towards(df, targets, key_column=key_column,
