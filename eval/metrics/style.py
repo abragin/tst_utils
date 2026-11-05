@@ -174,6 +174,25 @@ def encode_style(texts, encoder_key, *, normalize):
                         text_keys=text_keys)
 
 
+_historical_pin_warning = {"shown": False}
+
+
+def _warn_historical_pin_once(key):
+    """Warn once per process when the pin is not base_v1 (host ruling P11
+    of task 5.2). The supported paths encode through `encode_style` with an
+    explicit evaluation encoder, so only a historical caller sees this."""
+    if key == "base_v1" or _historical_pin_warning["shown"]:
+        return
+    _historical_pin_warning["shown"] = True
+    import warnings
+    from tst_utils.eval.data.style_store import StyleProvenanceWarning
+    warnings.warn(
+        f"calc_style_embeddings encodes with the pin {key!r}, not base_v1: "
+        "a historical caller that mixes these vectors with base_v1 vectors "
+        "compares two encoders; use encode_style with an explicit key",
+        StyleProvenanceWarning, stacklevel=3)
+
+
 def calc_style_embeddings(texts, *, normalize):
     """Encode `texts` with the project style encoder.
 
@@ -196,7 +215,9 @@ def calc_style_embeddings(texts, *, normalize):
           are scale-invariant (angular), so `normalize=False` is correct for
           evaluation pipelines that consume `author_styles.npz` (unnormalized).
     """
-    model = load_style_encoder(model_names.style_encoder_key())
+    key = model_names.style_encoder_key()
+    _warn_historical_pin_once(key)
+    model = load_style_encoder(key)
     return [
         e for e in model.encode(
             list(texts),
@@ -245,13 +266,55 @@ def towards(source, current, target):
         sim_measure(current, target) - sim_measure(source, target), 0
     )/sim_c(target, source)
 
-def add_away_towards(df, author_styles=None):
+def unit_view(vector):
+    """The unit view of a stored target vector, in its stored dtype.
+
+    The one normalization of requirement 4 of task 5.2: the scoring
+    consumer derives it from the labelled object's stored values and never
+    writes it back."""
+    return vector / np.linalg.norm(vector)
+
+
+def add_away_towards(df, author_styles=None, *, key_column=None,
+                     source_vectors=None):
+    """Add the `away` and `towards` columns to `df`.
+
+    Labelled route (task 5.2): `author_styles` is a `LabelledStyleVectors`
+    and `key_column` names the column whose value selects each row's
+    target (`target_style` on the text path, `target_style_key` on the emb
+    path). The target is the unit view of the stored vector. When
+    `source_vectors` is given, it holds the source vector of each row, in
+    row order, and the `text_style_emb` cells are not read.
+
+    Historical route: a bare dict keyed by `target_style`, or None to read
+    `row.target_style_emb`; kept for the frozen direct callers
+    (`15 metrics exploration/step6_eval.py`, `step6b_eval_long.py`).
+    """
+    from tst_utils.eval.data.style_store import LabelledStyleVectors
+    labelled = isinstance(author_styles, LabelledStyleVectors)
+    if labelled:
+        if key_column is None:
+            raise ValueError("a labelled target source needs key_column")
+        keys = df[key_column].tolist()
+        unknown = sorted({str(k) for k in keys if k not in author_styles})
+        if unknown:
+            raise KeyError(f"unknown target style keys {unknown}; known: "
+                           f"{list(author_styles.keys)}")
+        units = {k: unit_view(author_styles.vector(k)) for k in set(keys)}
+    if source_vectors is not None and len(source_vectors) != len(df):
+        raise ValueError(f"{len(source_vectors)} source vectors for "
+                         f"{len(df)} rows")
     away_val = []
     towards_val = []
-    for _, row in df.iterrows():
-        source = row.text_style_emb
+    for position, (_, row) in enumerate(df.iterrows()):
+        source = (row.text_style_emb if source_vectors is None
+                  else source_vectors[position])
         current = row.styled_text_style_emb
-        target = author_styles[row.target_style] if author_styles else row.target_style_emb
+        if labelled:
+            target = units[row[key_column]]
+        else:
+            target = (author_styles[row.target_style] if author_styles
+                      else row.target_style_emb)
         away_val.append(away(source, current, target))
         towards_val.append(towards(source, current, target))
     df['away'] = away_val

@@ -12,14 +12,32 @@ import pandas as pd
 import numpy as np
 from tst_utils.eval.metrics.meaning import meaning_score
 from tst_utils.eval.metrics.composite import base_score_v2, compute_nat_v2
-from tst_utils.eval.data.style_store import guard_inline_style_columns
+from tst_utils.eval import model_names
+from tst_utils.eval.data.style_store import (
+    LabelledStyleVectors,
+    StyleLabelError,
+    load_style_embeddings,
+    style_text_key,
+    warn_provenance,
+)
+from tst_utils.eval.style_encoder_registry import get_encoder
 from tst_utils.eval.performance.constants import TARGET_STYLES, _SCORE_COLS, _QUALITY_COLS
 from tst_utils.eval.performance.reshape import expand_tst_output
-from tst_utils.eval.performance.source_cache import ensure_source_caches
+from tst_utils.eval.performance.source_cache import (
+    encode_style_rows, ensure_source_caches)
 from tst_utils.eval.performance.copying import add_chrf
 from tst_utils.eval.performance import scoring
 
 logger = logging.getLogger(__name__)
+
+
+def _same_vector(cell, stored):
+    """True when a frame cell holds exactly the stored vector."""
+    try:
+        array = np.asarray(cell)
+    except Exception:
+        return False
+    return array.shape == stored.shape and np.array_equal(array, stored)
 
 
 class TstPerformanceMetrics:
@@ -30,27 +48,72 @@ class TstPerformanceMetrics:
     - test_df (pd.DataFrame): Dataset containing source texts and related metadata.
         Expected columns:
           • For TST with string target styles: 'text' and 'author'.
-          • For TST with explicit target style embeddings:
-              'text', 'author', 'target_style_emb', and 'target_style_desc'.
+          • For TST with explicit target style vectors (the emb path):
+              'text', 'author', 'target_style_key' and 'target_style_desc'.
+              `target_style_key` selects each row's target from
+              `target_style_source`; `target_style_desc` is free text and
+              never read as a key.
     - tst_func (Callable): Function performing text style transfer.
-        • For TST with string target styles: should have a signature like (texts: List[str], target_style: str) -> List[str].
-        • For TST with explicit target style embeddings: should have a signature like (texts: List[str], target_style_embeddings: List[np.ndarray]) -> List[str].
-    - target_styles (List[str] | None): List of target styles to evaluate.
-        Used only for text target style TST. If None, the class expects explicit target style embeddings in test_df.
+        • Text path: (texts: List[str], target_style: str) -> List[str].
+        • Emb path: (texts=List[str], target_style_embeddings=StyleSelection)
+          -> List[str]. The selection carries the labelled source and one
+          row key per text, never bare vectors.
+    - target_styles (List[str] | None): target styles of the text path; None
+        selects the emb path.
     - tst_model (str): Name or ID of the TST model being evaluated.
-    - author_styles (Dict[str, np.ndarray]): Precomputed style embeddings per author or domain. Used with target style TST only.
+    - author_styles (LabelledStyleVectors | None): the scoring targets of the
+        text path, keyed by target style, labelled with the evaluation
+        encoder.
     - verbose (bool): Whether to log debug/progress information during processing.
+    - evaluation_encoder (str | None): the registry key every style encode
+        and every style check of this instance uses. None means the pin,
+        read once here; it is never reread during a run.
+    - target_style_source (LabelledStyleVectors | None): the targets of the
+        emb path, labelled with the evaluation encoder.
+    - source_style_path (str | None): a labelled parquet side file of source
+        style vectors, checked against the evaluation encoder at every entry.
+
+    Source style vectors are owned by the instance (task 5.2, requirement
+    11): a private store maps the exact text key of each source text to a
+    write-protected vector, filled only by the instance's own encode and by
+    a checked side-file load. The `text_style_emb` column is a detached
+    copy written from the store; a cell that differs from the store, or a
+    text the store has never seen, is warned about, discarded and encoded
+    fresh.
+
+    While the pin and the evaluation encoder are both `base_v1`, a bare
+    dict `author_styles` and an inline `target_style_emb` column are
+    accepted with a warning, as declared `base_v1` sources (the J4-tested
+    tree and a rollback keep `PphGenerator` working). Otherwise both raise.
     """
     def __init__(
         self, test_df, tst_func, target_styles, tst_model,
-        author_styles, verbose = False, perplexity_batch_size = 32
+        author_styles, verbose = False, perplexity_batch_size = 32, *,
+        evaluation_encoder=None, target_style_source=None,
+        source_style_path=None,
     ):
+        default_pin = model_names.style_encoder_key()
+        if evaluation_encoder is None:
+            evaluation_encoder = default_pin
+        get_encoder(evaluation_encoder)  # an unregistered key raises here
+        self._evaluation_encoder = evaluation_encoder
+        # The legacy intake (bare dict, inline target column) is open only
+        # while both the default pin and this run are base_v1.
+        self._legacy_v1 = (default_pin == "base_v1"
+                           and evaluation_encoder == "base_v1")
+        self._default_pin = default_pin
         self.test_df = test_df
         self.tst_func = tst_func
         self.target_styles = target_styles
         self.tst_model = tst_model
         self.verbose = verbose
-        self.author_styles = author_styles
+        self.author_styles = self._intake_targets(author_styles,
+                                                  "author_styles")
+        self.target_style_source = self._intake_targets(
+            target_style_source, "target_style_source")
+        self._inline_target_source = None
+        self.source_style_path = source_style_path
+        self._source_store = {}
         # rugpt3 perplexity batch size; lower to fit a small GPU (the per-batch
         # logits tensor is the VRAM bottleneck — see styled_pph_gen's 8 GB path).
         self.perplexity_batch_size = perplexity_batch_size
@@ -65,12 +128,183 @@ class TstPerformanceMetrics:
             logger.addHandler(_handler)
             logger.setLevel(logging.INFO)
 
+    @property
+    def evaluation_encoder(self):
+        """The registry key of this run's evaluation encoder (read-only)."""
+        return self._evaluation_encoder
+
+    # ---- intake and validation (task 5.2) ---------------------------------
+
+    def _intake_targets(self, targets, name):
+        """Accept a labelled target source of the evaluation encoder."""
+        if targets is None or isinstance(targets, LabelledStyleVectors):
+            if (targets is not None
+                    and targets.encoder_key != self._evaluation_encoder):
+                raise StyleLabelError(
+                    f"TstPerformanceMetrics: {name} holds "
+                    f"{targets.encoder_key!r} vectors; the evaluation "
+                    f"encoder is {self._evaluation_encoder!r}")
+            return targets
+        if isinstance(targets, dict):
+            if not self._legacy_v1:
+                raise StyleLabelError(
+                    f"TstPerformanceMetrics: {name} is a bare dict; pass "
+                    "LabelledStyleVectors (load_labelled_author_styles, "
+                    "from_build, from_encoded or declare); the pin is "
+                    f"{self._default_pin!r} and the evaluation encoder "
+                    f"{self._evaluation_encoder!r}")
+            warn_provenance(
+                f"TstPerformanceMetrics: {name} is a bare dict with no "
+                "label; declared base_v1 while the pin is base_v1")
+            keys = [k for k in targets if not str(k).startswith("__")]
+            return LabelledStyleVectors.declare(
+                {k: targets[k] for k in keys}, "base_v1",
+                f"bare dict {name} (legacy, pin base_v1)", keys=keys)
+        raise TypeError(
+            f"TstPerformanceMetrics: {name} must be LabelledStyleVectors, "
+            f"got {type(targets).__name__}")
+
+    def _put_source(self, key, vector):
+        stored = np.array(vector, copy=True)
+        stored.setflags(write=False)
+        self._source_store[key] = stored
+
+    def _side_file_vectors(self):
+        """The checked side file as {text key: vector}; raises on a mismatch."""
+        frame, _label = load_style_embeddings(
+            self.source_style_path, expect_encoder=self._evaluation_encoder)
+        return {key: np.asarray(vector, dtype=np.float32)
+                for key, vector in zip(frame["text_key"], frame["style_emb"])}
+
+    def _validate_source_style(self, frame, entry_point):
+        """Resolve every source text against the store; return the store's
+        vectors in row order and the frame with a detached `text_style_emb`.
+        """
+        texts = frame["text"].tolist()
+        keys = [style_text_key(text) for text in texts]
+        side = (self._side_file_vectors()
+                if self.source_style_path is not None else None)
+        if side is not None:
+            missing = [text for key, text in zip(keys, texts)
+                       if key not in side]
+            if missing:
+                raise StyleLabelError(
+                    f"{entry_point}: {len(missing)} texts have no row in "
+                    f"{self.source_style_path}, first missing excerpt: "
+                    f"{str(missing[0])[:80]!r}")
+        affected = [False] * len(keys)
+        if "text_style_emb" in frame.columns:
+            for row, (key, cell) in enumerate(zip(keys,
+                                                  frame["text_style_emb"])):
+                stored = self._source_store.get(key)
+                affected[row] = stored is None or not _same_vector(cell, stored)
+            if any(affected):
+                warn_provenance(
+                    f"{entry_point}: stored column text_style_emb has no "
+                    "label or differs from the instance's source store; "
+                    "the affected rows are dropped and encoded fresh")
+        need, seen = [], set()
+        for key, text, bad in zip(keys, texts, affected):
+            if (bad or key not in self._source_store) and key not in seen:
+                seen.add(key)
+                need.append((key, text))
+        if need:
+            if side is not None:
+                for key, _text in need:
+                    self._put_source(key, side[key])
+            else:
+                vectors = encode_style_rows([text for _key, text in need],
+                                            self._evaluation_encoder)
+                for (key, _text), vector in zip(need, vectors):
+                    self._put_source(key, vector)
+        frame = frame.copy()
+        source_vectors = [self._source_store[key] for key in keys]
+        frame["text_style_emb"] = [np.array(v, copy=True)
+                                   for v in source_vectors]
+        return frame, source_vectors
+
+    def _emb_mode(self):
+        return not self.target_styles
+
+    def _emb_targets(self):
+        return self.target_style_source or self._inline_target_source
+
+    def _validate_targets(self, frame, entry_point):
+        """Check the target supply of `frame` before any encode or TST call."""
+        if not self._emb_mode():
+            if "target_style_emb" in frame.columns:
+                self._reject_or_warn_inline(entry_point)
+            return frame
+        frame = frame.copy()
+        if "target_style_emb" in frame.columns:
+            self._reject_or_warn_inline(entry_point)
+            if ("target_style_key" not in frame.columns
+                    and self.target_style_source is None):
+                # Legacy: the inline column becomes a declared base_v1 source,
+                # one key per source row.
+                if self._inline_target_source is None:
+                    keys = [f"inline_{i}" for i in range(len(frame))]
+                    self._inline_target_source = LabelledStyleVectors.declare(
+                        list(frame["target_style_emb"]), "base_v1",
+                        f"inline target_style_emb at {entry_point} "
+                        "(legacy, pin base_v1)", keys=keys)
+                    frame["target_style_key"] = keys
+        if "target_style_key" in frame.columns:
+            source = self._emb_targets()
+            if source is None:
+                raise ValueError(
+                    f"{entry_point}: target_style_key needs "
+                    "target_style_source (LabelledStyleVectors)")
+            keys = frame["target_style_key"].tolist()
+            bad = [k for k in keys if not isinstance(k, str)]
+            if bad:
+                raise ValueError(f"{entry_point}: target_style_key must be "
+                                 f"a str on every row, got {bad[0]!r}")
+            unknown = sorted({k for k in keys if k not in source})
+            if unknown:
+                raise KeyError(f"{entry_point}: unknown target_style_key "
+                               f"values {unknown}; known: "
+                               f"{list(source.keys)}")
+        return frame
+
+    def _reject_or_warn_inline(self, entry_point):
+        if not self._legacy_v1:
+            raise StyleLabelError(
+                f"{entry_point}: stored column target_style_emb has no "
+                f"label; the pin is {self._default_pin!r} and the "
+                f"evaluation encoder {self._evaluation_encoder!r}; select "
+                "targets by target_style_key from a labelled source")
+        warn_provenance(
+            f"{entry_point}: stored column target_style_emb has no label; "
+            "an unlabelled file predates the label")
+
+    def _validate_frame(self, frame, entry_point):
+        """The shared validation of every public entry (requirement 11)."""
+        if "text" not in frame.columns:
+            raise ValueError(f"{entry_point}: the frame has no text column")
+        frame = self._validate_targets(frame, entry_point)
+        frame, source_vectors = self._validate_source_style(frame,
+                                                            entry_point)
+        return frame, source_vectors
+
+    def _target_record(self):
+        """The result columns that record this run's targets and encoder."""
+        source = self._emb_targets() if self._emb_mode() else self.author_styles
+        record = {"evaluation_encoder": self._evaluation_encoder}
+        if source is not None:
+            record.update({"target_provenance": source.provenance,
+                           "target_declared": bool(source.is_declared),
+                           "target_source": source.source})
+        return record
+
     def _log(self, msg, *args) -> None:
         """Verbose-gated progress logging (replaces the old `if self.verbose: print`)."""
         if self.verbose:
             logger.info(msg, *args)
 
     def produce_tst_results_with_text_target_styles(self) -> None:
+        entry = "TstPerformanceMetrics.produce_tst_results_with_text_target_styles"
+        self.test_df, _ = self._validate_frame(self.test_df, entry)
         res_dfs = []
 
         precalculated_cols = ["text_perplexity", "text_style_emb", "text_labse_emb"]
@@ -78,6 +312,7 @@ class TstPerformanceMetrics:
             ['example_number', 'text', 'author'] +
             [c for c in precalculated_cols if c in self.test_df]
         )
+        record = self._target_record()
 
         for t_style in self.target_styles:
             self._log("Performing TST for style: %s", t_style)
@@ -92,7 +327,8 @@ class TstPerformanceMetrics:
 
             df_expanded = expand_tst_output(
                 tst_output, df, cols_to_copy,
-                extra_fields={"target_style": t_style, "tst_model": self.tst_model},
+                extra_fields={"target_style": t_style, "tst_model": self.tst_model,
+                              **record},
             )
             res_dfs.append(df_expanded)
 
@@ -101,11 +337,18 @@ class TstPerformanceMetrics:
 
     def produce_tst_results_with_target_style_emb(self) -> None:
         """
-        Perform TST using explicit style embeddings from test_df.
-        Expects `target_style_emb` and `target_style_desc` columns in test_df.
+        Perform TST with targets selected by key from the labelled
+        `target_style_source`. Expects `target_style_key` and
+        `target_style_desc` columns in test_df (an inline
+        `target_style_emb` column is accepted only while the pin is base_v1,
+        with a warning, as a declared base_v1 source).
         """
-        if "target_style_emb" not in self.test_df or "target_style_desc" not in self.test_df:
-            raise ValueError("test_df must contain 'target_style_emb' and 'target_style_desc' columns.")
+        entry = "TstPerformanceMetrics.produce_tst_results_with_target_style_emb"
+        if "target_style_desc" not in self.test_df or not (
+                {"target_style_key", "target_style_emb"} & set(self.test_df.columns)):
+            raise ValueError("test_df must contain 'target_style_key' and "
+                             "'target_style_desc' columns.")
+        self.test_df, _ = self._validate_frame(self.test_df, entry)
 
         df = self.test_df.reset_index(drop=False).rename(columns={"index": "example_number"})
         df["tst_model"] = self.tst_model
@@ -115,23 +358,26 @@ class TstPerformanceMetrics:
         # identities) written by add_target_style_emb. Copied through conditionally
         # because callers that build test_df by hand may not set it; when present it
         # must survive this whitelist or it is silently dropped before best_tst_results.
-        optional_provenance_cols = ["target_keys"]
+        # target_style_emb is copied only on the legacy inline route.
+        optional_provenance_cols = ["target_keys", "target_style_emb"]
         cols_to_copy = (
-            ['example_number', 'text', 'author', 'target_style_emb', 'target_style_desc'] +
+            ['example_number', 'text', 'author', 'target_style_key',
+             'target_style_desc'] +
             [c for c in precalculated_cols if c in self.test_df] +
             [c for c in optional_provenance_cols if c in self.test_df]
         )
 
         self._log("Performing TST with target_style_embeddings")
 
+        selection = self._emb_targets().select(df.target_style_key.tolist())
         tst_output = self.tst_func(
             texts=df.text.tolist(),
-            target_style_embeddings=df.target_style_emb.tolist()
+            target_style_embeddings=selection,
         )
 
         self.tst_results = expand_tst_output(
             tst_output, df, cols_to_copy,
-            extra_fields={"tst_model": self.tst_model},
+            extra_fields={"tst_model": self.tst_model, **self._target_record()},
         )
 
     def produce_tst_results(self) -> None:
@@ -143,17 +389,20 @@ class TstPerformanceMetrics:
         """
         if self.target_styles:
             return self.produce_tst_results_with_text_target_styles()
-        elif {"target_style_emb", "target_style_desc"} <= set(self.test_df.columns):
+        elif "target_style_desc" in self.test_df.columns and (
+                {"target_style_key", "target_style_emb"} & set(self.test_df.columns)):
             return self.produce_tst_results_with_target_style_emb()
         else:
             raise ValueError(
                 "Cannot determine TST mode: either provide target_styles "
-                "or ensure test_df has both 'target_style_emb' and 'target_style_desc' columns."
+                "or ensure test_df has both 'target_style_key' and 'target_style_desc' columns."
             )
 
     def add_source_ppx_and_emb(self):
+        entry = "TstPerformanceMetrics.add_source_ppx_and_emb"
+        self.test_df, _ = self._validate_frame(self.test_df, entry)
         ensure_source_caches(
-            self.test_df, perplexity=True, style_emb=True, labse_emb=True,
+            self.test_df, perplexity=True, labse_emb=True,
             perplexity_batch_size=self.perplexity_batch_size,
         )
 
@@ -162,14 +411,37 @@ class TstPerformanceMetrics:
 
         Pipeline (each step caches/derives in place on self.tst_results):
             perplexity → bert → labse → style embeddings/away-towards → combine.
+        The source style vectors come from the instance's store, the styled
+        texts are encoded with the evaluation encoder, and each target is
+        the unit view of the labelled source's stored vector.
         """
         if self.tst_results is None:
             raise Exception("TST results are absent.")
+        entry = "TstPerformanceMetrics.compute_scores"
+        if self._emb_mode():
+            targets, key_column = self._emb_targets(), "target_style_key"
+        else:
+            targets, key_column = self.author_styles, "target_style"
+        if targets is None:
+            raise ValueError(
+                f"{entry}: no labelled target source "
+                f"({'target_style_source' if self._emb_mode() else 'author_styles'})")
+        if key_column not in self.tst_results.columns:
+            raise ValueError(f"{entry}: tst_results has no {key_column} column")
+        unknown = sorted({str(k) for k in self.tst_results[key_column]
+                          if k not in targets})
+        if unknown:
+            raise KeyError(f"{entry}: unknown {key_column} values {unknown}")
+        self.tst_results, source_vectors = self._validate_frame(
+            self.tst_results, entry)
         scoring.add_perplexity_scores(
             self.tst_results, self._log, batch_size=self.perplexity_batch_size)
         scoring.add_bert_score(self.tst_results, self._log)
         scoring.add_labse_score(self.tst_results, self._log)
-        scoring.add_style_scores(self.tst_results, self.author_styles, self._log)
+        scoring.add_labelled_style_scores(
+            self.tst_results, targets, key_column=key_column,
+            source_vectors=source_vectors,
+            encoder_key=self._evaluation_encoder, log=self._log)
         scoring.combine_scores(self.tst_results, self._log)
 
     def select_best_tst_version(self, score_col: str = 'score') -> None:
@@ -219,11 +491,14 @@ class TstPerformanceMetrics:
                     res[fs_key] = self.best_tst_results[
                         self.best_tst_results.target_style.isin(f_styles)
                     ][score_col].mean()
-            return res
         else:
-            return {
+            res = {
                 'DATA_MEAN': self.best_tst_results[score_col].mean()
             }
+        # The run's evaluation encoder (task 5.2): scores of different
+        # encoders are not comparable.
+        res['evaluation_encoder'] = self._evaluation_encoder
+        return res
 
     def compute_quality_scores(self, alignment_scorer, gender_scorer, entity_scorer) -> None:
         """Add bi_score, cl_score, bi_cl, gender_score, entity_score to self.tst_results.
@@ -344,17 +619,19 @@ class TstPerformanceMetrics:
         column is absent).
 
         Args:
-            source_style_path: optional parquet side file of source style
-                vectors. When given, the guard joins it onto the frame;
-                otherwise an unlabelled stored `text_style_emb` is dropped
-                and encoded fresh. A second execute() on one instance
-                re-encodes `text_style_emb` with a warning, because the
-                pipeline's own column carries no label.
+            source_style_path: optional labelled parquet side file of
+                source style vectors (overrides the constructor's). When
+                given, every entry checks it against the evaluation encoder
+                and fills the instance's source store from it; otherwise
+                the instance encodes each unseen source text once. A
+                stored `text_style_emb` that differs from the store is
+                dropped with a warning and encoded fresh; the instance's
+                own column is a copy of the store and passes.
         """
-        self.test_df = guard_inline_style_columns(
-            self.test_df, source_style_path=source_style_path,
-            entry_point="TstPerformanceMetrics.execute",
-        )
+        if source_style_path is not None:
+            self.source_style_path = source_style_path
+        self.test_df, _ = self._validate_frame(
+            self.test_df, "TstPerformanceMetrics.execute")
         self.add_source_ppx_and_emb()
         self.produce_tst_results()
         self.compute_scores()

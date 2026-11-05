@@ -5,6 +5,8 @@ source frame (``add_source_ppx_and_emb``) and the expanded results frame
 (``compute_scores``). Each cache is only (re)computed when its column is absent.
 """
 
+import numpy as np
+
 from tst_utils.eval.metrics.naturality import calculate_perplexity
 from tst_utils.eval.metrics.meaning import calc_labse_embeddings
 from tst_utils.eval.metrics.style import calc_style_embeddings
@@ -36,3 +38,17 @@ def ensure_source_caches(df, *, perplexity=False, style_emb=False, labse_emb=Fal
         df['text_labse_emb'] = [
             e.cpu().numpy() for e in calc_labse_embeddings(df.text)
         ]
+
+
+def encode_style_rows(texts, encoder_key):
+    """The evaluation encode route of `TstPerformanceMetrics` (task 5.2).
+
+    Encodes `texts` with the registry key `encoder_key` through
+    `encode_style` (raw vectors, `normalize=False`; every style consumer is
+    angle-only) and returns one 1D float array per text. The key is the
+    instance's evaluation encoder, never a reread of the pin.
+    """
+    from tst_utils.eval.metrics import style as style_metrics
+    encoded = style_metrics.encode_style(list(texts), encoder_key,
+                                         normalize=False)
+    return [np.array(row, copy=True) for row in encoded.embeddings]

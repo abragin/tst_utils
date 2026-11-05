@@ -16,7 +16,8 @@ from tst_utils.eval.metrics.meaning import (
     calc_labse_embeddings, length_penalty
 )
 from tst_utils.eval.metrics.style import calc_style_embeddings, add_away_towards
-from tst_utils.eval.performance.source_cache import ensure_source_caches
+from tst_utils.eval.performance.source_cache import (
+    encode_style_rows, ensure_source_caches)
 
 
 def _noop(*args) -> None:
@@ -62,10 +63,30 @@ def add_labse_score(df, log=_noop) -> None:
 
 
 def add_style_scores(df, author_styles, log=_noop) -> None:
+    """Historical route, kept for the frozen phase-2A callers
+    (`analyze_hard.py`, `gen_phaseb_named.py`, `gen_static_set.py`,
+    `salvage_static_set.py`, `score_static_set.py`); it encodes with the
+    pin. `TstPerformanceMetrics` uses `add_labelled_style_scores`."""
     log('Adding style embeddings')
     ensure_source_caches(df, style_emb=True)
     df['styled_text_style_emb'] = calc_style_embeddings(df.styled_text, normalize=False)
     add_away_towards(df, author_styles)
+    _free_gpu()
+
+
+def add_labelled_style_scores(df, targets, *, key_column, source_vectors,
+                              encoder_key, log=_noop) -> None:
+    """Style scores against a labelled target source (task 5.2).
+
+    `styled_text` is encoded with `encoder_key` (the instance's evaluation
+    encoder); `source_vectors` are the source vectors in row order, taken
+    from the instance's store; each row's target is the unit view of
+    `targets.vector(row[key_column])`.
+    """
+    log('Adding style embeddings')
+    df['styled_text_style_emb'] = encode_style_rows(df.styled_text, encoder_key)
+    add_away_towards(df, targets, key_column=key_column,
+                     source_vectors=source_vectors)
     _free_gpu()
 
 

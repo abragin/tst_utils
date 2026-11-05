@@ -22,6 +22,28 @@ from tst_utils.eval.metrics.entity_consistency import EntityConsistencyScorer
 from tst_utils.tinystyler import TinyStyler
 from tst_utils.tst_generator import TSTGenerator, GEN_OPTS_V3
 from tst_utils.utils import set_global_seed
+from tst_utils.eval import model_names
+
+
+class GenerationFailClosedError(RuntimeError):
+    """The styled-paraphrase generation path is closed for this pin."""
+
+
+def require_v1_generation(entry_point):
+    """Fail closed (host ruling B, task 5.2, requirement 2).
+
+    The `PphGenerator` path conditions on the pin's vectors and has no
+    encoder key of its own, so it runs only while the default pin is
+    `base_v1`. Governed by the default pin at call time; no evaluation
+    override re-enables it. Called first at every entry, before any pool
+    encoding, sampling, model load or generation.
+    """
+    key = model_names.style_encoder_key()
+    if key != "base_v1":
+        raise GenerationFailClosedError(
+            f"{entry_point}: the styled-paraphrase generation path is closed "
+            f"while the pin is {key!r}; it runs only with base_v1 until a "
+            "later task threads an encoder key through it")
 
 # Legacy v1 filters (retained).
 SIM_MEASURE_UB = 0.92
@@ -665,6 +687,7 @@ def gen_paraphrases(
     split — the smoke's cost-per-attempt input). ``attrs`` do not survive every
     pandas op; read them before slicing.
     """
+    require_v1_generation("gen_paraphrases")
     current_df = current_df.copy()
     if rng is None:
         rng = np.random.default_rng()
@@ -1172,6 +1195,7 @@ class PphGenerator:
         # loads once (models, scorers, encoded style pool). The per-domain
         # context lives in set_domain(); passing base_df_path keeps the legacy
         # single-domain behaviour (domain derived from the pool's first row).
+        require_v1_generation("PphGenerator.__init__")
         if checkpoint_path is None:
             raise ValueError("checkpoint_path is required")
         set_global_seed(seed)
@@ -1316,6 +1340,7 @@ class PphGenerator:
         attempt, on their own equally-capped counter so a deterministic scorer
         failure cannot recirculate forever.
         """
+        require_v1_generation("PphGenerator.execute")
         if self.base_df is None or self.results_path is None:
             raise RuntimeError(
                 "execute(): no domain context — call set_domain(domain, "

@@ -798,7 +798,9 @@ def test_set_domain_rejects_mismatched_base_df():
         gen.set_domain('news', base)
 
 
-def test_execute_without_domain_context_raises():
+def test_execute_without_domain_context_raises(monkeypatch):
+    from tst_utils.eval import model_names
+    monkeypatch.setattr(model_names, "STYLE_ENCODER_KEY", "base_v1")
     gen = _bare_generator()
     with pytest.raises(RuntimeError, match='no domain context'):
         gen.execute()
@@ -815,6 +817,8 @@ def _mock_execute_harness(monkeypatch, tmp_path):
     embedding the entry guard dropped rather than sampling against its absence.
     """
     from tst_utils import styled_pph_gen as spg
+    from tst_utils.eval import model_names
+    monkeypatch.setattr(model_names, "STYLE_ENCODER_KEY", "base_v1")
 
     recompute = np.full(8, 999.0, dtype=np.float32)
     seen = {}
@@ -1068,3 +1072,78 @@ def test_join_generated_files_dedupes_on_source_uid(tmp_path):
     # read-only by default: both part files still on disk
     parts = [f for f in os.listdir(d) if f.startswith("part_")]
     assert len(parts) == 2
+
+
+# ---------------- task 5.2: the generation path fails closed off base_v1
+
+def _install_spies(monkeypatch):
+    """Spy every encode, read, sampling, model load and scoring step that the
+    generation entries can reach first."""
+    from tst_utils import styled_pph_gen as spg
+    from tst_utils.eval.metrics import style as style_module
+    touched = []
+
+    def spy(name):
+        def _spy(*args, **kwargs):
+            touched.append(name)
+            raise AssertionError(f"{name} reached")
+        return _spy
+
+    monkeypatch.setattr(spg, "calc_style_embeddings", spy("calc_style_embeddings"))
+    monkeypatch.setattr(style_module, "load_style_encoder", spy("load_style_encoder"))
+    monkeypatch.setattr(spg.AutoTokenizer, "from_pretrained", spy("tokenizer"))
+    monkeypatch.setattr(spg, "TinyStyler", spy("TinyStyler"))
+    monkeypatch.setattr(spg, "TSTGenerator", spy("TSTGenerator"))
+    monkeypatch.setattr(spg.pd, "read_parquet", spy("read_parquet"))
+    monkeypatch.setattr(spg, "add_target_style_emb", spy("add_target_style_emb"))
+    monkeypatch.setattr(spg, "TstPerformanceMetrics", spy("TstPerformanceMetrics"))
+    monkeypatch.setattr(spg, "ensure_source_caches", spy("ensure_source_caches"))
+    monkeypatch.setattr(spg, "guard_inline_style_columns", spy("guard"))
+    monkeypatch.setattr(spg, "join_generated_files", spy("join_generated_files"))
+    return spg, touched
+
+
+def _pin(monkeypatch, key):
+    from tst_utils.eval import model_names
+    monkeypatch.setattr(model_names, "STYLE_ENCODER_KEY", key)
+
+
+def test_pph_generator_init_fails_closed_before_any_load(monkeypatch, tmp_path):
+    _pin(monkeypatch, "base_v2")
+    spg, touched = _install_spies(monkeypatch)
+    with pytest.raises(spg.GenerationFailClosedError, match="base_v2"):
+        spg.PphGenerator(style_df_path=str(tmp_path / "pool.parquet"),
+                         checkpoint_path=str(tmp_path / "ckpt.safetensors"),
+                         assert_norm="normalized")
+    assert touched == []
+
+
+def test_pph_generator_execute_fails_closed(monkeypatch, tmp_path):
+    _pin(monkeypatch, "base_v1")
+    gen, _seen, _calls, _ = _mock_execute_harness(monkeypatch, tmp_path)
+    _pin(monkeypatch, "base_v2")
+    spg, touched = _install_spies(monkeypatch)
+    with pytest.raises(spg.GenerationFailClosedError, match="base_v2"):
+        gen.execute()
+    assert touched == []
+
+
+def test_gen_paraphrases_fails_closed(monkeypatch):
+    _pin(monkeypatch, "base_v2")
+    spg, touched = _install_spies(monkeypatch)
+    df = pd.DataFrame({"text": ["one"], "domain": ["news"]})
+    with pytest.raises(spg.GenerationFailClosedError, match="base_v2"):
+        spg.gen_paraphrases(df, None, None, None, ["other_domain"],
+                            None, None, None)
+    assert touched == []
+
+
+def test_no_evaluation_override_reopens_generation(monkeypatch):
+    """The rejection follows the default pin; an explicit base_v1 elsewhere
+    does not re-enable it."""
+    from tst_utils import styled_pph_gen as spg
+    _pin(monkeypatch, "base_v2")
+    with pytest.raises(spg.GenerationFailClosedError):
+        spg.require_v1_generation("probe")
+    _pin(monkeypatch, "base_v1")
+    spg.require_v1_generation("probe")

@@ -529,3 +529,13 @@ def test_registered_load_builds_from_config_without_base_weights(tiny_registry,
         assert torch.equal(state[key], value), key
     assert torch.equal(state["model.transformer.wte.weight"],
                        stored["model.lm_head.weight"])
+
+
+def test_raw_trained_rejects_unit_only_target_with_assert_norm_none(tiny_registry):
+    """Requirement 5 of task 5.2: assert_norm=None still enforces the
+    registered raw scale, so a unit-only target is rejected before the
+    projection."""
+    ts, seen = _load(tiny_registry("raw"), assert_norm=None)
+    with pytest.raises(ts_mod.TinyStylerProvenanceError, match="raw-trained"):
+        ts.generate(IDS, MASK, style=_sources(norm=1.0).select(["a", "b"]))
+    assert seen == []

@@ -1,8 +1,10 @@
 """End-to-end guard test: TstPerformanceMetrics.execute with a canned tst_func.
 
 1D (one output per input) and 2D (two outputs per input). The style
-encoder is monkeypatched to a counter that returns fixed vectors; the
-other scorers (perplexity, BERTScore, LaBSE) run for real, so this file
+encoder's load seam (`style.load_style_encoder`, which every encode of
+`encode_style` passes) is monkeypatched to a counter that returns fixed
+vectors; every case asserts that it saw the styled-text encodes, so a zero
+source count cannot pass vacuously (task 5.2). The other scorers (perplexity, BERTScore, LaBSE) run for real, so this file
 is gpu_only and runs on tallin.
 """
 
@@ -35,24 +37,44 @@ STYLED_V1 = [
     "Юноша тихо шагал вдоль безлюдной улицы.",
 ]
 TARGETS = ["Tolstoy", "Dostoevsky"]
-AUTHOR_STYLES = {
-    "Tolstoy": np.full(8, 14.0, dtype=np.float32),
-    "Dostoevsky": np.full(8, 16.0, dtype=np.float32),
-}
+# The fixtures name their encoder explicitly (task 5.2): a declared base_v1
+# target source and an explicit base_v1 evaluation encoder.
+ENCODER = "base_v1"
+
+
+def _author_styles():
+    from tst_utils.eval.data.style_store import LabelledStyleVectors
+    return LabelledStyleVectors.declare(
+        [np.full(8, 14.0, dtype=np.float32) + np.arange(8, dtype=np.float32),
+         np.full(8, 16.0, dtype=np.float32) - np.arange(8, dtype=np.float32)],
+        ENCODER, "guard-e2e probe", keys=TARGETS)
 
 
 class _Counter:
+    """A fake model on the one encode seam, `style.load_style_encoder`."""
+
     def __init__(self):
         self.calls = []
 
-    def __call__(self, texts, normalize):
-        texts = list(texts)
-        self.calls.append(texts)
-        return [_vector_for(text) for text in texts]
+    def load(self, key):
+        counter = self
+
+        class Model:
+            def encode(self, texts, show_progress_bar=False,
+                       normalize_embeddings=False):
+                texts = list(texts)
+                counter.calls.append((key, texts))
+                return np.stack([_vector_for(text) for text in texts])
+        return Model()
 
     def source_encodes(self):
-        return sum(1 for call in self.calls for text in call
+        return sum(1 for _key, call in self.calls for text in call
                    if text in SOURCES)
+
+    def styled_encodes(self):
+        styled = set(STYLED) | set(STYLED_V1)
+        return sum(1 for _key, call in self.calls for text in call
+                   if text in styled)
 
 
 def _vector_for(text):
@@ -73,11 +95,9 @@ def _make_tst_func(n_versions):
 
 
 def _install_counter(monkeypatch):
-    import tst_utils.eval.performance.source_cache as source_cache_module
-    import tst_utils.eval.performance.scoring as scoring_module
+    import tst_utils.eval.metrics.style as style_module
     counter = _Counter()
-    monkeypatch.setattr(source_cache_module, "calc_style_embeddings", counter)
-    monkeypatch.setattr(scoring_module, "calc_style_embeddings", counter)
+    monkeypatch.setattr(style_module, "load_style_encoder", counter.load)
     return counter
 
 
@@ -88,10 +108,14 @@ def _run(df, monkeypatch, n_versions, **execute_kwargs):
         tst_func=_make_tst_func(n_versions),
         target_styles=TARGETS,
         tst_model="guard-e2e",
-        author_styles=AUTHOR_STYLES,
+        author_styles=_author_styles(),
         verbose=False,
+        evaluation_encoder=ENCODER,
     )
     pm.execute(**execute_kwargs)
+    # the counter sits on the encode route: every case sees the styled texts
+    assert counter.styled_encodes() > 0
+    assert {key for key, _ in counter.calls} == {ENCODER}
     return pm, counter
 
 
