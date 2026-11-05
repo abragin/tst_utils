@@ -18,7 +18,14 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 
+from tst_utils.eval.data.style_store import LabelledStyleVectors
 from tst_utils.tst_generator import TSTGenerator, GEN_OPTS_V1
+
+
+def news_styles(dim=8):
+    """A declared labelled source (task 5.2: no bare dicts)."""
+    return LabelledStyleVectors.declare([np.ones(dim, dtype=np.float32)],
+                                        "base_v1", "test", keys=["News"])
 
 
 GPT_NAME = "ai-forever/rugpt3small_based_on_gpt2"
@@ -32,6 +39,9 @@ class FakeModel(torch.nn.Module):
         super().__init__()
         self._p = torch.nn.Parameter(torch.zeros(1))
         self.last_call = None
+        # Stands in for a registered TinyStyler checkpoint (task 5.2).
+        self.verified_identity = {"name": "fake", "encoder_key": "base_v1",
+                                  "trained_scale": "unit"}
 
     def generate(self, input_ids=None, attention_mask=None, style=None, **kwargs):
         self.last_call = {
@@ -68,7 +78,7 @@ def test_gpt_embeddings_path_decouples_input_and_output(gpt_tokenizer):
     style_dim = 8
     gen = TSTGenerator(
         model, gpt_tokenizer, target_styles=None, model_type="GPT",
-        style_emb_dict={"News": np.ones(style_dim, dtype=np.float32)},
+        style_emb_dict=news_styles(style_dim),
         batch_size=4, generate_options={},
         max_input_length=16, max_output_length=24, min_output_length=5,
     )
@@ -112,7 +122,7 @@ def test_t5_uses_decoder_max_length(t5_tokenizer):
     style_dim = 8
     gen = TSTGenerator(
         model, t5_tokenizer, target_styles=None, model_type="T5",
-        style_emb_dict={"News": np.ones(style_dim, dtype=np.float32)},
+        style_emb_dict=news_styles(style_dim),
         batch_size=4, generate_options={},
         max_input_length=16, max_output_length=24, min_output_length=5,
     )
@@ -142,7 +152,7 @@ def test_conflicting_generate_options_raises(gpt_tokenizer, bad_opts):
     model = FakeModel()
     gen = TSTGenerator(
         model, gpt_tokenizer, target_styles=None, model_type="GPT",
-        style_emb_dict={"News": np.ones(8, dtype=np.float32)},
+        style_emb_dict=news_styles(),
         batch_size=4, generate_options=bad_opts,
         max_input_length=16, max_output_length=24, min_output_length=5,
     )
@@ -157,7 +167,7 @@ def test_nonactive_length_key_does_not_clash(gpt_tokenizer):
     model = FakeModel()
     gen = TSTGenerator(
         model, gpt_tokenizer, target_styles=None, model_type="GPT",
-        style_emb_dict={"News": np.ones(8, dtype=np.float32)},
+        style_emb_dict=news_styles(),
         batch_size=4, generate_options={"max_length": 50},
         max_input_length=16, max_output_length=24, min_output_length=5,
     )
@@ -189,7 +199,7 @@ def test_gpt_pads_left_regardless_of_tokenizer_side(right_padded_gpt_tokenizer, 
         model, tok,
         target_styles=["News"] if path == "author_tags" else None,
         model_type="GPT",
-        style_emb_dict={"News": np.ones(8, dtype=np.float32)} if path == "embeddings" else None,
+        style_emb_dict=news_styles() if path == "embeddings" else None,
         batch_size=4, generate_options={},
         max_input_length=32, max_output_length=24, min_output_length=5,
     )

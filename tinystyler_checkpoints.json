@@ -1,0 +1,50 @@
+{
+  "description": "TinyStyler checkpoints with a verified inference provenance (task 5.2, requirement 6). Keyed by the sha256 of the model.safetensors file. trained_scale is the style-vector scale the projection was trained on: unit (unit-norm rows) or raw (native encoder scale, ~15). missing_keys lists the keys the file may lack; each is a tied alias whose value comes from a loaded key. Hashes and header reads: 17 phase style-v2/results/pin_switch_inventory/ (J1); selection: host, 2026-11-05.",
+  "checkpoints": {
+    "d5ba57f2b215a69b28194c42af442536e530447e4855813ac7a16aca9f225b22": {
+      "name": "folder-14 tst-tinystyler-styled-pph-rugpt3-small-v1 (checkpoint-114678)",
+      "paths": [
+        "14 training tinystyler with better data/tst-tinystyler-styled-pph-rugpt3-small-v1/model.safetensors",
+        "14 training tinystyler with better data/tst-tinystyler-styled-pph-rugpt3-small-v1/checkpoint-114678/model.safetensors"
+      ],
+      "encoder_key": "base_v1",
+      "trained_scale": "unit",
+      "model_name": "ai-forever/rugpt3small_based_on_gpt2",
+      "model_type": "GPT",
+      "ctrl_embed_dim": 768,
+      "missing_keys": [
+        {"key": "model.transformer.wte.weight", "kind": "tied_alias", "tied_to": "model.lm_head.weight"}
+      ]
+    },
+    "9e3acaf23b79bbf7fd0a97d7997e4ad94616dbdf551303e793e1c6493562153a": {
+      "name": "folder-11 ts_target_emb_rugpt_small_long_text_ft_v1 (best long-text model)",
+      "paths": [
+        "11 tinystyler - long texts FT/trained_ts_target_emb_rugpt_small_long_text_ft_v1/model.safetensors"
+      ],
+      "encoder_key": "base_v1",
+      "trained_scale": "raw",
+      "model_name": "ai-forever/rugpt3small_based_on_gpt2",
+      "model_type": "GPT",
+      "ctrl_embed_dim": 768,
+      "missing_keys": [
+        {"key": "model.transformer.wte.weight", "kind": "tied_alias", "tied_to": "model.lm_head.weight"}
+      ]
+    },
+    "3414a60cb7227f95762882ec4e8c32176347a1530f28b3b10b55127539692976": {
+      "name": "folder-09 ts_target_emb_rut5_base_v1 (best T5 model)",
+      "paths": [
+        "09 tinystyler/trained_ts_target_emb_rut5_base_v1/model.safetensors"
+      ],
+      "encoder_key": "base_v1",
+      "trained_scale": "raw",
+      "model_name": "ai-forever/ruT5-base",
+      "model_type": "T5",
+      "ctrl_embed_dim": 768,
+      "missing_keys": [
+        {"key": "model.shared.weight", "kind": "tied_alias", "tied_to": "model.decoder.embed_tokens.weight"},
+        {"key": "model.encoder.embed_tokens.weight", "kind": "tied_alias", "tied_to": "model.decoder.embed_tokens.weight"},
+        {"key": "model.lm_head.weight", "kind": "tied_alias", "tied_to": "model.decoder.embed_tokens.weight"}
+      ]
+    }
+  }
+}

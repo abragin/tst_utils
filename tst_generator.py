@@ -25,15 +25,15 @@ GEN_OPTS_V3 = {   # default TinyStyler sampling params
 class TSTGenerator:
     """Batched style-transfer inference wrapper.
 
-    Style-embedding scale: this wrapper passes ``style_emb_dict`` /
-    ``target_style_embeddings`` straight through to ``model.generate(style=...)``.
-    The caller is responsible for matching the scale to what ``model``
-    (typically a :class:`TinyStyler`) expects. Two ways to enforce the
-    scale check:
-
-    - construct the model with ``TinyStyler(assert_norm=...)``; or
-    - pass ``assert_norm=`` to this wrapper, which will set the same attribute
-      on the inner model (overrides whatever the model was constructed with).
+    Style conditioning (task 5.2): ``style_emb_dict`` must be
+    ``LabelledStyleVectors`` whose encoder is the conditioning encoder of the
+    model's verified identity (a registered TinyStyler checkpoint), checked at
+    construction; ``target_style_embeddings`` must be a ``StyleSelection``.
+    The wrapper passes selections to ``model.generate(style=...)``, and
+    TinyStyler builds the tensor at the registered trained scale. Bare
+    arrays and dicts raise. ``assert_norm=`` on a verified model must equal
+    the registered scale; on another model it sets the attribute, as before.
+    Author-tag models (``style_emb_dict=None``) are unchanged.
 
     Length parameters (both required, no default):
 
@@ -99,6 +99,29 @@ class TSTGenerator:
         self.tokenizer = tokenizer
         self.target_styles = target_styles
         self.model_type = model_type.upper()
+        identity = getattr(model, "verified_identity", None)
+        if style_emb_dict is not None:
+            # Task 5.2: the named-target conditioning route takes only a
+            # labelled object, checked against the model's verified identity
+            # here, at construction.
+            from tst_utils.eval.data.style_store import LabelledStyleVectors
+            if not isinstance(style_emb_dict, LabelledStyleVectors):
+                raise TypeError(
+                    "TSTGenerator(style_emb_dict=...) takes LabelledStyleVectors "
+                    "(load_labelled_author_styles, from_encoded or declare), "
+                    f"got {type(style_emb_dict).__name__}"
+                )
+            if identity is None:
+                raise ValueError(
+                    "TSTGenerator(style_emb_dict=...) needs a model with a "
+                    "verified identity (a registered TinyStyler checkpoint)"
+                )
+            if style_emb_dict.encoder_key != identity["encoder_key"]:
+                raise ValueError(
+                    f"style_emb_dict holds {style_emb_dict.encoder_key!r} "
+                    f"vectors; the checkpoint {identity['name']} is conditioned "
+                    f"on {identity['encoder_key']!r}"
+                )
         self.style_emb_dict = style_emb_dict
         self.batch_size = batch_size
         self.num_sequences = num_sequences
@@ -116,6 +139,16 @@ class TSTGenerator:
                     f"assert_norm must be one of {_VALID_ASSERT_NORM}, "
                     f"got {assert_norm!r}"
                 )
+            if identity is not None:
+                from tst_utils.tinystyler import SCALE_TO_ASSERT_NORM
+                registered = SCALE_TO_ASSERT_NORM[identity["trained_scale"]]
+                if assert_norm != registered:
+                    raise ValueError(
+                        f"TSTGenerator(assert_norm={assert_norm!r}) contradicts "
+                        f"the registered trained scale of {identity['name']} "
+                        f"({identity['trained_scale']}, assert_norm="
+                        f"{registered!r})"
+                    )
             if not hasattr(model, 'assert_norm'):
                 raise TypeError(
                     "TSTGenerator(assert_norm=...) requires a model that exposes "
@@ -131,9 +164,9 @@ class TSTGenerator:
         if self.style_emb_dict is not None:  # TinyStyler with embeddings
             if target_style not in self.style_emb_dict:
                 raise ValueError(f"Unsupported style: {target_style}")
-            emb = self.style_emb_dict[target_style]
-            emb = np.array([emb] * batch_size)
-            return torch.from_numpy(emb).float().to(self.device)
+            # A selection of the labelled source; TinyStyler.generate checks
+            # it and builds the tensor right before the projection.
+            return self.style_emb_dict.select([target_style] * batch_size)
         else:  # use author tags
             if target_style not in self.target_styles:
                 raise ValueError(f"Unsupported style: {target_style}")
@@ -247,6 +280,27 @@ class TSTGenerator:
         if (target_style is not None) and (target_style_embeddings is not None):
             raise ValueError("Provide only one of target_style or target_style_embeddings, not both.")
 
+        if target_style_embeddings is not None:
+            from tst_utils.eval.data.style_store import StyleSelection
+            if not isinstance(target_style_embeddings, StyleSelection):
+                raise TypeError(
+                    "perform_tst(target_style_embeddings=...) takes a "
+                    "StyleSelection (a labelled source and one row key per "
+                    f"text), got {type(target_style_embeddings).__name__}"
+                )
+            if len(target_style_embeddings) != len(texts):
+                raise ValueError(
+                    "Length mismatch between texts and target_style_embeddings.")
+            identity = getattr(self.model, "verified_identity", None)
+            if (identity is not None and target_style_embeddings.encoder_key
+                    != identity["encoder_key"]):
+                raise ValueError(
+                    f"target style vectors from "
+                    f"{target_style_embeddings.encoder_key!r}; the checkpoint "
+                    f"{identity['name']} is conditioned on "
+                    f"{identity['encoder_key']!r}"
+                )
+
         results = []
         total = len(texts)
 
@@ -259,10 +313,8 @@ class TSTGenerator:
             # string (woven into the input text by `_prepare_inputs`).
             style_embs, style_token = None, None
             if target_style_embeddings is not None:
-                batch_embs = target_style_embeddings[start:end]
-                if len(batch_embs) != len(batch_texts):
-                    raise ValueError("Length mismatch between texts and target_style_embeddings.")
-                style_embs = torch.tensor(np.stack(batch_embs)).float().to(self.device)
+                style_embs = target_style_embeddings.source.select(
+                    target_style_embeddings.row_keys[start:end])
             elif self.style_emb_dict is not None:
                 style_embs = self._get_style_representation(target_style, len(batch_texts))
             else:

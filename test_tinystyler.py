@@ -237,3 +237,268 @@ def test_tst_generator_rejects_model_without_assert_norm():
         TSTGenerator(model=fake, tokenizer=MagicMock(), target_styles=None,
                      assert_norm='normalized',
                      max_input_length=256, max_output_length=256)
+
+
+# =============================================================================
+# Task 5.2, requirement 6: the checkpoint guard and the guarded generate.
+# A tiny real GPT-2 (no download) stands in for the base model, so the load,
+# the tie check and the projection are real; a recording projection shows
+# whether `generate` ever reached it.
+# =============================================================================
+
+import json as _json
+
+import numpy as _np
+from safetensors.torch import save_file as _save_file
+
+from tst_utils import tinystyler as ts_mod
+from tst_utils.eval.data.style_store import LabelledStyleVectors
+
+
+def _tiny_base_factory():
+    from transformers import GPT2Config, GPT2LMHeadModel
+    config = GPT2Config(n_layer=1, n_embd=D_MODEL, n_head=2, vocab_size=50,
+                        n_positions=64)
+
+    def from_pretrained(name, use_safetensors=True):
+        torch.manual_seed(0)
+        return GPT2LMHeadModel(config)
+    return from_pretrained
+
+
+@pytest.fixture
+def tiny_registry(tmp_path, monkeypatch):
+    """Patch the base model loader and write checkpoints into a tmp registry.
+
+    Returns make(scale, drop=(), register=True) -> checkpoint path.
+    """
+    monkeypatch.setattr(ts_mod.AutoModelForCausalLM, "from_pretrained",
+                        _tiny_base_factory())
+    registry_path = tmp_path / "registry.json"
+    registry = {"description": "test", "checkpoints": {}}
+    registry_path.write_text(_json.dumps(registry))
+    monkeypatch.setattr(ts_mod, "CHECKPOINT_REGISTRY_PATH", str(registry_path))
+    counter = {"n": 0}
+
+    def make(scale="unit", drop=(), register=True):
+        source = TinyStyler(model_name="tiny", model_type="GPT", use_style=True,
+                            ctrl_embed_dim=CTRL_DIM, assert_norm=None)
+        torch.manual_seed(1 + counter["n"])
+        torch.nn.init.normal_(source.proj.weight)
+        state = {k: v.clone().contiguous() for k, v in source.state_dict().items()
+                 if k != "model.transformer.wte.weight" and k not in drop}
+        counter["n"] += 1
+        path = tmp_path / f"ckpt{counter['n']}.safetensors"
+        _save_file(state, str(path))
+        if register:
+            data = _json.loads(registry_path.read_text())
+            data["checkpoints"][ts_mod.checkpoint_sha256(str(path))] = {
+                "name": f"tiny-{scale}-{counter['n']}", "paths": [str(path)],
+                "encoder_key": "base_v1", "trained_scale": scale,
+                "model_name": "tiny", "model_type": "GPT",
+                "ctrl_embed_dim": CTRL_DIM,
+                "missing_keys": [{"key": "model.transformer.wte.weight",
+                                  "kind": "tied_alias",
+                                  "tied_to": "model.lm_head.weight"}],
+            }
+            registry_path.write_text(_json.dumps(data))
+        return str(path)
+    return make
+
+
+def _load(path, **kwargs):
+    kwargs.setdefault("assert_norm", None)
+    ts = TinyStyler(model_name="tiny", model_type="GPT", use_style=True,
+                    ctrl_embed_dim=CTRL_DIM, checkpoint_path=path, **kwargs)
+    seen = []
+    original = ts.proj.forward
+
+    def recording(x):
+        seen.append(x.detach().clone())
+        return original(x)
+    ts.proj.forward = recording
+    ts.model.generate = lambda **kw: torch.zeros(1, 1, dtype=torch.long)
+    return ts, seen
+
+
+def _sources(encoder="base_v1", norm=15.0, keys=("a", "b")):
+    # the last row has another direction and is 10% longer, so a swap of
+    # rows or a lost magnitude shows in the projected input
+    vectors = [_np.full(CTRL_DIM, norm / CTRL_DIM ** 0.5, dtype=_np.float32)
+               for _ in keys]
+    last = vectors[-1].copy()
+    last[: CTRL_DIM // 2] *= -1
+    vectors[-1] = last * 1.1
+    return LabelledStyleVectors.declare(vectors, encoder, "test",
+                                        keys=list(keys))
+
+
+IDS = torch.zeros(2, 3, dtype=torch.long)
+MASK = torch.ones(2, 3)
+
+
+# ---- the identity at load ---------------------------------------------------
+
+def test_registered_checkpoint_gets_its_identity(tiny_registry):
+    ts, _ = _load(tiny_registry("unit"))
+    identity = ts.verified_identity
+    assert identity["encoder_key"] == "base_v1"
+    assert identity["trained_scale"] == "unit"
+    assert ts.assert_norm == "normalized"  # assert_norm=None -> registered
+
+
+def test_unregistered_checkpoint_has_no_identity(tiny_registry):
+    ts, _ = _load(tiny_registry("unit", register=False))
+    assert ts.verified_identity is None
+
+
+def test_missing_learned_key_raises_at_load(tiny_registry):
+    path = tiny_registry("unit", drop=("model.transformer.ln_f.weight",))
+    with pytest.raises(ts_mod.TinyStylerProvenanceError, match="missing"):
+        _load(path)
+
+
+def test_contradicting_assert_norm_raises_at_construction(tiny_registry):
+    raw = tiny_registry("raw")
+    with pytest.raises(ts_mod.TinyStylerProvenanceError, match="contradicts"):
+        _load(raw, assert_norm="normalized")
+    with pytest.raises(ts_mod.TinyStylerProvenanceError, match="raw-trained"):
+        _load(raw, auto_normalize_input=True)
+    ts, _ = _load(raw, assert_norm="unnormalized")
+    assert ts.verified_identity["trained_scale"] == "raw"
+
+
+def test_construction_field_mismatch_raises(tiny_registry):
+    path = tiny_registry("unit")
+    with pytest.raises(ts_mod.TinyStylerProvenanceError, match="ctrl_embed_dim"):
+        TinyStyler(model_name="tiny", model_type="GPT", use_style=True,
+                   ctrl_embed_dim=512, checkpoint_path=path, assert_norm=None)
+
+
+# ---- generate never reaches the projection on a rejected input -------------
+
+def test_rejections_never_reach_the_projection(tiny_registry):
+    unit_path = tiny_registry("unit")
+    raw_path = tiny_registry("raw")
+    cases = []
+    ts, seen = _load(unit_path)
+    cases.append((ts, seen, _sources("base_v2").select(["a", "b"]),
+                  ts_mod.TinyStylerProvenanceError, "conditioned on"))
+    ts, seen = _load(unit_path)
+    cases.append((ts, seen, torch.ones(2, CTRL_DIM), TypeError,
+                  "StyleSelection"))
+    ts, seen = _load(tiny_registry("unit", register=False))
+    cases.append((ts, seen, _sources().select(["a", "b"]),
+                  ts_mod.TinyStylerProvenanceError, "no verified identity"))
+    ts, seen = _load(raw_path, assert_norm="unnormalized")
+    cases.append((ts, seen, _sources(norm=1.0).select(["a", "a"]),
+                  ts_mod.TinyStylerProvenanceError, "raw-trained"))
+    for ts, seen, style, error, match in cases:
+        with pytest.raises(error, match=match):
+            ts.generate(IDS, MASK, style=style)
+        assert seen == []
+
+
+def test_external_load_route_is_unverified(tiny_registry):
+    from safetensors.torch import load_file
+    path = tiny_registry("unit")
+    ts, seen = _load(tiny_registry("unit", register=False))
+    ts.load_state_dict(load_file(path), strict=False)
+    assert ts.verified_identity is None
+    with pytest.raises(ts_mod.TinyStylerProvenanceError):
+        ts.generate(IDS, MASK, style=_sources().select(["a", "b"]))
+    assert seen == []
+
+
+# ---- positive controls ---------------------------------------------------------
+
+def test_unit_trained_success_reaches_projection_with_unit_view(tiny_registry):
+    ts, seen = _load(tiny_registry("unit"))
+    styles = _sources(norm=15.0)
+    ts.generate(IDS, MASK, style=styles.select(["b", "a"]))
+    assert len(seen) == 1
+    got = seen[0].squeeze(1)
+    expected = _np.stack([styles.vector("b"), styles.vector("a")]).astype(_np.float64)
+    expected /= _np.linalg.norm(expected, axis=1, keepdims=True)
+    assert torch.allclose(got, torch.tensor(expected, dtype=got.dtype), atol=1e-6)
+
+
+def test_raw_trained_success_reaches_projection_with_raw_values(tiny_registry):
+    ts, seen = _load(tiny_registry("raw"), assert_norm="unnormalized")
+    styles = _sources(norm=15.0)
+    ts.generate(IDS, MASK, style=styles.select(["a", "b"]))
+    got = seen[0].squeeze(1)
+    expected = torch.tensor(_np.stack([styles.vector("a"), styles.vector("b")]),
+                            dtype=got.dtype)
+    assert torch.allclose(got, expected)
+
+
+def test_state_transition_verified_then_load_state_dict_then_rejected(tiny_registry):
+    ts, seen = _load(tiny_registry("unit"))
+    styles = _sources()
+    ts.generate(IDS, MASK, style=styles.select(["a", "b"]))
+    assert len(seen) == 1
+    ts.load_state_dict(ts.state_dict())
+    assert ts.verified_identity is None
+    with pytest.raises(ts_mod.TinyStylerProvenanceError):
+        ts.generate(IDS, MASK, style=styles.select(["a", "b"]))
+    assert len(seen) == 1
+
+
+def test_tst_generator_route_reaches_projection(tiny_registry):
+    from tst_utils.tst_generator import TSTGenerator
+    ts, seen = _load(tiny_registry("unit"))
+
+    styles = _sources()
+    gen = TSTGenerator(ts, MagicMock(), target_styles=None, model_type="GPT",
+                       style_emb_dict=styles, batch_size=2, num_sequences=1,
+                       generate_options={}, max_input_length=8,
+                       max_output_length=8)
+    gen._prepare_inputs = lambda batch, style_token=None: {
+        "input_ids": torch.zeros(len(batch), 3, dtype=torch.long),
+        "attention_mask": torch.ones(len(batch), 3)}
+    gen._decode = lambda ids, style_token=None: ["out"] * 2
+    gen.perform_tst(["x", "y"], target_style="b")
+    assert len(seen) == 1
+    expected = styles.vector("b").astype(_np.float64)
+    expected /= _np.linalg.norm(expected)
+    assert torch.allclose(seen[0].squeeze(1)[0],
+                          torch.tensor(expected, dtype=seen[0].dtype), atol=1e-6)
+    # the selection route: repeated, reordered row keys
+    gen.perform_tst(["x", "y"], target_style_embeddings=styles.select(["b", "a"]))
+    assert len(seen) == 2
+    with pytest.raises(TypeError, match="StyleSelection"):
+        gen.perform_tst(["x", "y"], target_style_embeddings=[_np.ones(CTRL_DIM)] * 2)
+
+
+def test_tst_generator_rejects_bare_dicts_and_wrong_encoders(tiny_registry):
+    from tst_utils.tst_generator import TSTGenerator
+    ts, _ = _load(tiny_registry("unit"))
+    common = dict(target_styles=None, model_type="GPT", batch_size=2,
+                  generate_options={}, max_input_length=8, max_output_length=8)
+    with pytest.raises(TypeError, match="LabelledStyleVectors"):
+        TSTGenerator(ts, MagicMock(), style_emb_dict={"a": _np.ones(CTRL_DIM)},
+                     **common)
+    with pytest.raises(ValueError, match="conditioned on"):
+        TSTGenerator(ts, MagicMock(), style_emb_dict=_sources("base_v2"), **common)
+    unverified, _ = _load(tiny_registry("unit", register=False))
+    with pytest.raises(ValueError, match="verified identity"):
+        TSTGenerator(unverified, MagicMock(), style_emb_dict=_sources(), **common)
+
+
+def test_tst_generator_assert_norm_on_verified_model(tiny_registry):
+    from tst_utils.tst_generator import TSTGenerator
+    ts, _ = _load(tiny_registry("unit"))
+    common = dict(target_styles=None, model_type="GPT", max_input_length=8,
+                  max_output_length=8)
+    with pytest.raises(ValueError, match="contradicts"):
+        TSTGenerator(ts, MagicMock(), assert_norm="unnormalized", **common)
+    TSTGenerator(ts, MagicMock(), assert_norm="normalized", **common)
+    assert ts.assert_norm == "normalized"
+
+
+def test_author_tag_model_is_exempt():
+    ts = _make_stub(use_style=False)
+    ts.model.get_input_embeddings = lambda: nn.Embedding(10, D_MODEL)
+    ts.model.generate = lambda **kw: "ok"
+    assert ts.generate(IDS, MASK) == "ok"
