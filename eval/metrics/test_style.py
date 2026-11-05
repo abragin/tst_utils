@@ -51,7 +51,9 @@ def normalized_embs():
 
 @pytest.fixture(scope='module')
 def raw_embs():
-    return calc_style_embeddings(_TEXTS, normalize=False)
+    # An explicit base_v1 encode (task 5.2): the scale below is v1's.
+    return list(style_module.encode_style(_TEXTS, "base_v1",
+                                          normalize=False).embeddings)
 
 
 def test_normalize_required_kwarg():
@@ -81,7 +83,7 @@ def test_normalize_true_produces_unit_norm(normalized_embs):
 
 
 def test_normalize_false_preserves_native_scale(raw_embs):
-    # `abragin/ruBert-style-base` produces vectors with norm ~15.
+    # base_v1 (`abragin/ruBert-style-base`) produces vectors with norm ~15.
     norms = [float(np.linalg.norm(e)) for e in raw_embs]
     for n in norms:
         assert n > 10.0, f'expected raw norm > 10, got {n}'
@@ -155,7 +157,7 @@ def test_hash_check_catches_missing_file(tmp_path):
 
 
 @gpu_only
-def test_vectors_unchanged_after_load_check():
+def test_vectors_unchanged_after_load_check(monkeypatch):
     # The 20 texts encoded before the change, through the new loader:
     # max abs difference 0.0, because the revision is the same snapshot.
     import json
@@ -164,6 +166,9 @@ def test_vectors_unchanged_after_load_check():
                            "tests", "style_before_vectors.npz")
     stored = np.load(fixture, allow_pickle=True)
     texts = [str(t) for t in stored["texts"]]
+    # An explicit base_v1 identity test (task 5.2): the fixture is v1.
+    from tst_utils.eval import model_names
+    monkeypatch.setattr(model_names, "STYLE_ENCODER_KEY", "base_v1")
     fresh = calc_style_embeddings(texts, normalize=False)
     difference = float(np.max(np.abs(
         np.asarray(fresh, dtype=np.float32)
@@ -225,12 +230,23 @@ def test_encode_style_label_with_fake_model(monkeypatch):
 
 
 @gpu_only
-def test_encode_style_matches_calc_on_gpu():
+@pytest.mark.parametrize("key", ["base_v1", "base_v2"])
+def test_encode_style_matches_calc_on_gpu(monkeypatch, key):
+    """The one pin source patched to `key`: calc_style_embeddings and
+    encode_style(key) give the same vectors (task 5.2)."""
+    import warnings
+    from tst_utils.eval import model_names
+    monkeypatch.setattr(model_names, "STYLE_ENCODER_KEY", key)
     texts = ["Привет мир.", "Это второе предложение."]
-    encoded = style_module.encode_style(texts, "base_v1", normalize=False)
-    fresh = calc_style_embeddings(texts, normalize=False)
+    encoded = style_module.encode_style(texts, key, normalize=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the base_v2 historical-pin warning
+        fresh = calc_style_embeddings(texts, normalize=False)
     assert np.max(np.abs(encoded.embeddings
                          - np.asarray(fresh))) == 0.0
-    assert encoded.label["encoder_key"] == "base_v1"
+    assert encoded.label["encoder_key"] == key
     assert encoded.label["normalization"] == "none"
-    assert 14 <= encoded.label["norm_min"] <= encoded.label["norm_max"] <= 17
+    if key == "base_v1":
+        assert 14 <= encoded.label["norm_min"] <= encoded.label["norm_max"] <= 17
+    else:
+        assert encoded.label["norm_min"] > 10

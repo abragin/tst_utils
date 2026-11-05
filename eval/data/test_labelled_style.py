@@ -173,19 +173,21 @@ def test_selection_rejects_unknown_keys_bare_dicts_and_strings():
 # ---- the checked loader ----------------------------------------------------
 
 def test_checked_loader_reads_the_v1_author_styles():
-    styles = load_module.load_labelled_author_styles(expect_encoder="base_v1")
+    styles = load_module.load_labelled_author_styles(
+        expect_encoder="base_v1", path=load_module.AUTHOR_STYLES_BASE_V1_PATH)
     assert styles.provenance == "loader"
     assert styles.encoder_key == "base_v1"
     assert set(styles.keys) == {"Bible", "Chekhov", "Dostoevsky", "Tolstoy",
                                 "News"}
-    with np.load(load_module.AUTHOR_STYLES_PATH) as raw:
+    with np.load(load_module.AUTHOR_STYLES_BASE_V1_PATH) as raw:
         assert np.array_equal(styles.vector("Tolstoy"), raw["Tolstoy"])
     assert 14.0 < float(styles.norms().min())
 
 
 def test_checked_loader_rejects_a_wrong_encoder_and_an_unlabelled_file(tmp_path):
-    with pytest.raises(StyleLabelError, match="base_v2"):
-        load_module.load_labelled_author_styles(expect_encoder="base_v2")
+    with pytest.raises(StyleLabelError, match="base_v1"):
+        load_module.load_labelled_author_styles(
+            expect_encoder="base_v2", path=load_module.AUTHOR_STYLES_BASE_V1_PATH)
     path = str(tmp_path / "u.npz")
     np.savez(path, a=np.ones(768, dtype=np.float32))
     with pytest.raises(StyleLabelError, match="unlabelled"):
@@ -206,14 +208,14 @@ def test_checked_loader_round_trips_a_build(tmp_path):
 def test_patch_of_the_pin_source_reaches_every_reader(monkeypatch, tmp_path):
     monkeypatch.setattr(model_names, "STYLE_ENCODER_KEY", "base_v2")
     assert model_names.style_encoder_key() == "base_v2"
-    # the canonical v1 file is labelled base_v1: every default reader refuses
+    # the v1 copy is labelled base_v1: every default reader refuses it
+    v1_path = load_module.AUTHOR_STYLES_BASE_V1_PATH
     with pytest.raises(StyleLabelError, match="base_v2"):
-        load_module.load_author_styles()
+        load_module.load_centroids_npz(v1_path, renormalize=False)
     with pytest.raises(StyleLabelError, match="base_v2"):
-        load_module.load_centroids_npz(load_module.AUTHOR_STYLES_PATH,
-                                       renormalize=False)
+        load_module.load_labelled_author_styles(path=v1_path)
     with pytest.raises(StyleLabelError, match="base_v2"):
-        load_module.load_labelled_author_styles()
+        load_module.load_labelled_centroids(v1_path)
     # side files: a v1 side file is refused by the default
     from tst_utils.eval.data.style_store import (join_style_embeddings,
                                                  load_style_embeddings,

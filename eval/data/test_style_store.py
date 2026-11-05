@@ -101,12 +101,12 @@ def test_round_trip_save_load_join(tmp_path):
     encoded = _handmade_encoded(texts)
     path = str(tmp_path / "side.parquet")
     save_style_embeddings(texts, encoded, path, run_name="probe")
-    frame, label = load_style_embeddings(path)
+    frame, label = load_style_embeddings(path, expect_encoder="base_v1")
     assert label["n_rows"] == 3
     assert label["run_name"] == "probe"
     assert len(frame) == 3
     df = pd.DataFrame({"text": texts})
-    joined = join_style_embeddings(df, path, "text", "emb")
+    joined = join_style_embeddings(df, path, "text", "emb", expect_encoder="base_v1")
     expected = encoded.embeddings.astype(np.float16).astype(np.float32)
     for got, want in zip(joined["emb"], expected):
         assert got.dtype == np.float32 and got.ndim == 1
@@ -118,10 +118,10 @@ def test_duplicate_texts_stored_once(tmp_path):
     encoded = _handmade_encoded(texts)
     path = str(tmp_path / "side.parquet")
     save_style_embeddings(texts, encoded, path)
-    _frame, label = load_style_embeddings(path)
+    _frame, label = load_style_embeddings(path, expect_encoder="base_v1")
     assert label["n_rows"] == 2
     df = pd.DataFrame({"text": texts})
-    joined = join_style_embeddings(df, path, "text", "emb")
+    joined = join_style_embeddings(df, path, "text", "emb", expect_encoder="base_v1")
     assert len(joined) == 3
     assert float(np.max(np.abs(joined["emb"].iloc[0]
                                - joined["emb"].iloc[2]))) == 0.0
@@ -149,7 +149,7 @@ def test_missing_label_raises(tmp_path):
     path = str(tmp_path / "plain.parquet")
     pd.DataFrame({"text_key": ["k"], "style_emb": [[1.0]]}).to_parquet(path)
     with pytest.raises(StyleLabelError, match="no style label"):
-        load_style_embeddings(path)
+        load_style_embeddings(path, expect_encoder="base_v1")
 
 
 def test_other_encoder_raises(tmp_path):
@@ -168,7 +168,7 @@ def test_changed_hash_raises(tmp_path):
     path = str(tmp_path / "side.parquet")
     save_style_embeddings(texts, encoded, path)
     with pytest.raises(StyleLabelError, match="file_sha256"):
-        load_style_embeddings(path)
+        load_style_embeddings(path, expect_encoder="base_v1")
 
 
 def test_missing_text_raises(tmp_path):
@@ -177,7 +177,7 @@ def test_missing_text_raises(tmp_path):
     save_style_embeddings(texts, _handmade_encoded(texts), path)
     df = pd.DataFrame({"text": ["stored text", "absent text"]})
     with pytest.raises(StyleLabelError, match="1 texts.*absent text"):
-        join_style_embeddings(df, path, "text", "emb")
+        join_style_embeddings(df, path, "text", "emb", expect_encoder="base_v1")
 
 
 def test_existing_out_col_raises(tmp_path):
@@ -186,7 +186,7 @@ def test_existing_out_col_raises(tmp_path):
     save_style_embeddings(texts, _handmade_encoded(texts), path)
     df = pd.DataFrame({"text": texts, "emb": [0]})
     with pytest.raises(ValueError, match="already exists"):
-        join_style_embeddings(df, path, "text", "emb")
+        join_style_embeddings(df, path, "text", "emb", expect_encoder="base_v1")
 
 
 def test_join_does_not_mutate(tmp_path):
@@ -195,7 +195,7 @@ def test_join_does_not_mutate(tmp_path):
     save_style_embeddings(texts, _handmade_encoded(texts), path)
     df = pd.DataFrame({"text": texts})
     before = df.copy(deep=True)
-    joined = join_style_embeddings(df, path, "text", "emb")
+    joined = join_style_embeddings(df, path, "text", "emb", expect_encoder="base_v1")
     pd.testing.assert_frame_equal(df, before)
     assert df.attrs == {}
     assert "emb" in joined.columns and "emb" not in df.columns
@@ -272,7 +272,7 @@ def test_save_matching_texts_writes_and_joins(monkeypatch, tmp_path):
     path = str(tmp_path / "side.parquet")
     save_style_embeddings(texts, encoded, path)
     joined = join_style_embeddings(pd.DataFrame({"text": texts}), path,
-                                   "text", "emb")
+                                   "text", "emb", expect_encoder="base_v1")
     expected = encoded.embeddings.astype(np.float16).astype(np.float32)
     for got, want in zip(joined["emb"], expected):
         assert float(np.max(np.abs(got - want))) == 0.0
@@ -301,44 +301,44 @@ def _rewrite_label(src, dst, label):
 
 def test_side_file_missing_required_field_raises(monkeypatch, tmp_path):
     path = _valid_side_file(monkeypatch, tmp_path)
-    _frame, label = load_style_embeddings(path)
+    _frame, label = load_style_embeddings(path, expect_encoder="base_v1")
     del label["normalization"]
     bad = str(tmp_path / "missing.parquet")
     _rewrite_label(path, bad, label)
     with pytest.raises(StyleLabelError, match="missing required field"):
-        load_style_embeddings(bad)
+        load_style_embeddings(bad, expect_encoder="base_v1")
 
 
 def test_side_file_wrong_n_rows_raises(monkeypatch, tmp_path):
     path = _valid_side_file(monkeypatch, tmp_path)
-    _frame, label = load_style_embeddings(path)
+    _frame, label = load_style_embeddings(path, expect_encoder="base_v1")
     label["n_rows"] = label["n_rows"] + 1
     bad = str(tmp_path / "rows.parquet")
     _rewrite_label(path, bad, label)
     with pytest.raises(StyleLabelError, match="n_rows"):
-        load_style_embeddings(bad)
+        load_style_embeddings(bad, expect_encoder="base_v1")
 
 
 def test_side_file_wrong_dim_raises(monkeypatch, tmp_path):
     path = _valid_side_file(monkeypatch, tmp_path)
-    _frame, label = load_style_embeddings(path)
+    _frame, label = load_style_embeddings(path, expect_encoder="base_v1")
     label["dim"] = label["dim"] + 1
     bad = str(tmp_path / "dim.parquet")
     _rewrite_label(path, bad, label)
     with pytest.raises(StyleLabelError, match="width"):
-        load_style_embeddings(bad)
+        load_style_embeddings(bad, expect_encoder="base_v1")
 
 
 def test_side_file_wrong_dim_still_reads_label_first(monkeypatch, tmp_path):
     """The identity checks run before any row is read, so a tampered label
     raises even when row reading is impossible (the existing guarantee)."""
     path = _valid_side_file(monkeypatch, tmp_path)
-    _frame, label = load_style_embeddings(path)
+    _frame, label = load_style_embeddings(path, expect_encoder="base_v1")
     label["file_sha256"] = {"model.safetensors": "0" * 64}
     bad = str(tmp_path / "hash.parquet")
     _rewrite_label(path, bad, label)
     with pytest.raises(StyleLabelError, match="file_sha256"):
-        load_style_embeddings(bad)
+        load_style_embeddings(bad, expect_encoder="base_v1")
 
 
 def _handmade_groups(n=6):
@@ -480,7 +480,7 @@ def test_centroid_round_trip(tmp_path):
     path = str(tmp_path / "c.npz")
     centroids, _label = build_centroids(encoded, _handmade_groups(),
                                         renormalize=False, path=path)
-    loaded = load_centroids_npz(path, renormalize=False)
+    loaded = load_centroids_npz(path, renormalize=False, expect_encoder="base_v1")
     assert "__style_label__" not in loaded
     assert set(loaded) == set(centroids)
     for group in centroids:
@@ -519,9 +519,9 @@ def test_labelled_centroid_mismatch_raises(tmp_path):
     np.savez(p_other, **vectors, __style_label__=json.dumps(other))
     np.savez(p_bad, **vectors, __style_label__=json.dumps(bad_hash))
     with pytest.raises(StyleLabelError, match="base_v2"):
-        load_centroids_npz(p_other, renormalize=False)
+        load_centroids_npz(p_other, renormalize=False, expect_encoder="base_v1")
     with pytest.raises(StyleLabelError, match="file_sha256"):
-        load_centroids_npz(p_bad, renormalize=False)
+        load_centroids_npz(p_bad, renormalize=False, expect_encoder="base_v1")
 
 
 def test_centroid_missing_required_field_raises(tmp_path):
@@ -534,7 +534,7 @@ def test_centroid_missing_required_field_raises(tmp_path):
     np.savez(path, k=np.ones(60, dtype=np.float32),
              __style_label__=json.dumps(label))
     with pytest.raises(StyleLabelError, match="missing required field"):
-        load_centroids_npz(path, renormalize=False)
+        load_centroids_npz(path, renormalize=False, expect_encoder="base_v1")
 
 
 def test_centroid_wrong_dim_raises(tmp_path):
@@ -545,7 +545,7 @@ def test_centroid_wrong_dim_raises(tmp_path):
     np.savez(path, k=np.ones(60, dtype=np.float32),
              __style_label__=json.dumps(label))
     with pytest.raises(StyleLabelError, match="width 60"):
-        load_centroids_npz(path, renormalize=False)
+        load_centroids_npz(path, renormalize=False, expect_encoder="base_v1")
 
 
 def test_centroid_input_normalization_unknown_allowed(tmp_path):
@@ -555,7 +555,7 @@ def test_centroid_input_normalization_unknown_allowed(tmp_path):
     path = str(tmp_path / "c.npz")
     np.savez(path, k=np.ones(60, dtype=np.float32),
              __style_label__=json.dumps(label))
-    assert set(load_centroids_npz(path, renormalize=False)) == {"k"}
+    assert set(load_centroids_npz(path, renormalize=False, expect_encoder="base_v1")) == {"k"}
 
 
 # ---------------- review R2-4: kind and the vector/group key set -------------
@@ -569,7 +569,7 @@ def test_centroid_wrong_kind_raises(tmp_path):
     np.savez(path, k=np.ones(60, dtype=np.float32),
              __style_label__=json.dumps(label))
     with pytest.raises(StyleLabelError, match="kind is 'per_row'"):
-        load_centroids_npz(path, renormalize=False)
+        load_centroids_npz(path, renormalize=False, expect_encoder="base_v1")
 
 
 def test_centroid_extra_group_raises(tmp_path):
@@ -583,7 +583,7 @@ def test_centroid_extra_group_raises(tmp_path):
              extra=np.ones(60, dtype=np.float32),
              __style_label__=json.dumps(label))
     with pytest.raises(StyleLabelError, match=r"extra \['extra'\]"):
-        load_centroids_npz(path, renormalize=False)
+        load_centroids_npz(path, renormalize=False, expect_encoder="base_v1")
 
 
 def test_centroid_missing_group_raises(tmp_path):
@@ -596,7 +596,7 @@ def test_centroid_missing_group_raises(tmp_path):
     np.savez(path, k=np.ones(60, dtype=np.float32),
              __style_label__=json.dumps(label))
     with pytest.raises(StyleLabelError, match=r"missing \['gone'\]"):
-        load_centroids_npz(path, renormalize=False)
+        load_centroids_npz(path, renormalize=False, expect_encoder="base_v1")
 
 
 def test_centroid_small_float_array_is_metadata(tmp_path):
@@ -610,10 +610,10 @@ def test_centroid_small_float_array_is_metadata(tmp_path):
     np.savez(path, k=np.ones(60, dtype=np.float32),
              meta=np.array([1.0, 2.0], dtype=np.float32),
              __style_label__=json.dumps(label))
-    loaded = load_centroids_npz(path, renormalize=False)
+    loaded = load_centroids_npz(path, renormalize=False, expect_encoder="base_v1")
     assert set(loaded) == {"k", "meta"}
     assert np.array_equal(loaded["meta"], np.array([1.0, 2.0], dtype=np.float32))
-    with_renorm = load_centroids_npz(path, renormalize=True)
+    with_renorm = load_centroids_npz(path, renormalize=True, expect_encoder="base_v1")
     assert np.array_equal(with_renorm["meta"],
                           np.array([1.0, 2.0], dtype=np.float32))
 
@@ -623,11 +623,15 @@ def _unlabelled_npz(path):
     return path
 
 
-def test_unlabelled_warns_by_default(tmp_path):
+def test_unlabelled_warns_by_default(tmp_path, monkeypatch):
+    """The default under the base_v1 pin; the base_v2 half of the pair is
+    test_unlabelled_default_follows_patched_pin."""
+    from tst_utils.eval import model_names
     from tst_utils.eval.data.load import load_centroids_npz
+    monkeypatch.setattr(model_names, "STYLE_ENCODER_KEY", "base_v1")
     path = _unlabelled_npz(str(tmp_path / "u.npz"))
     with pytest.warns(StyleProvenanceWarning):
-        loaded = load_centroids_npz(path, renormalize=False)
+        loaded = load_centroids_npz(path, renormalize=False, expect_encoder="base_v1")
     assert set(loaded) == {"k"}
 
 
@@ -660,9 +664,9 @@ def test_unlabelled_default_follows_patched_pin(tmp_path, monkeypatch):
 def test_unlabelled_warning_asserts_second_emission(tmp_path):
     from tst_utils.eval.data.load import load_centroids_npz
     path = _unlabelled_npz(str(tmp_path / "u.npz"))
-    load_centroids_npz(path, renormalize=False)
+    load_centroids_npz(path, renormalize=False, expect_encoder="base_v1")
     with pytest.warns(StyleProvenanceWarning):
-        load_centroids_npz(path, renormalize=False)
+        load_centroids_npz(path, renormalize=False, expect_encoder="base_v1")
 
 
 def test_read_style_label(tmp_path):
@@ -680,15 +684,18 @@ def test_load_author_styles_labelled_copy_matches(tmp_path):
     import warnings
 
     from tst_utils.eval.data.load import (
-        load_author_styles,
+        AUTHOR_STYLES_BASE_V1_PATH,
+        load_centroids_npz,
         read_style_label,
     )
+    # The v1 file is the copy at its own path (task 5.2); the canonical
+    # path follows the pin.
+    canonical = AUTHOR_STYLES_BASE_V1_PATH
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        original = load_author_styles()
+        original = load_centroids_npz(canonical, renormalize=False,
+                                      expect_encoder="base_v1")
     assert len(original) == 5
-    canonical = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "author_styles.npz")
     label = read_style_label(canonical)
     assert label["encoder_key"] == "base_v1"
     assert label["file_sha256"] == get_encoder("base_v1")["file_sha256"]
@@ -720,7 +727,9 @@ def test_guard_drops_inline_source_column():
     pd.testing.assert_frame_equal(df, _inline_frame())
 
 
-def test_guard_joins_side_file(tmp_path):
+def test_guard_joins_side_file(tmp_path, monkeypatch):
+    from tst_utils.eval import model_names
+    monkeypatch.setattr(model_names, "STYLE_ENCODER_KEY", "base_v1")
     import warnings
     import tst_utils.eval.data.style_store as store_module
     texts = ["alpha", "beta"]
@@ -738,7 +747,9 @@ def test_guard_joins_side_file(tmp_path):
     ))) == 0.0
 
 
-def test_guard_side_file_missing_text_raises(tmp_path):
+def test_guard_side_file_missing_text_raises(tmp_path, monkeypatch):
+    from tst_utils.eval import model_names
+    monkeypatch.setattr(model_names, "STYLE_ENCODER_KEY", "base_v1")
     import tst_utils.eval.data.style_store as store_module
     path = str(tmp_path / "side.parquet")
     save_style_embeddings(["alpha"], _handmade_encoded(["alpha"]), path)
@@ -748,7 +759,9 @@ def test_guard_side_file_missing_text_raises(tmp_path):
             df, source_style_path=path, entry_point="probe")
 
 
-def test_guard_target_warns_on_base_v1():
+def test_guard_target_warns_on_base_v1(monkeypatch):
+    from tst_utils.eval import model_names
+    monkeypatch.setattr(model_names, "STYLE_ENCODER_KEY", "base_v1")
     import tst_utils.eval.data.style_store as store_module
     df = pd.DataFrame({"text": ["alpha"],
                        "target_style_emb": [np.ones(4, dtype=np.float32)]})

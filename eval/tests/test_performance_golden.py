@@ -40,7 +40,16 @@ source. It changes the baseline, so it needs its own task; no task owns it
 Regenerate the frozen baseline (only when behaviour intentionally changes —
 NOT as part of the behaviour-preserving refactor):
 
-    python tst_utils/eval/tests/test_performance_golden.py --generate
+    python tst_utils/eval/tests/test_performance_golden.py --generate [--out-dir DIR] [--note TEXT]
+
+`--out-dir` (task 5.2) writes `performance_golden.json` into DIR instead of
+this folder, for a job container whose code tree is read-only.
+
+Supply route (task 5.2): the harness reads the canonical author_styles
+through the checked loader at the pin, as raw labelled vectors; the scoring
+consumer derives the unit view. The emb cases select their target by
+`target_style_key` from that same labelled source. The inline
+`target_style_emb` rejection is its own pin-parameterized CPU test below.
 """
 
 import gc
@@ -54,8 +63,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from tst_utils.eval.performance import TstPerformanceMetrics
-from tst_utils.eval.data.load import load_author_styles
-from tst_utils.eval.data.style_store import StyleProvenanceWarning
+from tst_utils.eval.data.load import load_labelled_author_styles
+from tst_utils.eval.data.style_store import StyleLabelError, StyleProvenanceWarning
 
 HAS_CUDA = torch.cuda.is_available()
 gpu_only = pytest.mark.skipif(
@@ -124,15 +133,14 @@ def _make_tst_func(n_versions):
     return f
 
 
-def _build_test_df(path, author_styles):
+def _build_test_df(path):
     if path == "text":
         return pd.DataFrame({"text": SOURCES, "author": [SOURCE_AUTHOR] * len(SOURCES)})
     elif path == "emb":
-        emb = author_styles[EMB_DESC]
         return pd.DataFrame({
             "text": SOURCES,
             "author": [SOURCE_AUTHOR] * len(SOURCES),
-            "target_style_emb": [emb] * len(SOURCES),
+            "target_style_key": [EMB_DESC] * len(SOURCES),
             "target_style_desc": [EMB_DESC] * len(SOURCES),
         })
     raise ValueError(path)
@@ -168,30 +176,20 @@ def _best_selection(pm, score_col):
 
 def _run_case(path, n_versions, author_styles, scorers):
     align_scorer, gender_scorer, entity_scorer = scorers
-    df = _build_test_df(path, author_styles)
+    df = _build_test_df(path)
     target_styles = TST_STYLES if path == "text" else None
-    # Mirror production callers: the text-target-style path passes author_styles
-    # (add_away_towards looks up author_styles[target_style]); the target-style-emb
-    # path passes author_styles=None so add_away_towards uses row.target_style_emb
-    # (the emb tst_results have target_style_desc/_emb but no target_style column).
-    # See 12 better DS generation/add_styled_pph{,_v2}.py.
-    ctor_author_styles = author_styles if path == "text" else None
+    # The text path scores against author_styles[target_style]; the emb path
+    # selects its target by target_style_key from the same labelled source.
     pm = TstPerformanceMetrics(
         test_df=df,
         tst_func=_make_tst_func(n_versions),
         target_styles=target_styles,
         tst_model="golden",
-        author_styles=ctor_author_styles,
+        author_styles=author_styles if path == "text" else None,
+        target_style_source=author_styles if path == "emb" else None,
         verbose=False,
     )
-    if path == "emb":
-        # The "emb" frame carries an unlabelled target_style_emb built from
-        # author_styles.npz, so the entry guard warns; the scores are the
-        # frozen golden values either way.
-        with pytest.warns(StyleProvenanceWarning, match="target_style_emb"):
-            pm.execute()                              # v1: produce + compute_scores + select_best
-    else:
-        pm.execute()                                  # v1: produce + compute_scores + select_best
+    pm.execute()                                  # v1: produce + compute_scores + select_best
     best_v1 = _best_selection(pm, "score")        # capture v1 selection
     pm.compute_quality_scores(align_scorer, gender_scorer, entity_scorer)
     pm.compute_composite_v2()                     # score_v2
@@ -220,14 +218,14 @@ def _build_scorers():
     return align_scorer, gender_scorer, entity_scorer
 
 
-def _load_author_styles_norm():
-    raw = load_author_styles()
-    return {k: v / np.linalg.norm(v) for k, v in raw.items()}
+def _load_author_styles():
+    """The canonical author_styles at the pin, raw and labelled."""
+    return load_labelled_author_styles()
 
 
 def run_all_cases():
     """Build scorers once, run all four cases. Returns {case_name: result}."""
-    author_styles = _load_author_styles_norm()
+    author_styles = _load_author_styles()
     scorers = _build_scorers()
     out = {}
     for name, path, nver in CASES:
@@ -268,14 +266,49 @@ def test_golden_parity(case_name, golden, live):
     assert l["best_v2"] == g["best_v2"], f"{case_name}: v2 selection drift"
 
 
+@pytest.mark.parametrize("pin", ["base_v1", "base_v2"])
+def test_inline_target_column_follows_the_pin(monkeypatch, pin):
+    """CPU: an inline target_style_emb column warns while the pin is base_v1
+    and raises once it is not (task 5.2). The encoder load seam is a fake,
+    so no model is fetched or loaded."""
+    from tst_utils.eval import model_names
+    from tst_utils.eval.metrics import style as style_module
+
+    class _Fake:
+        def encode(self, texts, show_progress_bar=False,
+                   normalize_embeddings=False):
+            return np.full((len(list(texts)), 8), 15.0, dtype=np.float32)
+
+    monkeypatch.setattr(model_names, "STYLE_ENCODER_KEY", pin)
+    monkeypatch.setattr(style_module, "load_style_encoder", lambda key: _Fake())
+    df = pd.DataFrame({"text": SOURCES[:2], "author": [SOURCE_AUTHOR] * 2,
+                       "target_style_emb": [np.ones(8, dtype=np.float32)] * 2,
+                       "target_style_desc": [EMB_DESC] * 2})
+    pm = TstPerformanceMetrics(test_df=df, tst_func=_make_tst_func(1),
+                               target_styles=None, tst_model="golden",
+                               author_styles=None)
+    if pin == "base_v1":
+        with pytest.warns(StyleProvenanceWarning, match="target_style_emb"):
+            pm.produce_tst_results()
+    else:
+        with pytest.raises(StyleLabelError, match="target_style_emb"):
+            pm.produce_tst_results()
+
+
 # ── generation ──────────────────────────────────────────────────────────────
-def generate_golden():
+def generate_golden(out_dir=None, note=None):
     import time
+    from tst_utils.eval import model_names
     cases = run_all_cases()
+    path = os.path.join(out_dir, "performance_golden.json") if out_dir else GOLDEN
+    task = "2A.5 performance.py refactor"
+    if note:
+        task = f"{task}; {note}"
     out = {
         "meta": {
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "task": "2A.5 performance.py refactor",
+            "task": task,
+            "evaluation_encoder": model_names.style_encoder_key(),
             "tst_func": "canned-deterministic",
             "frozen_cols": FREEZE_COLS,
             "scorers": ("ruRoberta-L8 rolling_max w9 + rubert-tiny2-L3 span4 fallback; "
@@ -284,15 +317,32 @@ def generate_golden():
         },
         "cases": cases,
     }
-    with open(GOLDEN, "w") as f:
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(path, "w") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
     n = sum(len(c["rows"]) for c in cases.values())
-    print(f"Golden written -> {GOLDEN} ({len(cases)} cases, {n} rows)")
+    print(f"Golden written -> {path} ({len(cases)} cases, {n} rows)")
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(description="the performance golden")
+    parser.add_argument("--generate", action="store_true",
+                        help="(re)write the golden JSON")
+    parser.add_argument("--out-dir", default=None,
+                        help="write performance_golden.json here "
+                             "(default: this folder)")
+    parser.add_argument("--note", default=None,
+                        help="appended to meta.task")
+    args = parser.parse_args(argv)
+    if not args.generate:
+        print("Pass --generate to (re)write the golden JSON.")
+        return 0
+    generate_golden(out_dir=args.out_dir, note=args.note)
+    return 0
 
 
 if __name__ == "__main__":
     import sys
-    if "--generate" in sys.argv:
-        generate_golden()
-    else:
-        print("Pass --generate to (re)write the golden JSON.")
+    sys.exit(main())

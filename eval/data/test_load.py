@@ -50,7 +50,8 @@ def test_load_centroids_npz_renormalize_true(tmp_path):
 
     loaded = None
     with pytest.warns(StyleProvenanceWarning):
-        loaded = load_centroids_npz(p, renormalize=True)
+        loaded = load_centroids_npz(p, renormalize=True,
+                                    expect_encoder='base_v1')
     assert set(loaded.keys()) == {'Tolstoy_centroid', 'News_centroid', 'authors'}
     assert abs(float(np.linalg.norm(loaded['Tolstoy_centroid'])) - 1.0) < 1e-5
     assert abs(float(np.linalg.norm(loaded['News_centroid'])) - 1.0) < 1e-5
@@ -63,7 +64,8 @@ def test_load_centroids_npz_renormalize_false(tmp_path):
     a = np.full(768, 0.5, dtype=np.float32)
     np.savez_compressed(p, c=a)
     with pytest.warns(StyleProvenanceWarning):
-        loaded = load_centroids_npz(p, renormalize=False)
+        loaded = load_centroids_npz(p, renormalize=False,
+                                    expect_encoder='base_v1')
     assert abs(float(np.linalg.norm(loaded['c'])) - float(np.linalg.norm(a))) < 1e-5
 
 
@@ -72,3 +74,19 @@ def test_load_centroids_npz_renormalize_required(tmp_path):
     np.savez_compressed(p, c=np.zeros(768, dtype=np.float32))
     with pytest.raises(TypeError, match='renormalize'):
         load_centroids_npz(p)
+
+
+# Task 5.2: the default follows the pin, so the default is a pin pair.
+@pytest.mark.parametrize('pin', ['base_v1', 'base_v2'])
+def test_load_centroids_npz_default_follows_the_pin(tmp_path, monkeypatch, pin):
+    from tst_utils.eval import model_names
+    from tst_utils.eval.data.style_store import StyleLabelError
+    monkeypatch.setattr(model_names, 'STYLE_ENCODER_KEY', pin)
+    p = tmp_path / 'c.npz'
+    np.savez_compressed(p, c=np.full(768, 0.5, dtype=np.float32))
+    if pin == 'base_v1':
+        with pytest.warns(StyleProvenanceWarning, match='unlabelled'):
+            load_centroids_npz(p, renormalize=False)
+    else:
+        with pytest.raises(StyleLabelError, match='base_v2'):
+            load_centroids_npz(p, renormalize=False)
