@@ -1192,10 +1192,10 @@ def test_preloaded_index_is_built_once_per_frame(tmp_path, monkeypatch):
     builds = []
     real = style_store._preloaded_index
 
-    def counting(frame):
+    def counting(frame, rebuild=False):
         before = id(frame) in style_store._PRELOADED_INDEX
-        builds.append(not before)
-        return real(frame)
+        builds.append(rebuild or not before)
+        return real(frame, rebuild=rebuild)
     monkeypatch.setattr(style_store, "_preloaded_index", counting)
     for _ in range(3):
         join_style_embeddings(df, pair, "text", "emb", "base_v1")
@@ -1450,3 +1450,74 @@ def test_path_join_reads_every_label_before_any_row(tmp_path, monkeypatch):
     with pytest.raises(StyleLabelError, match="part-003.parquet names encoder"):
         join_style_embeddings(pd.DataFrame({"text": ["альфа"]}), folder,
                               "text", "emb", "base_v1")
+
+
+# ------- results review round 1, F2 and F4 (host, 2026-11-15) ---------------
+
+def test_preloaded_join_after_an_in_place_reorder(tmp_path):
+    folder = _stub_folder(tmp_path, _PARTS)
+    df = pd.DataFrame({"text": ["дзета", "альфа", "гамма"]})
+    want = join_style_embeddings(df, folder, "text", "emb", "base_v1")
+    pair = load_style_embeddings(folder, "base_v1")
+    first = join_style_embeddings(df, pair, "text", "emb", "base_v1")
+    frame, _ = pair
+    frame.sort_values("text_key", inplace=True, ignore_index=True)
+    after_sort = join_style_embeddings(df, pair, "text", "emb", "base_v1")
+    shuffled = frame.sample(frac=1.0, random_state=3).reset_index(drop=True)
+    frame[:] = shuffled.to_numpy()
+    after_shuffle = join_style_embeddings(df, pair, "text", "emb", "base_v1")
+    for joined in (first, after_sort, after_shuffle):
+        for got, row in zip(joined["emb"], want["emb"]):
+            assert got.tobytes() == row.tobytes()
+
+
+def test_single_file_extend_refuses_an_existing_out_path(tmp_path):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    other = _stub_side_file(tmp_path, ["омега"], name="other.parquet")
+    before = _bytes(other)
+    stub = _StubEncoder()
+    with pytest.raises(FileExistsError):
+        extend_style_embeddings(["новый"], path, out_path=other, encode_fn=stub)
+    assert stub.calls == [] and _bytes(other) == before
+
+
+def test_folder_extend_checks_out_path_before_the_encode(tmp_path):
+    folder = _stub_folder(tmp_path, _PARTS)
+    (tmp_path / "taken").mkdir()
+    stub = _StubEncoder()
+    with pytest.raises(FileExistsError):
+        extend_style_embeddings(["новый"], folder, out_path=str(tmp_path / "taken"),
+                                encode_fn=stub)
+    assert stub.calls == []
+
+
+def test_folder_extend_removes_its_copy_when_the_part_fails(tmp_path, monkeypatch):
+    folder = _stub_folder(tmp_path, _PARTS)
+    out = tmp_path / "grown"
+
+    def failing_save(texts, encoded, path, **free_fields):
+        raise OSError("disk full")
+    monkeypatch.setattr(style_store, "save_style_embeddings", failing_save)
+    with pytest.raises(OSError, match="disk full"):
+        extend_style_embeddings(["новый"], folder, out_path=str(out),
+                                encode_fn=_StubEncoder())
+    assert not out.exists()
+
+
+def test_folder_extend_reads_no_stored_vector(tmp_path, monkeypatch):
+    import pyarrow.parquet as pq
+    folder = _stub_folder(tmp_path, _PARTS)
+    reads = []
+    real_read_table = pq.read_table
+
+    def counting(path, *args, columns=None, **kwargs):
+        reads.append(tuple(columns or ()))
+        return real_read_table(path, *args, columns=columns, **kwargs)
+
+    def no_load(*args, **kwargs):
+        raise AssertionError("the folder extend loaded the whole folder")
+    monkeypatch.setattr(pq, "read_table", counting)
+    monkeypatch.setattr(style_store, "load_style_embeddings", no_load)
+    assert extend_style_embeddings(["бета", "новый"], folder, out_path=folder,
+                                   encode_fn=_StubEncoder()) == (6, 1)
+    assert reads and set(reads) == {("text_key",)}

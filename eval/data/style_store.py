@@ -427,9 +427,10 @@ _logger = logging.getLogger(__name__)
 _PRELOADED_INDEX = {}
 
 
-def _preloaded_index(frame):
+def _preloaded_index(frame, rebuild=False):
     entry = _PRELOADED_INDEX.get(id(frame))
-    if entry is not None and entry[0]() is frame and entry[1] == len(frame):
+    if not rebuild and entry is not None and entry[0]() is frame \
+            and entry[1] == len(frame):
         return entry[2]
     index = {key: row for row, key in enumerate(frame["text_key"])}
     frame_id = id(frame)
@@ -439,17 +440,40 @@ def _preloaded_index(frame):
     return index
 
 
-def _read_side_rows(path, expect_encoder, wanted_keys):
-    """The label of a side file or folder, and the stored rows of
-    `wanted_keys` only: (label, rows, row_of).
+def _preloaded_picks(frame, wanted_keys):
+    """(row_of, picks) of `wanted_keys` in a preloaded frame.
+
+    The cached index is checked against the frame: the stored key at each
+    picked row must be the wanted key. A frame changed in place keeps its
+    id and maybe its length (a sort, a shuffle, an edited key), so on a
+    mismatch, or on a key that the index lacks, the index is built again
+    once from the frame as it is now.
+    """
+    stored_keys = frame["text_key"].to_numpy()
+    for rebuild in (False, True):
+        index = _preloaded_index(frame, rebuild=rebuild)
+        row_of, picks = {}, []
+        for key in wanted_keys:
+            row = index.get(key)
+            if row is not None:
+                row_of[key] = len(picks)
+                picks.append(row)
+        consistent = all(stored_keys[row] == key
+                         for key, row in zip(row_of, picks))
+        if consistent and (rebuild or len(row_of) == len(wanted_keys)):
+            return row_of, picks
+    raise StyleLabelError(
+        "preloaded side file: the key index does not match the frame after "
+        "a rebuild")
+
+
+def _read_side_keys(path, expect_encoder):
+    """The checked label of a side file or folder, its file paths, and the
+    `text_key` column of each file: (label, part_paths, key_columns).
 
     The checks are those of `load_style_embeddings`: every label before
     any row, `n_rows` and `dim` against each file, the shared fields and
-    the norm range of a folder, no key in two parts. Then only the
-    `text_key` column of each file is read; the `style_emb` column is read
-    one file at a time and only the matching rows are kept. `rows` is an
-    (n_found, dim) array of the stored dtype; `row_of` maps each found key
-    to its row in `rows`. Memory grows with the wanted rows, not the file.
+    the norm range of a folder, no key in two parts. No vector is read.
     """
     is_folder = os.path.isdir(path)
     part_paths = side_part_paths(path) if is_folder else [path]
@@ -489,6 +513,20 @@ def _read_side_rows(path, expect_encoder, wanted_keys):
         label = _combine_part_labels(path, labels, part_paths, n_total)
     else:
         label = labels[0]
+    return label, part_paths, key_columns
+
+
+def _read_side_rows(path, expect_encoder, wanted_keys):
+    """The label of a side file or folder, and the stored rows of
+    `wanted_keys` only: (label, rows, row_of).
+
+    After the checks of `_read_side_keys`, the `style_emb` column is read
+    one file at a time, only for the files that hold a wanted key, and
+    only the matching rows are kept. `rows` is an (n_found, dim) array of
+    the stored dtype; `row_of` maps each found key to its row in `rows`.
+    Memory grows with the wanted rows and the largest file, not the folder.
+    """
+    label, part_paths, key_columns = _read_side_keys(path, expect_encoder)
     dim = int(label["dim"])
     wanted = pa.array(list(wanted_keys), type=pa.string())
     found_keys, found_rows = [], []
@@ -525,13 +563,7 @@ def _side_rows(path, expect_encoder, wanted_keys):
             raise StyleLabelError(
                 f"{where}: label says n_rows {label['n_rows']} but the frame "
                 f"has {len(frame)} rows")
-        index = _preloaded_index(frame)
-        row_of, picks = {}, []
-        for key in wanted_keys:
-            row = index.get(key)
-            if row is not None:
-                row_of[key] = len(picks)
-                picks.append(row)
+        row_of, picks = _preloaded_picks(frame, wanted_keys)
         dim = int(label["dim"])
         stored = frame["style_emb"].to_numpy()
         rows = (np.stack([stored[row] for row in picks]) if picks
@@ -653,7 +685,8 @@ def extend_style_embeddings(texts, path, *, out_path, encode_fn,
     """Add the vectors of the texts that `path` lacks; write to `out_path`.
 
     `out_path` is required; `out_path == path` is the explicit in-place
-    form. The missing texts (no stored key; deduplicated, first seen kept)
+    form. Any other `out_path` must not exist: `FileExistsError` before
+    anything is read or encoded, for a file and a folder alike. The missing texts (no stored key; deduplicated, first seen kept)
     are encoded by `encode_fn` with the encoder and normalization of the
     file's label, never the caller's. The fresh label must equal the
     file's in `encoder_key`, `file_sha256`, `dim` and `normalization`, or
@@ -670,11 +703,12 @@ def extend_style_embeddings(texts, path, *, out_path, encode_fn,
 
     A side folder (`path` is a directory of parts) is extended by one new
     part, written by `save_style_embeddings` with the given free fields;
-    the old parts are not rewritten. With `out_path == path` the part is
-    added in place (temp file, read back, `os.replace` to the next
-    `part-NNN.parquet`); with another `out_path`, which must not exist,
-    the old parts are copied there first. The norm range of the union must
-    stay within a factor of 2.
+    the old parts are not rewritten, and only their `text_key` columns are
+    read (no stored vector). With `out_path == path` the part is added in
+    place (temp file, read back, `os.replace` to the next
+    `part-NNN.parquet`); with another `out_path` the old parts are copied
+    there first, and the copy is removed again if the new part fails. The
+    norm range of the union must stay within a factor of 2.
 
     Returns:
         (int, int): the stored rows before, and the rows added.
@@ -685,12 +719,32 @@ def extend_style_embeddings(texts, path, *, out_path, encode_fn,
     given_provenance = free_fields.get("provenance", {})
     if not isinstance(given_provenance, dict):
         raise TypeError("provenance must be a dict")
-    file_label = _read_side_label(
-        side_part_paths(path)[0] if os.path.isdir(path) else path)
-    frame, label = load_style_embeddings(
-        path, expect_encoder=file_label.get("encoder_key"))
-    stored_keys = list(frame["text_key"])
-    stored = set(stored_keys)
+    is_folder = os.path.isdir(path)
+    in_place = os.path.abspath(out_path) == os.path.abspath(path)
+    if not in_place and os.path.exists(out_path):
+        raise FileExistsError(f"out_path exists: {out_path}")
+    file_label = _read_side_label(side_part_paths(path)[0] if is_folder else path)
+    if is_folder:
+        # Only the keys are read: a folder is extended by a new part, so no
+        # stored vector is needed.
+        label, _, key_columns = _read_side_keys(
+            path, expect_encoder=file_label.get("encoder_key"))
+        n_before = sum(len(keys) for keys in key_columns)
+        candidates = list(dict.fromkeys(style_text_key(text) for text in texts))
+        stored_mask = pa.compute.is_in(
+            pa.array(candidates, type=pa.string()),
+            value_set=pa.chunked_array(
+                [chunk for keys in key_columns for chunk in keys.chunks],
+                type=pa.string())).to_pylist()
+        del key_columns
+        stored = {key for key, hit in zip(candidates, stored_mask) if hit}
+        frame = stored_keys = None
+    else:
+        frame, label = load_style_embeddings(
+            path, expect_encoder=file_label.get("encoder_key"))
+        stored_keys = list(frame["text_key"])
+        stored = set(stored_keys)
+        n_before = len(stored_keys)
     missing_texts, missing_keys, seen = [], [], set()
     for text in texts:
         key = style_text_key(text)
@@ -699,10 +753,9 @@ def extend_style_embeddings(texts, path, *, out_path, encode_fn,
         seen.add(key)
         missing_texts.append(text)
         missing_keys.append(key)
-    n_before = len(stored_keys)
     if not missing_texts:
         return n_before, 0
-    if os.path.isdir(path):
+    if is_folder:
         return _extend_side_folder(missing_texts, path, label, n_before,
                                    out_path=out_path, encode_fn=encode_fn,
                                    free_fields=free_fields)
@@ -770,30 +823,37 @@ def _extend_side_folder(missing_texts, path, label, n_before, *, out_path,
             f"(min {norm_min}, max {norm_max})")
     same_folder = os.path.abspath(out_path) == os.path.abspath(path)
     if not same_folder:
-        if os.path.exists(out_path):
+        if os.path.exists(out_path):  # checked before the encode too
             raise FileExistsError(f"out_path exists: {out_path}")
         os.makedirs(out_path)
-        for part in side_part_paths(path):
-            shutil.copy2(part, os.path.join(out_path, os.path.basename(part)))
-    numbers = [int(os.path.basename(p)[len("part-"):-len(".parquet")])
-               for p in side_part_paths(out_path)
-               if os.path.basename(p)[len("part-"):-len(".parquet")].isdigit()]
-    target = os.path.join(out_path, f"part-{max(numbers, default=-1) + 1:03d}.parquet")
-    handle, temp_path = tempfile.mkstemp(
-        prefix=".style_extend_", suffix=".parquet.tmp", dir=out_path)
-    os.close(handle)
     try:
-        save_style_embeddings(missing_texts, encoded, temp_path, **free_fields)
-        written = _read_side_label(temp_path)
-        if written["n_rows"] != len(missing_texts) or \
-                pq.ParquetFile(temp_path).metadata.num_rows != len(missing_texts):
-            raise StyleLabelError(
-                f"extend_style_embeddings: the temp file {temp_path} does "
-                "not read back as written")
-        os.replace(temp_path, target)
+        if not same_folder:
+            for part in side_part_paths(path):
+                shutil.copy2(part, os.path.join(out_path, os.path.basename(part)))
+        numbers = [int(os.path.basename(p)[len("part-"):-len(".parquet")])
+                   for p in side_part_paths(out_path)
+                   if os.path.basename(p)[len("part-"):-len(".parquet")].isdigit()]
+        target = os.path.join(
+            out_path, f"part-{max(numbers, default=-1) + 1:03d}.parquet")
+        handle, temp_path = tempfile.mkstemp(
+            prefix=".style_extend_", suffix=".parquet.tmp", dir=out_path)
+        os.close(handle)
+        try:
+            save_style_embeddings(missing_texts, encoded, temp_path, **free_fields)
+            written = _read_side_label(temp_path)
+            if written["n_rows"] != len(missing_texts) or \
+                    pq.ParquetFile(temp_path).metadata.num_rows != len(missing_texts):
+                raise StyleLabelError(
+                    f"extend_style_embeddings: the temp file {temp_path} does "
+                    "not read back as written")
+            os.replace(temp_path, target)
+        except BaseException:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
     except BaseException:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        if not same_folder:  # the copy is ours: no half-made folder stays
+            shutil.rmtree(out_path, ignore_errors=True)
         raise
     return n_before, len(missing_texts)
 
