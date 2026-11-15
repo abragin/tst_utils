@@ -39,20 +39,49 @@ def style_text_key(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+_NORM_CHUNK_ROWS = 65536
+
+
+def _row_norms_float64(embeddings, chunk_rows=None):
+    """Return the float64 L2 norm of each row of `embeddings`.
+
+    The rows are converted to float64 one chunk at a time, so the extra
+    memory is one chunk (about 0.8 GB at 768 dims), not a float64 copy of
+    the whole array plus its squares (about 4 times the size of an fp32
+    input; about 17 GiB at 1.46 million rows of 768 dims). Each row's norm
+    is the same computation as on the whole array, so the result does not
+    depend on `chunk_rows`.
+    """
+    if chunk_rows is None:
+        chunk_rows = _NORM_CHUNK_ROWS
+    embeddings = np.asarray(embeddings)
+    if embeddings.ndim != 2 or embeddings.shape[0] <= chunk_rows:
+        return np.linalg.norm(
+            np.asarray(embeddings, dtype=np.float64), axis=1
+        )
+    norms = np.empty(embeddings.shape[0], dtype=np.float64)
+    for start in range(0, embeddings.shape[0], chunk_rows):
+        stop = start + chunk_rows
+        norms[start:stop] = np.linalg.norm(
+            np.asarray(embeddings[start:stop], dtype=np.float64), axis=1
+        )
+    return norms
+
+
 def measure_normalization(embeddings):
     """Measure the normalization of per-row `embeddings`.
 
     Returns a dict with `normalization` (`"l2"` if every norm is within
     1e-3 of 1, `"none"` otherwise) plus `norm_min` and `norm_max` as
     Python floats. The norms are computed in float64 whatever the input
-    dtype.
+    dtype, in chunks of rows (`_row_norms_float64`).
 
     Raises:
         ValueError: on an empty input; if some norms are within 1e-3 of 1
             and others are not (a mixed-scale array); or if
             `norm_max / norm_min` exceeds 2.
     """
-    norms = np.linalg.norm(np.asarray(embeddings, dtype=np.float64), axis=1)
+    norms = _row_norms_float64(embeddings)
     if norms.size == 0:
         raise ValueError("measure_normalization needs at least one row")
     norm_min = float(np.min(norms))

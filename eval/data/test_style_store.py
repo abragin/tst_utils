@@ -8,6 +8,7 @@ import os
 import pandas as pd
 import pytest
 
+from tst_utils.eval.data import style_store
 from tst_utils.eval.data.style_store import (
     StyleLabelError,
     StyleProvenanceWarning,
@@ -73,6 +74,77 @@ def test_ratio_above_two_raises():
 
 
 def test_empty_raises():
+    with pytest.raises(ValueError, match="at least one row"):
+        measure_normalization(np.zeros((0, 8)))
+
+
+def _whole_array_norms(embeddings):
+    """The norm computation of `measure_normalization` before the chunks."""
+    return np.linalg.norm(np.asarray(embeddings, dtype=np.float64), axis=1)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float16, np.float64])
+@pytest.mark.parametrize("n_rows", [1, 7, 64, 65, 200, 1000, 1003])
+def test_chunked_row_norms_are_bit_identical(dtype, n_rows):
+    # 64 rows per chunk: 200, 1000 and 1003 are not multiples of it.
+    rng = np.random.default_rng(20261115 + n_rows)
+    rows = (rng.normal(size=(n_rows, 768)) * 0.55).astype(dtype)
+    chunked = style_store._row_norms_float64(rows, chunk_rows=64)
+    whole = _whole_array_norms(rows)
+    assert chunked.dtype == np.float64
+    assert chunked.tobytes() == whole.tobytes()
+
+
+def test_chunked_row_norms_non_contiguous_input_is_bit_identical():
+    rng = np.random.default_rng(20261115)
+    rows = rng.normal(size=(300, 96)).astype(np.float32)[::2, ::3]
+    chunked = style_store._row_norms_float64(rows, chunk_rows=64)
+    assert chunked.tobytes() == _whole_array_norms(rows).tobytes()
+
+
+@pytest.mark.parametrize("kind", ["raw", "unit"])
+def test_measure_normalization_chunked_equals_whole(monkeypatch, kind):
+    rng = np.random.default_rng(20261115)
+    rows = rng.normal(size=(1003, 768))
+    rows = rows / np.linalg.norm(rows, axis=1, keepdims=True)
+    if kind == "raw":
+        rows = rows * rng.uniform(12.0, 17.0, size=(1003, 1))
+    rows = rows.astype(np.float32)
+    whole = measure_normalization(rows)  # 1003 rows: one chunk by default
+    monkeypatch.setattr(style_store, "_NORM_CHUNK_ROWS", 64)
+    calls = []
+    real_norm = np.linalg.norm
+    monkeypatch.setattr(
+        style_store.np.linalg, "norm",
+        lambda array, **kw: calls.append(len(array)) or real_norm(array, **kw),
+    )
+    chunked = style_store.measure_normalization(rows)
+    monkeypatch.undo()
+    assert max(calls) == 64 and sum(calls) == 1003  # it did run in chunks
+    assert chunked == whole
+    assert chunked["normalization"] == ("none" if kind == "raw" else "l2")
+    norms = _whole_array_norms(rows)
+    assert chunked["norm_min"] == float(norms.min())
+    assert chunked["norm_max"] == float(norms.max())
+
+
+def test_measure_normalization_chunked_mixed_scale_same_error(monkeypatch):
+    rng = np.random.default_rng(20261115)
+    rows = rng.normal(size=(1003, 64))
+    rows = rows / np.linalg.norm(rows, axis=1, keepdims=True)
+    rows[700:] *= 15.0  # unit rows and raw rows, in different chunks
+    rows = rows.astype(np.float32)
+    with pytest.raises(ValueError) as whole_error:
+        measure_normalization(rows)
+    monkeypatch.setattr(style_store, "_NORM_CHUNK_ROWS", 64)
+    with pytest.raises(ValueError) as chunked_error:
+        measure_normalization(rows)
+    assert str(chunked_error.value) == str(whole_error.value)
+    assert "mixed-scale" in str(chunked_error.value)
+
+
+def test_measure_normalization_chunked_empty_raises(monkeypatch):
+    monkeypatch.setattr(style_store, "_NORM_CHUNK_ROWS", 64)
     with pytest.raises(ValueError, match="at least one row"):
         measure_normalization(np.zeros((0, 8)))
 
