@@ -708,7 +708,12 @@ def extend_style_embeddings(texts, path, *, out_path, encode_fn,
     place (temp file, read back, `os.replace` to the next
     `part-NNN.parquet`); with another `out_path` the old parts are copied
     there first, and the copy is removed again if the new part fails. The
-    norm range of the union must stay within a factor of 2.
+    norm range of the union must stay within a factor of 2. The label merge
+    above is for a file only: the new part of a folder carries exactly the
+    free fields given, with no `provenance["previous"]` chain, and the old
+    parts keep their own labels. A caller that wants the link to the folder
+    passes it in `provenance` (for example the folder's keys hash and the
+    caller's run name).
 
     Returns:
         (int, int): the stored rows before, and the rows added.
