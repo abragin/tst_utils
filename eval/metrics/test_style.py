@@ -44,14 +44,37 @@ def test_angular_sim_05_1_three_values():
 _TEXTS = ['Привет мир.', 'Это второе предложение.']
 
 
+def _require_local_snapshot(key):
+    """Skip unless the registered snapshot of `key` is in the local HF cache.
+
+    The model fixtures below encode with the real encoder. Where the
+    snapshot is not cached and downloads are off (the agent VM sets
+    HF_HUB_OFFLINE=1 and has no cache), they used to raise and report 4
+    errors; now they skip with this reason. They need no GPU, so they run
+    wherever the cache holds the snapshot, e.g. in a job container.
+    """
+    from huggingface_hub import snapshot_download
+    entry = get_encoder(key)
+    try:
+        snapshot_download(entry["hub_id"], revision=entry["revision"],
+                          local_files_only=True)
+    except Exception as error:
+        pytest.skip(f"the {key} snapshot ({entry['hub_id']} at "
+                    f"{entry['revision'][:8]}) is not in the local HF cache "
+                    f"({type(error).__name__}); run in a job container")
+
+
 @pytest.fixture(scope='module')
 def normalized_embs():
+    from tst_utils.eval import model_names
+    _require_local_snapshot(model_names.style_encoder_key())
     return calc_style_embeddings(_TEXTS, normalize=True)
 
 
 @pytest.fixture(scope='module')
 def raw_embs():
     # An explicit base_v1 encode (task 5.2): the scale below is v1's.
+    _require_local_snapshot("base_v1")
     return list(style_module.encode_style(_TEXTS, "base_v1",
                                           normalize=False).embeddings)
 
