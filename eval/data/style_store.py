@@ -5,13 +5,20 @@ and its normalization. Readers check the label against the pin before
 they return a vector.
 """
 
+import glob
 import hashlib
 import json
+import logging
+import os
+import shutil
+import tempfile
 import warnings
+import weakref
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute  # noqa: F401  (pa.compute)
 import pyarrow.parquet as pq
 
 from tst_utils.eval import model_names
@@ -255,6 +262,11 @@ def save_style_embeddings(texts, encoded, path, **free_fields):
         if key in label:
             raise ValueError(f"free field overwrites an encoder field: {key}")
         label[key] = value
+    _write_side_table(path, stored_keys, stored_excerpts, stacked, label)
+
+
+def _write_side_table(path, stored_keys, stored_excerpts, stacked, label):
+    """Write the side-file table: keys, excerpts, fp16 rows, the label."""
     schema = pa.schema(
         [
             pa.field("text_key", pa.string()),
@@ -276,35 +288,53 @@ def save_style_embeddings(texts, encoded, path, **free_fields):
     pq.write_table(table, path)
 
 
-def load_style_embeddings(path, expect_encoder=None):
-    """Load a parquet side file after checking its label.
-
-    The label is read with `pq.read_schema` BEFORE any row, so a file
-    whose label mismatches raises without touching the row data. The
-    label must carry every field of `SIDE_LABEL_FIELDS` (review F4), and
-    the label is then checked against the file itself: `n_rows` equals
-    the stored row count and `dim` equals the `style_emb` vector width.
-    `expect_encoder=None` means the pin, read at call time.
-    """
-    if expect_encoder is None:
-        expect_encoder = model_names.style_encoder_key()
+def _read_side_label(path):
+    """The label of a side file, read from the schema only (no row)."""
     schema = pq.read_schema(path)
     raw = (schema.metadata or {}).get(b"style_label")
     if raw is None:
         raise StyleLabelError(f"no style label in {path}")
-    label = json.loads(bytes(raw).decode("utf-8"))
+    return json.loads(bytes(raw).decode("utf-8"))
+
+
+def _check_side_label(label, expect_encoder, where):
+    """The label checks of the loader: the encoder against `expect_encoder`
+    (None means the pin, read at call time), `file_sha256` against the
+    registry entry, and the required fields."""
+    if expect_encoder is None:
+        expect_encoder = model_names.style_encoder_key()
     if label.get("encoder_key") != expect_encoder:
         raise StyleLabelError(
-            f"style file {path} names encoder {label.get('encoder_key')!r}, "
+            f"{where} names encoder {label.get('encoder_key')!r}, "
             f"expected {expect_encoder!r}"
         )
     if label.get("file_sha256") != get_encoder(expect_encoder)["file_sha256"]:
         raise StyleLabelError(
-            f"style file {path} names a file_sha256 that differs from "
+            f"{where} names a file_sha256 that differs from "
             f"the registry entry of {expect_encoder!r}"
         )
-    require_label_fields(label, SIDE_LABEL_FIELDS,
-                          where=f"style file {path}", kind="side-file")
+    require_label_fields(label, SIDE_LABEL_FIELDS, where=where,
+                         kind="side-file")
+
+
+SIDE_PART_GLOB = "part-*.parquet"
+
+# The label fields that every part of a side folder must share.
+_SHARED_PART_FIELDS = ("encoder_key", "file_sha256", "dim", "normalization")
+
+
+def side_part_paths(folder):
+    """The part files of a side folder, sorted; raises if there is none."""
+    parts = sorted(glob.glob(os.path.join(folder, SIDE_PART_GLOB)))
+    if not parts:
+        raise StyleLabelError(f"style folder {folder} has no {SIDE_PART_GLOB}")
+    return parts
+
+
+def _read_side_table(path, expect_encoder):
+    """The checked table and label of one side file (see the loader)."""
+    label = _read_side_label(path)
+    _check_side_label(label, expect_encoder, f"style file {path}")
     table = pq.read_table(path)
     n_rows = len(table)
     if int(label["n_rows"]) != n_rows:
@@ -318,39 +348,372 @@ def load_style_embeddings(path, expect_encoder=None):
             f"style file {path} label says dim {label['dim']} but style_emb "
             f"has width {width}"
         )
+    return table, label
+
+
+def _combine_part_labels(folder, labels, part_paths, n_rows):
+    """The label of a side folder: the shared fields, the total row count,
+    the norm range over the parts, and each part's own label in `parts`."""
+    first = labels[0]
+    for path, label in zip(part_paths[1:], labels[1:]):
+        for field in _SHARED_PART_FIELDS:
+            if label.get(field) != first.get(field):
+                raise StyleLabelError(
+                    f"style folder {folder}: part {os.path.basename(path)} "
+                    f"differs in {field}: {label.get(field)!r} != "
+                    f"{first.get(field)!r}")
+    norm_min = min(float(label["norm_min"]) for label in labels)
+    norm_max = max(float(label["norm_max"]) for label in labels)
+    if norm_min > 0 and norm_max / norm_min > 2:
+        raise StyleLabelError(
+            f"style folder {folder}: mixed-scale parts, norm_max / norm_min "
+            f"exceeds 2 (min {norm_min}, max {norm_max})")
+    combined = {field: first[field] for field in _SHARED_PART_FIELDS}
+    combined.update({"n_rows": n_rows, "norm_min": norm_min,
+                     "norm_max": norm_max})
+    combined["parts"] = [
+        dict(label, file=os.path.basename(path))
+        for path, label in zip(part_paths, labels)]
+    return combined
+
+
+def load_style_embeddings(path, expect_encoder=None):
+    """Load a parquet side file, or a side folder, after checking its label.
+
+    The label is read with `pq.read_schema` BEFORE any row, so a file
+    whose label mismatches raises without touching the row data. The
+    label must carry every field of `SIDE_LABEL_FIELDS` (review F4), and
+    the label is then checked against the file itself: `n_rows` equals
+    the stored row count and `dim` equals the `style_emb` vector width.
+    `expect_encoder=None` means the pin, read at call time.
+
+    A side folder holds part files `part-*.parquet`, each a side file
+    with its own label. Every part passes the checks above; the parts
+    must agree in `encoder_key`, `file_sha256`, `dim` and
+    `normalization`, hold no text key twice, and have a norm range of at
+    most 2. The frame is the parts in file-name order; the label holds
+    the shared fields, the total `n_rows`, the norm range, and each
+    part's label (with its file name) in `parts`.
+    """
+    if not os.path.isdir(path):
+        table, label = _read_side_table(path, expect_encoder)
+        return table.to_pandas(), label
+    part_paths = side_part_paths(path)
+    part_labels = []
+    for part in part_paths:  # every label before any row
+        part_label = _read_side_label(part)
+        _check_side_label(part_label, expect_encoder, f"style file {part}")
+        part_labels.append(part_label)
+    _combine_part_labels(path, part_labels, part_paths, 0)
+    tables, labels = [], []
+    for part in part_paths:
+        table, label = _read_side_table(part, expect_encoder)
+        tables.append(table)
+        labels.append(label)
+    table = pa.concat_tables(tables)
+    del tables
+    keys = table.column("text_key")
+    if pa.compute.count_distinct(keys).as_py() != len(table):
+        raise StyleLabelError(
+            f"style folder {path}: a text key is stored in more than one part")
+    label = _combine_part_labels(path, labels, part_paths, len(table))
     return table.to_pandas(), label
 
 
+_logger = logging.getLogger(__name__)
+
+# The key -> row index of a preloaded frame, built once per frame object.
+# Keyed by id(); the weak reference proves the id still names that frame.
+_PRELOADED_INDEX = {}
+
+
+def _preloaded_index(frame):
+    entry = _PRELOADED_INDEX.get(id(frame))
+    if entry is not None and entry[0]() is frame and entry[1] == len(frame):
+        return entry[2]
+    index = {key: row for row, key in enumerate(frame["text_key"])}
+    frame_id = id(frame)
+    _PRELOADED_INDEX[frame_id] = (
+        weakref.ref(frame, lambda _ref: _PRELOADED_INDEX.pop(frame_id, None)),
+        len(frame), index)
+    return index
+
+
+def _resolve_side(path, expect_encoder):
+    """(frame, label, key index, name) for a path or a preloaded pair."""
+    if isinstance(path, tuple):
+        if len(path) != 2 or not isinstance(path[0], pd.DataFrame) \
+                or not isinstance(path[1], dict):
+            raise TypeError(
+                "path must be a side-file path or the (frame, label) pair "
+                "that load_style_embeddings returns")
+        frame, label = path
+        where = f"preloaded side file (run {label.get('run_name')!r})"
+        _check_side_label(label, expect_encoder, where)
+        if int(label["n_rows"]) != len(frame):
+            raise StyleLabelError(
+                f"{where}: label says n_rows {label['n_rows']} but the frame "
+                f"has {len(frame)} rows")
+        return frame, label, _preloaded_index(frame), where
+    frame, label = load_style_embeddings(path, expect_encoder)
+    index = {key: row for row, key in enumerate(frame["text_key"])}
+    return frame, label, index, str(path)
+
+
+def _encode_for_label(texts, label, encode_fn, where, entry_point):
+    """Encode `texts` with the encoder and normalization of `label`.
+
+    The encoder key and the normalization come from the label, never from
+    the caller. The fresh vectors must carry the text keys of `texts`, one
+    row per text, and a label equal to `label` in `encoder_key`,
+    `file_sha256`, `dim` and `normalization`; otherwise `StyleLabelError`
+    names the field and nothing is returned.
+    """
+    encoded = encode_fn(texts, label["encoder_key"],
+                        normalize=(label["normalization"] == "l2"))
+    embeddings, fresh_label = _require_encoded_style(encoded)
+    if embeddings.shape[0] != len(texts):
+        raise StyleLabelError(
+            f"{entry_point}: encode_fn returned {embeddings.shape[0]} rows "
+            f"for {len(texts)} texts")
+    _check_text_keys(encoded, texts, entry_point)
+    for field in _SHARED_PART_FIELDS:
+        if fresh_label.get(field) != label.get(field):
+            raise StyleLabelError(
+                f"{entry_point}: the fresh vectors differ from {where} in "
+                f"{field}: {fresh_label.get(field)!r} != {label.get(field)!r}")
+    return embeddings, encoded
+
+
 def join_style_embeddings(df, path, text_col, out_col,
-                          expect_encoder=None):
+                          expect_encoder=None, *, on_missing="raise",
+                          encode_fn=None, max_missing_fraction=0.01):
     """Join a side file onto `df` by exact-text key.
 
     Returns a copy; `df` is not mutated and nothing is written to
     `df.attrs`. `out_col` holds float32 1D np.ndarray per row, the same
-    form as the inline columns.
+    form as the inline columns. Only the stored rows that `df` needs are
+    gathered and cast to float32, so a joined column holds no view of the
+    whole file.
+
+    `path` is a side-file path, or the `(frame, label)` pair that
+    `load_style_embeddings` returns, unmodified: the pair is checked on
+    every call (`expect_encoder`, the registry hashes, `n_rows` against the
+    frame), and its key index is built once per frame object.
+
+    `on_missing="raise"` (the default): a text with no stored row raises
+    `StyleLabelError`. `on_missing="encode"` needs `encode_fn` (the
+    convention of `encode_style`): if the unique missing texts are more
+    than `max_missing_fraction` of the unique texts of the column, it
+    raises `StyleLabelError`; otherwise it encodes them with the encoder
+    and normalization of the label, rounds the fresh vectors through fp16
+    (so a text has the same vector stored or fresh), and logs one line
+    with the path, the missing count and the total. The file is never
+    written: persist with `extend_style_embeddings`.
     """
     if out_col in df.columns:
         raise ValueError(f"output column already exists: {out_col}")
-    frame, _label = load_style_embeddings(path, expect_encoder)
-    key_to_row = {key: row for row, key in enumerate(frame["text_key"])}
-    stacked = (
-        np.stack(frame["style_emb"].to_numpy()).astype(np.float32)
-        if len(frame)
-        else np.zeros((0, 0), dtype=np.float32)
-    )
-    keys = [style_text_key(text) for text in df[text_col]]
-    missing = [
-        str(text)[:80] for key, text in zip(keys, df[text_col])
-        if key not in key_to_row
-    ]
-    if missing:
+    if on_missing not in ("raise", "encode"):
+        raise ValueError(f"on_missing must be 'raise' or 'encode', "
+                         f"got {on_missing!r}")
+    if on_missing == "encode" and encode_fn is None:
+        raise TypeError("on_missing='encode' requires encode_fn")
+    frame, label, key_to_row, where = _resolve_side(path, expect_encoder)
+    texts = list(df[text_col])
+    keys = [style_text_key(text) for text in texts]
+    unique_rows = {}
+    missing = {}
+    for key, text in zip(keys, texts):
+        if key in key_to_row:
+            unique_rows.setdefault(key, len(unique_rows))
+        elif key not in missing:
+            missing[key] = text
+    if missing and on_missing == "raise":
+        first = next(iter(missing.values()))
+        n_missing_rows = sum(1 for key in keys if key in missing)
         raise StyleLabelError(
-            f"{len(missing)} texts have no stored row, "
-            f"first missing excerpt: {missing[0]!r}"
+            f"{n_missing_rows} texts have no stored row, "
+            f"first missing excerpt: {str(first)[:80]!r}"
         )
+    n_unique = len(unique_rows) + len(missing)
+    if missing:
+        fraction = len(missing) / n_unique
+        if fraction > max_missing_fraction:
+            raise StyleLabelError(
+                f"{where}: {len(missing)} of {n_unique} unique texts of "
+                f"{text_col!r} have no stored row ({fraction:.4f} > "
+                f"max_missing_fraction {max_missing_fraction})")
+    dim = int(label["dim"])
+    gathered = np.zeros((n_unique, dim), dtype=np.float32)
+    if unique_rows:
+        stored = frame["style_emb"].to_numpy()
+        gathered[:len(unique_rows)] = np.stack(
+            [stored[key_to_row[key]] for key in unique_rows])
+    position = dict(unique_rows)
+    if missing:
+        missing_texts = list(missing.values())
+        fresh, _ = _encode_for_label(missing_texts, label, encode_fn, where,
+                                     "join_style_embeddings")
+        gathered[len(unique_rows):] = np.asarray(fresh).astype(
+            np.float16).astype(np.float32)
+        for offset, key in enumerate(missing):
+            position[key] = len(unique_rows) + offset
+        _logger.warning(
+            "join_style_embeddings: %s: encoded %d missing of %d unique "
+            "texts of %r", where, len(missing), n_unique, text_col)
     joined = df.copy()
-    joined[out_col] = [stacked[key_to_row[key]] for key in keys]
+    joined[out_col] = [gathered[position[key]] for key in keys]
     return joined
+
+
+def extend_style_embeddings(texts, path, *, out_path, encode_fn,
+                            **free_fields):
+    """Add the vectors of the texts that `path` lacks; write to `out_path`.
+
+    `out_path` is required; `out_path == path` is the explicit in-place
+    form. The missing texts (no stored key; deduplicated, first seen kept)
+    are encoded by `encode_fn` with the encoder and normalization of the
+    file's label, never the caller's. The fresh label must equal the
+    file's in `encoder_key`, `file_sha256`, `dim` and `normalization`, or
+    `StyleLabelError` names the field and nothing is written. The stored
+    rows keep their fp16 values bit for bit; new rows are cast to fp16 and
+    carry the `text[:80]` excerpt. The label merges: `run_name`, `date` and
+    `notes`, when given, replace the old ones; the old `provenance` is
+    appended to the list `provenance["previous"]` of the new one; `n_rows`,
+    `norm_min` and `norm_max` are measured again over the union (a
+    mixed-scale union raises). The write goes to a temp file in the folder
+    of `out_path`, whose label and row count are read back before
+    `os.replace`. The bar is a process crash: no fsync and no lock; one
+    writer at a time is assumed.
+
+    A side folder (`path` is a directory of parts) is extended by one new
+    part, written by `save_style_embeddings` with the given free fields;
+    the old parts are not rewritten. With `out_path == path` the part is
+    added in place (temp file, read back, `os.replace` to the next
+    `part-NNN.parquet`); with another `out_path`, which must not exist,
+    the old parts are copied there first. The norm range of the union must
+    stay within a factor of 2.
+
+    Returns:
+        (int, int): the stored rows before, and the rows added.
+    """
+    for key in free_fields:
+        if key not in _FREE_FIELDS:
+            raise ValueError(f"unknown free field: {key}")
+    given_provenance = free_fields.get("provenance", {})
+    if not isinstance(given_provenance, dict):
+        raise TypeError("provenance must be a dict")
+    file_label = _read_side_label(
+        side_part_paths(path)[0] if os.path.isdir(path) else path)
+    frame, label = load_style_embeddings(
+        path, expect_encoder=file_label.get("encoder_key"))
+    stored_keys = list(frame["text_key"])
+    stored = set(stored_keys)
+    missing_texts, missing_keys, seen = [], [], set()
+    for text in texts:
+        key = style_text_key(text)
+        if key in stored or key in seen:
+            continue
+        seen.add(key)
+        missing_texts.append(text)
+        missing_keys.append(key)
+    n_before = len(stored_keys)
+    if not missing_texts:
+        return n_before, 0
+    if os.path.isdir(path):
+        return _extend_side_folder(missing_texts, path, label, n_before,
+                                   out_path=out_path, encode_fn=encode_fn,
+                                   free_fields=free_fields)
+    fresh, _ = _encode_for_label(missing_texts, label, encode_fn, str(path),
+                                 "extend_style_embeddings")
+    dim = int(label["dim"])
+    old_rows = (np.stack(frame["style_emb"].to_numpy()).astype(np.float16,
+                                                                copy=False)
+                if n_before else np.zeros((0, dim), dtype=np.float16))
+    union = np.concatenate([old_rows, np.asarray(fresh, dtype=np.float16)])
+    del old_rows
+    measured = measure_normalization(union)
+    if measured["normalization"] != label["normalization"]:
+        raise StyleLabelError(
+            f"extend_style_embeddings: the union measures "
+            f"{measured['normalization']!r}, the file says "
+            f"{label['normalization']!r}")
+    new_label = dict(label)
+    new_label.update(measured)
+    new_label["n_rows"] = int(union.shape[0])
+    for key in ("run_name", "date", "notes"):
+        if key in free_fields:
+            new_label[key] = free_fields[key]
+    old_provenance = label.get("provenance")
+    provenance = dict(given_provenance)
+    if old_provenance is not None:
+        old_record = dict(old_provenance)
+        chain = list(old_record.pop("previous", []))
+        provenance["previous"] = chain + [old_record]
+    new_label["provenance"] = provenance
+    excerpts = list(frame["text_excerpt"]) + [text[:80] for text in missing_texts]
+    keys = stored_keys + missing_keys
+    del frame
+    folder = os.path.dirname(os.path.abspath(out_path))
+    handle, temp_path = tempfile.mkstemp(
+        prefix=".style_extend_", suffix=".parquet.tmp", dir=folder)
+    os.close(handle)
+    try:
+        _write_side_table(temp_path, keys, excerpts, union, new_label)
+        written = _read_side_label(temp_path)
+        if written != json.loads(json.dumps(new_label)) or \
+                pq.ParquetFile(temp_path).metadata.num_rows != len(keys):
+            raise StyleLabelError(
+                f"extend_style_embeddings: the temp file {temp_path} does "
+                "not read back as written")
+        os.replace(temp_path, out_path)
+    except BaseException:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+    return n_before, len(missing_texts)
+
+
+def _extend_side_folder(missing_texts, path, label, n_before, *, out_path,
+                        encode_fn, free_fields):
+    """`extend_style_embeddings` for a side folder: one new part."""
+    fresh, encoded = _encode_for_label(missing_texts, label, encode_fn,
+                                       str(path), "extend_style_embeddings")
+    fresh_norms = _row_norms_float64(np.asarray(fresh, dtype=np.float16))
+    norm_min = min(float(label["norm_min"]), float(fresh_norms.min()))
+    norm_max = max(float(label["norm_max"]), float(fresh_norms.max()))
+    if norm_min > 0 and norm_max / norm_min > 2:
+        raise StyleLabelError(
+            f"extend_style_embeddings: mixed-scale union with {path} "
+            f"(min {norm_min}, max {norm_max})")
+    same_folder = os.path.abspath(out_path) == os.path.abspath(path)
+    if not same_folder:
+        if os.path.exists(out_path):
+            raise FileExistsError(f"out_path exists: {out_path}")
+        os.makedirs(out_path)
+        for part in side_part_paths(path):
+            shutil.copy2(part, os.path.join(out_path, os.path.basename(part)))
+    numbers = [int(os.path.basename(p)[len("part-"):-len(".parquet")])
+               for p in side_part_paths(out_path)
+               if os.path.basename(p)[len("part-"):-len(".parquet")].isdigit()]
+    target = os.path.join(out_path, f"part-{max(numbers, default=-1) + 1:03d}.parquet")
+    handle, temp_path = tempfile.mkstemp(
+        prefix=".style_extend_", suffix=".parquet.tmp", dir=out_path)
+    os.close(handle)
+    try:
+        save_style_embeddings(missing_texts, encoded, temp_path, **free_fields)
+        written = _read_side_label(temp_path)
+        if written["n_rows"] != len(missing_texts) or \
+                pq.ParquetFile(temp_path).metadata.num_rows != len(missing_texts):
+            raise StyleLabelError(
+                f"extend_style_embeddings: the temp file {temp_path} does "
+                "not read back as written")
+        os.replace(temp_path, target)
+    except BaseException:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+    return n_before, len(missing_texts)
 
 
 def guard_inline_style_columns(df, *, source_style_path=None, entry_point):

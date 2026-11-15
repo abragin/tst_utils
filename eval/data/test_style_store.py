@@ -860,3 +860,505 @@ def test_guard_quiet_frame_stays_quiet():
         warnings.simplefilter("error", StyleProvenanceWarning)
         guarded = store_module.guard_inline_style_columns(df, entry_point="probe")
     pd.testing.assert_frame_equal(guarded, df)
+
+
+# ---------------- extend_style_embeddings and the encode mode of the join ---
+# (task 2026-11-15-style-v2-full-set-recompute, step 5)
+
+import hashlib  # noqa: E402
+import logging  # noqa: E402
+
+from tst_utils.eval.data.style_store import extend_style_embeddings  # noqa: E402
+
+
+class _StubEncoder:
+    """An `encode_fn` stand-in: text-dependent raw-scale rows (norm ~15).
+
+    `label_changes` are applied to the label it returns; `dim`, `unit`,
+    `scale`, `shuffle_keys` and `drop_row` fake the other failure modes.
+    Every call is recorded with its arguments.
+    """
+
+    def __init__(self, dim=8, label_changes=None, unit=False, scale=15.0,
+                 shuffle_keys=False, drop_row=False):
+        self.dim, self.label_changes = dim, label_changes or {}
+        self.unit, self.scale = unit, scale
+        self.shuffle_keys, self.drop_row = shuffle_keys, drop_row
+        self.calls = []
+
+    @staticmethod
+    def row(text, dim=8, scale=15.0):
+        seed = int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:8],
+                              "little")
+        vector = np.random.default_rng(seed).normal(size=dim)
+        return (scale * vector / np.linalg.norm(vector)
+                * (1.0 + (seed % 100) / 1000.0)).astype(np.float32)
+
+    def __call__(self, texts, encoder_key, *, normalize):
+        from tst_utils.eval.metrics.style import EncodedStyle
+        texts = list(texts)
+        self.calls.append({"texts": texts, "encoder_key": encoder_key,
+                           "normalize": normalize})
+        rows = np.stack([self.row(t, self.dim, self.scale) for t in texts])
+        if self.unit or normalize:
+            rows = rows / np.linalg.norm(rows, axis=1, keepdims=True)
+        keys = [style_text_key(t) for t in texts]
+        if self.shuffle_keys:
+            keys = keys[::-1]
+        if self.drop_row:
+            rows = rows[:-1]
+        label = {"encoder_key": encoder_key,
+                 "file_sha256": dict(get_encoder(encoder_key)["file_sha256"]),
+                 "dim": int(rows.shape[1]), "n_rows": int(rows.shape[0])}
+        label.update(measure_normalization(rows))
+        label.update(self.label_changes)
+        return EncodedStyle(embeddings=rows, label=label,
+                            text_keys=tuple(keys))
+
+
+def _stub_side_file(tmp_path, texts, name="side.parquet", **free_fields):
+    path = str(tmp_path / name)
+    encoded = _StubEncoder()(texts, "base_v1", normalize=False)
+    save_style_embeddings(texts, encoded, path, **free_fields)
+    return path
+
+
+def _bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+_BASE_TEXTS = ["альфа", "бета", "гамма", "дельта"]
+
+
+@pytest.mark.parametrize("field, stub", [
+    ("encoder_key", _StubEncoder(label_changes={"encoder_key": "base_v2"})),
+    ("file_sha256", _StubEncoder(label_changes={"file_sha256": {"x": "y"}})),
+    ("dim", _StubEncoder(dim=6)),
+    ("normalization", _StubEncoder(unit=True)),
+])
+def test_extend_refuses_a_fresh_label_mismatch(tmp_path, field, stub):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    before = _bytes(path)
+    with pytest.raises(StyleLabelError, match=field):
+        extend_style_embeddings(["новый"], path, out_path=path, encode_fn=stub)
+    assert len(stub.calls) == 1  # encoded, then refused
+    assert _bytes(path) == before
+    assert sorted(os.listdir(tmp_path)) == ["side.parquet"]
+
+
+@pytest.mark.parametrize("stub, match", [
+    (_StubEncoder(shuffle_keys=True), "position 0"),
+    (_StubEncoder(drop_row=True), "rows for 2 texts"),
+])
+def test_extend_refuses_other_keys_or_row_count(tmp_path, stub, match):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    before = _bytes(path)
+    with pytest.raises(StyleLabelError, match=match):
+        extend_style_embeddings(["новый", "второй"], path, out_path=path,
+                                encode_fn=stub)
+    assert _bytes(path) == before
+
+
+def test_extend_derives_encoder_and_normalize_from_the_label(tmp_path):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    stub = _StubEncoder()
+    extend_style_embeddings(["новый"], path, out_path=path, encode_fn=stub)
+    assert stub.calls[0]["encoder_key"] == "base_v1"
+    assert stub.calls[0]["normalize"] is False
+    unit_path = str(tmp_path / "unit.parquet")
+    texts = ["один", "два"]
+    save_style_embeddings(texts, _StubEncoder()(texts, "base_v1", normalize=True),
+                          unit_path)
+    unit_stub = _StubEncoder()
+    extend_style_embeddings(["три"], unit_path, out_path=unit_path,
+                            encode_fn=unit_stub)
+    assert unit_stub.calls[0]["normalize"] is True
+    assert load_style_embeddings(unit_path, "base_v1")[1]["normalization"] == "l2"
+
+
+def test_extend_appends_dedups_and_keeps_old_rows_bit_identical(tmp_path):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS, run_name="first",
+                           date="2026-11-15", provenance={"step": 1})
+    old_frame, _ = load_style_embeddings(path, "base_v1")
+    stub = _StubEncoder()
+    result = extend_style_embeddings(
+        ["бета", "новый", "новый", "ещё", "альфа"], path,
+        out_path=path, encode_fn=stub)
+    assert result == (4, 2)
+    assert stub.calls[0]["texts"] == ["новый", "ещё"]
+    frame, label = load_style_embeddings(path, "base_v1")
+    assert list(frame["text_key"]) == (list(old_frame["text_key"])
+                                      + [style_text_key("новый"),
+                                         style_text_key("ещё")])
+    assert list(frame["text_excerpt"])[-2:] == ["новый", "ещё"]
+    old = np.stack(old_frame["style_emb"].to_numpy())
+    new = np.stack(frame["style_emb"].to_numpy())
+    assert new.dtype == np.float16
+    assert new[:4].tobytes() == old.tobytes()
+    assert new[4].tobytes() == _StubEncoder.row("новый").astype(np.float16).tobytes()
+    assert label["n_rows"] == 6
+    norms = np.linalg.norm(new.astype(np.float64), axis=1)
+    assert label["norm_min"] == float(norms.min())
+    assert label["norm_max"] == float(norms.max())
+
+
+def test_extend_with_nothing_missing_writes_nothing(tmp_path):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    before = _bytes(path)
+    stub = _StubEncoder()
+    out = str(tmp_path / "out.parquet")
+    assert extend_style_embeddings(_BASE_TEXTS, path, out_path=out,
+                                   encode_fn=stub) == (4, 0)
+    assert stub.calls == [] and _bytes(path) == before
+    assert not os.path.exists(out)
+
+
+def test_extend_to_another_path_leaves_the_source(tmp_path):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    before = _bytes(path)
+    out = str(tmp_path / "grown.parquet")
+    assert extend_style_embeddings(["новый"], path, out_path=out,
+                                   encode_fn=_StubEncoder()) == (4, 1)
+    assert _bytes(path) == before
+    assert load_style_embeddings(out, "base_v1")[1]["n_rows"] == 5
+
+
+def test_extend_requires_out_path_and_encode_fn(tmp_path):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    with pytest.raises(TypeError):
+        extend_style_embeddings(["новый"], path, encode_fn=_StubEncoder())
+    with pytest.raises(TypeError):
+        extend_style_embeddings(["новый"], path, out_path=path)
+    with pytest.raises(ValueError, match="unknown free field"):
+        extend_style_embeddings(["новый"], path, out_path=path,
+                                encode_fn=_StubEncoder(), source="x")
+
+
+def test_extend_merges_the_label_over_two_extends(tmp_path):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS, run_name="first",
+                           date="2026-11-15", notes="n0",
+                           provenance={"step": 0})
+    extend_style_embeddings(["один"], path, out_path=path,
+                            encode_fn=_StubEncoder(), run_name="second",
+                            provenance={"step": 1})
+    extend_style_embeddings(["два"], path, out_path=path,
+                            encode_fn=_StubEncoder(), date="2026-11-16",
+                            provenance={"step": 2})
+    _, label = load_style_embeddings(path, "base_v1")
+    assert label["run_name"] == "second"
+    assert label["date"] == "2026-11-16"
+    assert label["notes"] == "n0"
+    assert label["provenance"] == {
+        "step": 2, "previous": [{"step": 0}, {"step": 1}]}
+    assert label["n_rows"] == 6
+
+
+def test_extend_refuses_a_mixed_scale_union(tmp_path):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    before = _bytes(path)
+    with pytest.raises(ValueError, match="mixed-scale"):
+        extend_style_embeddings(["новый"], path, out_path=path,
+                                encode_fn=_StubEncoder(scale=45.0))
+    assert _bytes(path) == before
+
+
+def test_extend_failed_write_leaves_the_original(tmp_path, monkeypatch):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    before = _bytes(path)
+
+    def partial_write(target, *args, **kwargs):
+        with open(target, "wb") as f:
+            f.write(b"partial")
+        raise OSError("disk full")
+    monkeypatch.setattr(style_store, "_write_side_table", partial_write)
+    with pytest.raises(OSError, match="disk full"):
+        extend_style_embeddings(["новый"], path, out_path=path,
+                                encode_fn=_StubEncoder())
+    assert _bytes(path) == before
+    assert sorted(os.listdir(tmp_path)) == ["side.parquet"]
+
+
+def test_strict_join_default_still_raises_with_the_new_signature(tmp_path):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    df = pd.DataFrame({"text": ["альфа", "нет такого", "нет такого"]})
+    with pytest.raises(StyleLabelError, match="2 texts have no stored row"):
+        join_style_embeddings(df, path, "text", "emb", expect_encoder="base_v1")
+
+
+def test_joined_column_holds_no_view_of_the_whole_file(tmp_path):
+    texts = [f"текст {i}" for i in range(50)]
+    path = _stub_side_file(tmp_path, texts)
+    df = pd.DataFrame({"text": ["текст 3", "текст 7", "текст 3"]})
+    joined = join_style_embeddings(df, path, "text", "emb",
+                                   expect_encoder="base_v1")
+    for vector in joined["emb"]:
+        assert vector.dtype == np.float32
+        assert vector.base is not None and vector.base.shape[0] == 2
+    assert np.array_equal(joined["emb"][0], joined["emb"][2])
+
+
+def test_encode_mode_requires_encode_fn_and_a_known_mode(tmp_path):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    df = pd.DataFrame({"text": ["альфа"]})
+    with pytest.raises(TypeError, match="encode_fn"):
+        join_style_embeddings(df, path, "text", "emb", "base_v1",
+                              on_missing="encode")
+    with pytest.raises(ValueError, match="on_missing"):
+        join_style_embeddings(df, path, "text", "emb", "base_v1",
+                              on_missing="skip")
+
+
+def test_encode_mode_vector_is_bit_equal_stored_and_fresh(tmp_path):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    df = pd.DataFrame({"text": ["альфа", "новый", "альфа"]})
+    stub = _StubEncoder()
+    joined = join_style_embeddings(df, path, "text", "emb", "base_v1",
+                                   on_missing="encode", encode_fn=stub,
+                                   max_missing_fraction=0.5)
+    assert stub.calls[0]["texts"] == ["новый"]
+    assert stub.calls[0]["normalize"] is False
+    extend_style_embeddings(["новый"], path, out_path=path,
+                            encode_fn=_StubEncoder())
+    strict = join_style_embeddings(df, path, "text", "emb", "base_v1")
+    for fresh, stored in zip(joined["emb"], strict["emb"]):
+        assert fresh.dtype == stored.dtype == np.float32
+        assert fresh.tobytes() == stored.tobytes()
+
+
+def test_encode_mode_threshold(tmp_path, caplog):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    df = pd.DataFrame({"text": ["альфа", "бета", "гамма", "новый", "новый"]})
+    # 1 missing of 4 unique texts: 0.25.
+    with pytest.raises(StyleLabelError, match=r"1 of 4 unique texts"):
+        join_style_embeddings(df, path, "text", "emb", "base_v1",
+                              on_missing="encode", encode_fn=_StubEncoder(),
+                              max_missing_fraction=0.2)
+    caplog.set_level(logging.WARNING,
+                     logger="tst_utils.eval.data.style_store")
+    stub = _StubEncoder()
+    joined = join_style_embeddings(df, path, "text", "emb", "base_v1",
+                                   on_missing="encode", encode_fn=stub,
+                                   max_missing_fraction=0.25)
+    assert len(joined) == 5 and len(stub.calls) == 1
+    lines = [r.getMessage() for r in caplog.records]
+    assert len(lines) == 1
+    assert path in lines[0] and "1 missing of 4 unique" in lines[0]
+
+
+def test_encode_mode_refuses_a_fresh_label_mismatch(tmp_path):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    df = pd.DataFrame({"text": ["альфа", "новый"]})
+    with pytest.raises(StyleLabelError, match="file_sha256"):
+        join_style_embeddings(
+            df, path, "text", "emb", "base_v1", on_missing="encode",
+            encode_fn=_StubEncoder(label_changes={"file_sha256": {"x": "y"}}),
+            max_missing_fraction=1.0)
+
+
+@pytest.mark.parametrize("mode", ["raise", "encode"])
+def test_join_of_an_empty_column(tmp_path, mode):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    df = pd.DataFrame({"text": pd.Series([], dtype=object)})
+    stub = _StubEncoder()
+    joined = join_style_embeddings(df, path, "text", "emb", "base_v1",
+                                   on_missing=mode, encode_fn=stub)
+    assert len(joined) == 0 and "emb" in joined.columns and stub.calls == []
+
+
+def test_preloaded_form_joins_the_same_and_still_checks(tmp_path):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    df = pd.DataFrame({"text": ["гамма", "альфа"]})
+    pair = load_style_embeddings(path, "base_v1")
+    by_path = join_style_embeddings(df, path, "text", "emb", "base_v1")
+    preloaded = join_style_embeddings(df, pair, "text", "emb", "base_v1")
+    again = join_style_embeddings(df, pair, "text", "emb", "base_v1")
+    for a, b, c in zip(by_path["emb"], preloaded["emb"], again["emb"]):
+        assert a.tobytes() == b.tobytes() == c.tobytes()
+    with pytest.raises(StyleLabelError, match="expected 'base_v2'"):
+        join_style_embeddings(df, pair, "text", "emb", "base_v2")
+    frame, label = pair
+    with pytest.raises(StyleLabelError, match="n_rows"):
+        join_style_embeddings(df, (frame.iloc[:3], label), "text", "emb",
+                              "base_v1")
+    with pytest.raises(TypeError, match="pair"):
+        join_style_embeddings(df, (frame,), "text", "emb", "base_v1")
+
+
+def test_preloaded_index_is_built_once_per_frame(tmp_path, monkeypatch):
+    path = _stub_side_file(tmp_path, _BASE_TEXTS)
+    pair = load_style_embeddings(path, "base_v1")
+    df = pd.DataFrame({"text": ["альфа"]})
+    builds = []
+    real = style_store._preloaded_index
+
+    def counting(frame):
+        before = id(frame) in style_store._PRELOADED_INDEX
+        builds.append(not before)
+        return real(frame)
+    monkeypatch.setattr(style_store, "_preloaded_index", counting)
+    for _ in range(3):
+        join_style_embeddings(df, pair, "text", "emb", "base_v1")
+    assert builds == [True, False, False]
+
+
+# ---------------- side folders of parts (host, 2026-11-15) ------------------
+
+from tst_utils.eval.data.style_store import side_part_paths  # noqa: E402
+
+
+def _stub_folder(tmp_path, parts, name="side", stubs=None):
+    folder = tmp_path / name
+    folder.mkdir()
+    for number, texts in enumerate(parts):
+        stub = (stubs or {}).get(number, _StubEncoder())
+        encoded = stub(texts, "base_v1", normalize=False)
+        save_style_embeddings(texts, encoded,
+                              str(folder / f"part-{number:03d}.parquet"),
+                              run_name=f"part {number}")
+    return str(folder)
+
+
+_PARTS = [["альфа", "бета"], ["гамма", "дельта", "эпсилон"], ["дзета"]]
+
+
+def test_folder_loads_all_parts_in_order(tmp_path):
+    folder = _stub_folder(tmp_path, _PARTS)
+    frame, label = load_style_embeddings(folder, "base_v1")
+    texts = [t for part in _PARTS for t in part]
+    assert list(frame["text_key"]) == [style_text_key(t) for t in texts]
+    assert label["n_rows"] == 6 and label["encoder_key"] == "base_v1"
+    assert [p["file"] for p in label["parts"]] == [
+        "part-000.parquet", "part-001.parquet", "part-002.parquet"]
+    assert [p["run_name"] for p in label["parts"]] == ["part 0", "part 1", "part 2"]
+    assert label["norm_min"] == min(p["norm_min"] for p in label["parts"])
+    assert label["norm_max"] == max(p["norm_max"] for p in label["parts"])
+
+
+def test_folder_join_strict_and_preloaded(tmp_path):
+    folder = _stub_folder(tmp_path, _PARTS)
+    single = _stub_side_file(tmp_path, [t for part in _PARTS for t in part])
+    df = pd.DataFrame({"text": ["дзета", "альфа", "гамма"]})
+    from_folder = join_style_embeddings(df, folder, "text", "emb", "base_v1")
+    from_file = join_style_embeddings(df, single, "text", "emb", "base_v1")
+    pair = load_style_embeddings(folder, "base_v1")
+    preloaded = join_style_embeddings(df, pair, "text", "emb", "base_v1")
+    for a, b, c in zip(from_folder["emb"], from_file["emb"], preloaded["emb"]):
+        assert a.tobytes() == b.tobytes() == c.tobytes()
+    with pytest.raises(StyleLabelError, match="no stored row"):
+        join_style_embeddings(pd.DataFrame({"text": ["нет"]}), folder,
+                              "text", "emb", "base_v1")
+
+
+@pytest.mark.parametrize("stub, match", [
+    (_StubEncoder(unit=True), "normalization"),
+    (_StubEncoder(dim=6), "dim"),
+])
+def test_folder_refuses_parts_that_differ(tmp_path, stub, match):
+    folder = _stub_folder(tmp_path, _PARTS, stubs={2: stub})
+    with pytest.raises(StyleLabelError, match=match):
+        load_style_embeddings(folder, "base_v1")
+
+
+def test_folder_refuses_a_part_of_another_encoder(tmp_path):
+    folder = _stub_folder(tmp_path, _PARTS)
+    other = _StubEncoder()(["омега"], "base_v2", normalize=False)
+    save_style_embeddings(["омега"], other, os.path.join(folder, "part-003.parquet"))
+    with pytest.raises(StyleLabelError, match="part-003.parquet names encoder"):
+        load_style_embeddings(folder, "base_v1")
+
+
+def test_folder_refuses_a_key_in_two_parts(tmp_path):
+    folder = _stub_folder(tmp_path, [["альфа", "бета"], ["бета"]])
+    with pytest.raises(StyleLabelError, match="more than one part"):
+        load_style_embeddings(folder, "base_v1")
+
+
+def test_folder_refuses_mixed_scale_parts(tmp_path):
+    folder = _stub_folder(tmp_path, _PARTS, stubs={1: _StubEncoder(scale=45.0)})
+    with pytest.raises(StyleLabelError, match="mixed-scale"):
+        load_style_embeddings(folder, "base_v1")
+
+
+def test_empty_folder_raises(tmp_path):
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(StyleLabelError, match="no part"):
+        load_style_embeddings(str(tmp_path / "empty"), "base_v1")
+
+
+def test_folder_extend_in_place_adds_one_part(tmp_path):
+    folder = _stub_folder(tmp_path, _PARTS)
+    before = {p: _bytes(p) for p in side_part_paths(folder)}
+    stub = _StubEncoder()
+    result = extend_style_embeddings(["бета", "новый", "новый", "ещё"], folder,
+                                     out_path=folder, encode_fn=stub,
+                                     run_name="extend 1", provenance={"why": "t"})
+    assert result == (6, 2)
+    assert stub.calls[0]["texts"] == ["новый", "ещё"]
+    assert stub.calls[0]["normalize"] is False
+    for part, content in before.items():
+        assert _bytes(part) == content
+    assert sorted(os.listdir(folder)) == [
+        "part-000.parquet", "part-001.parquet", "part-002.parquet",
+        "part-003.parquet"]
+    frame, label = load_style_embeddings(folder, "base_v1")
+    assert label["n_rows"] == 8
+    assert label["parts"][3]["run_name"] == "extend 1"
+    assert label["parts"][3]["provenance"] == {"why": "t"}
+    assert list(frame["text_excerpt"])[-2:] == ["новый", "ещё"]
+
+
+def test_folder_extend_to_another_folder_leaves_the_source(tmp_path):
+    folder = _stub_folder(tmp_path, _PARTS)
+    before = {p: _bytes(p) for p in side_part_paths(folder)}
+    out = str(tmp_path / "grown")
+    assert extend_style_embeddings(["новый"], folder, out_path=out,
+                                   encode_fn=_StubEncoder()) == (6, 1)
+    assert {p: _bytes(p) for p in side_part_paths(folder)} == before
+    assert sorted(os.listdir(folder)) == sorted(os.path.basename(p) for p in before)
+    assert load_style_embeddings(out, "base_v1")[1]["n_rows"] == 7
+    with pytest.raises(FileExistsError):
+        extend_style_embeddings(["другой"], folder, out_path=out,
+                                encode_fn=_StubEncoder())
+
+
+@pytest.mark.parametrize("stub, match", [
+    (_StubEncoder(label_changes={"file_sha256": {"x": "y"}}), "file_sha256"),
+    (_StubEncoder(unit=True), "normalization"),
+    (_StubEncoder(scale=45.0), "mixed-scale"),
+])
+def test_folder_extend_refusal_writes_nothing(tmp_path, stub, match):
+    folder = _stub_folder(tmp_path, _PARTS)
+    before = {p: _bytes(p) for p in side_part_paths(folder)}
+    with pytest.raises(StyleLabelError, match=match):
+        extend_style_embeddings(["новый"], folder, out_path=folder,
+                                encode_fn=stub)
+    assert sorted(os.listdir(folder)) == sorted(os.path.basename(p) for p in before)
+    assert {p: _bytes(p) for p in side_part_paths(folder)} == before
+
+
+def test_folder_extend_failed_write_leaves_no_part(tmp_path, monkeypatch):
+    folder = _stub_folder(tmp_path, _PARTS)
+    names = sorted(os.listdir(folder))
+
+    def failing_save(texts, encoded, path, **free_fields):
+        with open(path, "wb") as f:
+            f.write(b"partial")
+        raise OSError("disk full")
+    monkeypatch.setattr(style_store, "save_style_embeddings", failing_save)
+    with pytest.raises(OSError, match="disk full"):
+        extend_style_embeddings(["новый"], folder, out_path=folder,
+                                encode_fn=_StubEncoder())
+    assert sorted(os.listdir(folder)) == names
+
+
+def test_folder_encode_mode_join(tmp_path):
+    folder = _stub_folder(tmp_path, _PARTS)
+    df = pd.DataFrame({"text": ["альфа", "новый"]})
+    stub = _StubEncoder()
+    joined = join_style_embeddings(df, folder, "text", "emb", "base_v1",
+                                   on_missing="encode", encode_fn=stub,
+                                   max_missing_fraction=0.5)
+    assert stub.calls[0]["texts"] == ["новый"]
+    assert joined["emb"][1].tobytes() == _StubEncoder.row("новый").astype(
+        np.float16).astype(np.float32).tobytes()
