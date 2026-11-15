@@ -1362,3 +1362,91 @@ def test_folder_encode_mode_join(tmp_path):
     assert stub.calls[0]["texts"] == ["новый"]
     assert joined["emb"][1].tobytes() == _StubEncoder.row("новый").astype(
         np.float16).astype(np.float32).tobytes()
+
+
+# ------- the join by path reads only the rows it needs (host, 2026-11-15) ---
+
+def _relabel(path, **changes):
+    import json
+    import pyarrow.parquet as pq
+    table = pq.read_table(path)
+    metadata = dict(table.schema.metadata)
+    label = json.loads(metadata[b"style_label"])
+    label.update(changes)
+    metadata[b"style_label"] = json.dumps(label).encode("utf-8")
+    pq.write_table(table.replace_schema_metadata(metadata), path)
+
+
+def test_path_join_does_not_load_the_whole_file(tmp_path, monkeypatch):
+    folder = _stub_folder(tmp_path, _PARTS)
+    single = _stub_side_file(tmp_path, [t for part in _PARTS for t in part])
+    df = pd.DataFrame({"text": ["дзета", "альфа", "дзета", "гамма"]})
+    expected = [join_style_embeddings(df, load_style_embeddings(path, "base_v1"),
+                                      "text", "emb", "base_v1")
+                for path in (folder, single)]
+
+    def no_load(*args, **kwargs):
+        raise AssertionError("the join by path loaded the whole file")
+    monkeypatch.setattr(style_store, "load_style_embeddings", no_load)
+    for path, want in zip((folder, single), expected):
+        joined = join_style_embeddings(df, path, "text", "emb", "base_v1")
+        for got, row in zip(joined["emb"], want["emb"]):
+            assert got.dtype == np.float32 and got.tobytes() == row.tobytes()
+
+
+def test_path_join_reads_vectors_only_of_the_parts_it_needs(tmp_path, monkeypatch):
+    import pyarrow.parquet as pq
+    folder = _stub_folder(tmp_path, _PARTS)
+    reads = []
+    real_read_table = pq.read_table
+
+    def counting(path, *args, columns=None, **kwargs):
+        reads.append((os.path.basename(str(path)), tuple(columns or ())))
+        return real_read_table(path, *args, columns=columns, **kwargs)
+    monkeypatch.setattr(pq, "read_table", counting)
+    df = pd.DataFrame({"text": ["гамма", "эпсилон"]})
+    joined = join_style_embeddings(df, folder, "text", "emb", "base_v1")
+    assert len(joined) == 2
+    assert [name for name, columns in reads if columns != ("text_key",)] == [
+        "part-001.parquet"]
+    assert {columns for _, columns in reads} == {("text_key",), ("style_emb",)}
+
+
+@pytest.mark.parametrize("parts, stubs, match", [
+    ([["альфа", "бета"], ["бета"]], None, "more than one part"),
+    (_PARTS, {1: _StubEncoder(scale=45.0)}, "mixed-scale"),
+    (_PARTS, {2: _StubEncoder(unit=True)}, "normalization"),
+    (_PARTS, {2: _StubEncoder(dim=6)}, "dim"),
+])
+def test_path_join_keeps_the_folder_checks(tmp_path, parts, stubs, match):
+    folder = _stub_folder(tmp_path, parts, stubs=stubs)
+    with pytest.raises(StyleLabelError, match=match):
+        join_style_embeddings(pd.DataFrame({"text": ["альфа"]}), folder,
+                              "text", "emb", "base_v1")
+
+
+def test_path_join_checks_each_label_against_its_file(tmp_path):
+    folder = _stub_folder(tmp_path, _PARTS)
+    _relabel(side_part_paths(folder)[1], n_rows=7)
+    with pytest.raises(StyleLabelError, match="label says n_rows 7 but the file has 3"):
+        join_style_embeddings(pd.DataFrame({"text": ["альфа"]}), folder,
+                              "text", "emb", "base_v1")
+    single = _stub_side_file(tmp_path, ["альфа", "бета"])
+    _relabel(single, dim=5)
+    with pytest.raises(StyleLabelError, match="dim"):
+        join_style_embeddings(pd.DataFrame({"text": ["альфа"]}), single,
+                              "text", "emb", "base_v1")
+
+
+def test_path_join_reads_every_label_before_any_row(tmp_path, monkeypatch):
+    import pyarrow.parquet as pq
+    folder = _stub_folder(tmp_path, _PARTS)
+    other = _StubEncoder()(["омега"], "base_v2", normalize=False)
+    save_style_embeddings(["омега"], other, os.path.join(folder, "part-003.parquet"))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("row data must not be touched")
+    monkeypatch.setattr(pq, "read_table", boom)
+    with pytest.raises(StyleLabelError, match="part-003.parquet names encoder"):
+        join_style_embeddings(pd.DataFrame({"text": ["альфа"]}), folder,
+                              "text", "emb", "base_v1")

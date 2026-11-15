@@ -439,8 +439,79 @@ def _preloaded_index(frame):
     return index
 
 
-def _resolve_side(path, expect_encoder):
-    """(frame, label, key index, name) for a path or a preloaded pair."""
+def _read_side_rows(path, expect_encoder, wanted_keys):
+    """The label of a side file or folder, and the stored rows of
+    `wanted_keys` only: (label, rows, row_of).
+
+    The checks are those of `load_style_embeddings`: every label before
+    any row, `n_rows` and `dim` against each file, the shared fields and
+    the norm range of a folder, no key in two parts. Then only the
+    `text_key` column of each file is read; the `style_emb` column is read
+    one file at a time and only the matching rows are kept. `rows` is an
+    (n_found, dim) array of the stored dtype; `row_of` maps each found key
+    to its row in `rows`. Memory grows with the wanted rows, not the file.
+    """
+    is_folder = os.path.isdir(path)
+    part_paths = side_part_paths(path) if is_folder else [path]
+    labels = []
+    for part in part_paths:  # every label before any row
+        part_label = _read_side_label(part)
+        _check_side_label(part_label, expect_encoder, f"style file {part}")
+        labels.append(part_label)
+    if is_folder:
+        _combine_part_labels(path, labels, part_paths, 0)
+    key_columns = []
+    for part, part_label in zip(part_paths, labels):
+        parquet = pq.ParquetFile(part)
+        n_rows = parquet.metadata.num_rows
+        if int(part_label["n_rows"]) != n_rows:
+            raise StyleLabelError(
+                f"style file {part} label says n_rows {part_label['n_rows']} "
+                f"but the file has {n_rows} rows")
+        width = getattr(parquet.schema_arrow.field("style_emb").type,
+                        "list_size", None)
+        if width is not None and int(part_label["dim"]) != int(width):
+            raise StyleLabelError(
+                f"style file {part} label says dim {part_label['dim']} but "
+                f"style_emb has width {width}")
+        key_columns.append(
+            pq.read_table(part, columns=["text_key"]).column("text_key"))
+    if is_folder:
+        n_total = sum(len(keys) for keys in key_columns)
+        all_keys = pa.chunked_array(
+            [chunk for keys in key_columns for chunk in keys.chunks],
+            type=pa.string())
+        if pa.compute.count_distinct(all_keys).as_py() != n_total:
+            raise StyleLabelError(
+                f"style folder {path}: a text key is stored in more than "
+                f"one part")
+        del all_keys
+        label = _combine_part_labels(path, labels, part_paths, n_total)
+    else:
+        label = labels[0]
+    dim = int(label["dim"])
+    wanted = pa.array(list(wanted_keys), type=pa.string())
+    found_keys, found_rows = [], []
+    for part, keys in zip(part_paths, key_columns):
+        mask = pa.compute.is_in(keys, value_set=wanted)
+        picks = np.flatnonzero(mask.to_numpy(zero_copy_only=False))
+        if not len(picks):
+            continue
+        picks = pa.array(picks)
+        emb = pq.read_table(part, columns=["style_emb"]).column("style_emb")
+        taken = emb.take(picks).combine_chunks()
+        del emb
+        found_rows.append(
+            taken.flatten().to_numpy(zero_copy_only=False).reshape(-1, dim))
+        found_keys.extend(keys.take(picks).to_pylist())
+    rows = (np.concatenate(found_rows) if found_rows
+            else np.zeros((0, dim), dtype=np.float16))
+    return label, rows, {key: row for row, key in enumerate(found_keys)}
+
+
+def _side_rows(path, expect_encoder, wanted_keys):
+    """(label, rows, row_of, name) of the stored rows of `wanted_keys`,
+    for a path or a preloaded pair."""
     if isinstance(path, tuple):
         if len(path) != 2 or not isinstance(path[0], pd.DataFrame) \
                 or not isinstance(path[1], dict):
@@ -454,10 +525,20 @@ def _resolve_side(path, expect_encoder):
             raise StyleLabelError(
                 f"{where}: label says n_rows {label['n_rows']} but the frame "
                 f"has {len(frame)} rows")
-        return frame, label, _preloaded_index(frame), where
-    frame, label = load_style_embeddings(path, expect_encoder)
-    index = {key: row for row, key in enumerate(frame["text_key"])}
-    return frame, label, index, str(path)
+        index = _preloaded_index(frame)
+        row_of, picks = {}, []
+        for key in wanted_keys:
+            row = index.get(key)
+            if row is not None:
+                row_of[key] = len(picks)
+                picks.append(row)
+        dim = int(label["dim"])
+        stored = frame["style_emb"].to_numpy()
+        rows = (np.stack([stored[row] for row in picks]) if picks
+                else np.zeros((0, dim), dtype=np.float16))
+        return label, rows, row_of, where
+    label, rows, row_of = _read_side_rows(path, expect_encoder, wanted_keys)
+    return label, rows, row_of, str(path)
 
 
 def _encode_for_label(texts, label, encode_fn, where, entry_point):
@@ -496,10 +577,14 @@ def join_style_embeddings(df, path, text_col, out_col,
     gathered and cast to float32, so a joined column holds no view of the
     whole file.
 
-    `path` is a side-file path, or the `(frame, label)` pair that
-    `load_style_embeddings` returns, unmodified: the pair is checked on
-    every call (`expect_encoder`, the registry hashes, `n_rows` against the
-    frame), and its key index is built once per frame object.
+    `path` is a side-file path (a file or a folder of parts), or the
+    `(frame, label)` pair that `load_style_embeddings` returns, unmodified.
+    A path gets the checks of `load_style_embeddings`, but only the
+    `text_key` column is read whole; the vectors are read one file at a
+    time and only the rows `df` needs are kept, so the memory of the join
+    grows with `df`, not with the file. The pair is checked on every call
+    (`expect_encoder`, the registry hashes, `n_rows` against the frame),
+    and its key index is built once per frame object.
 
     `on_missing="raise"` (the default): a text with no stored row raises
     `StyleLabelError`. `on_missing="encode"` needs `encode_fn` (the
@@ -518,15 +603,13 @@ def join_style_embeddings(df, path, text_col, out_col,
                          f"got {on_missing!r}")
     if on_missing == "encode" and encode_fn is None:
         raise TypeError("on_missing='encode' requires encode_fn")
-    frame, label, key_to_row, where = _resolve_side(path, expect_encoder)
     texts = list(df[text_col])
     keys = [style_text_key(text) for text in texts]
-    unique_rows = {}
+    label, stored_rows, row_of, where = _side_rows(
+        path, expect_encoder, dict.fromkeys(keys))
     missing = {}
     for key, text in zip(keys, texts):
-        if key in key_to_row:
-            unique_rows.setdefault(key, len(unique_rows))
-        elif key not in missing:
+        if key not in row_of and key not in missing:
             missing[key] = text
     if missing and on_missing == "raise":
         first = next(iter(missing.values()))
@@ -535,7 +618,8 @@ def join_style_embeddings(df, path, text_col, out_col,
             f"{n_missing_rows} texts have no stored row, "
             f"first missing excerpt: {str(first)[:80]!r}"
         )
-    n_unique = len(unique_rows) + len(missing)
+    n_found = len(row_of)
+    n_unique = n_found + len(missing)
     if missing:
         fraction = len(missing) / n_unique
         if fraction > max_missing_fraction:
@@ -545,19 +629,17 @@ def join_style_embeddings(df, path, text_col, out_col,
                 f"max_missing_fraction {max_missing_fraction})")
     dim = int(label["dim"])
     gathered = np.zeros((n_unique, dim), dtype=np.float32)
-    if unique_rows:
-        stored = frame["style_emb"].to_numpy()
-        gathered[:len(unique_rows)] = np.stack(
-            [stored[key_to_row[key]] for key in unique_rows])
-    position = dict(unique_rows)
+    gathered[:n_found] = stored_rows
+    del stored_rows
+    position = dict(row_of)
     if missing:
         missing_texts = list(missing.values())
         fresh, _ = _encode_for_label(missing_texts, label, encode_fn, where,
                                      "join_style_embeddings")
-        gathered[len(unique_rows):] = np.asarray(fresh).astype(
+        gathered[n_found:] = np.asarray(fresh).astype(
             np.float16).astype(np.float32)
         for offset, key in enumerate(missing):
-            position[key] = len(unique_rows) + offset
+            position[key] = n_found + offset
         _logger.warning(
             "join_style_embeddings: %s: encoded %d missing of %d unique "
             "texts of %r", where, len(missing), n_unique, text_col)
