@@ -45,6 +45,20 @@
         {"key": "model.encoder.embed_tokens.weight", "kind": "tied_alias", "tied_to": "model.decoder.embed_tokens.weight"},
         {"key": "model.lm_head.weight", "kind": "tied_alias", "tied_to": "model.decoder.embed_tokens.weight"}
       ]
+    },
+    "17b86d477483a9b245c764314b578bf8a6f8c6f6257a1c4b5a23ec0f93e0d9b4": {
+      "name": "2B step-1 GPT (checkpoint-89194, train_short_v2 + legacy + LLM sets)",
+      "paths": [
+        "18 phase 2B GPT retrain/results/gpt_train_v1/checkpoint-89194/model.safetensors"
+      ],
+      "encoder_key": "base_v2",
+      "trained_scale": "unit",
+      "model_name": "ai-forever/rugpt3small_based_on_gpt2",
+      "model_type": "GPT",
+      "ctrl_embed_dim": 768,
+      "missing_keys": [
+        {"key": "model.transformer.wte.weight", "kind": "tied_alias", "tied_to": "model.lm_head.weight"}
+      ]
     }
   }
 }
